@@ -272,20 +272,111 @@ class AgentDojoDataset(IPIDataset):
     ):
         self._scenarios = self._load(suite_names, max_per_suite, include_tools)
 
+    # ------------------------------------------------------------------
+    # Public constructor: import agentdojo yourself and pass the suite
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_suite(
+        cls,
+        suite,
+        suite_name: str = "",
+        max_scenarios: Optional[int] = None,
+        include_tools: bool = True,
+    ) -> "AgentDojoDataset":
+        """
+        Create an AgentDojoDataset from a pre-imported agentdojo TaskSuite.
+
+        Import the suite yourself in the notebook, then pass it here.
+        This avoids any internal import-discovery issues.
+
+        Example::
+
+            from agentdojo.default_suites.v1.workspace import task_suite
+            dataset = AgentDojoDataset.from_suite(task_suite, suite_name='workspace', max_scenarios=20)
+
+        Args:
+            suite:         An agentdojo TaskSuite instance.
+            suite_name:    Name embedded in scenario IDs (e.g. ``"workspace"``).
+            max_scenarios: Cap on number of scenarios extracted. None = all.
+            include_tools: Whether to extract and include the tool schema string.
+        """
+        obj = cls.__new__(cls)
+        obj._scenarios = cls._extract_from_suite(suite, suite_name, max_scenarios, include_tools)
+        return obj
+
+    # ------------------------------------------------------------------
+    # Internal: suite → IPIScenario list
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_collection(collection) -> list[tuple[str, object]]:
+        """
+        Return a list of (task_id, task_obj) pairs from a dict or list.
+
+        agentdojo stores tasks as either:
+          dict[str, type[Task]]   — task_id → task class (most common)
+          list[type[Task]]        — positional list
+        Both are normalised here so downstream code never iterates dict keys.
+        """
+        if isinstance(collection, dict):
+            return list(collection.items())
+        return [(str(i), t) for i, t in enumerate(collection)]
+
+    @staticmethod
+    def _extract_from_suite(
+        suite,
+        suite_name: str,
+        max_scenarios: Optional[int],
+        include_tools: bool,
+    ) -> list[IPIScenario]:
+        """Convert one agentdojo TaskSuite into a list of IPIScenario objects."""
+        inj_raw  = getattr(suite, "injection_tasks", None) or {}
+        usr_raw  = getattr(suite, "user_tasks",      None) or {}
+
+        inj_items = AgentDojoDataset._normalize_collection(inj_raw)
+        usr_items = AgentDojoDataset._normalize_collection(usr_raw)
+
+        tool_schema = AgentDojoDataset._extract_tool_schema(suite) if include_tools else ""
+
+        # Use the first user task string as shared context (or empty)
+        user_task_str = ""
+        if usr_items:
+            user_task_str = AgentDojoDataset._extract_user_task(usr_items[0][1])
+
+        scenarios: list[IPIScenario] = []
+        for task_id, injection_task in inj_items:
+            if max_scenarios is not None and len(scenarios) >= max_scenarios:
+                break
+            sid = f"agentdojo/{suite_name}/{task_id}" if suite_name else f"agentdojo/{task_id}"
+            scenarios.append(IPIScenario(
+                id=sid,
+                user_task=user_task_str,
+                injection_goal=AgentDojoDataset._extract_goal(injection_task),
+                target_tool_calls=AgentDojoDataset._extract_target_calls(injection_task),
+                tool_schema=tool_schema,
+                metadata={"suite": suite_name, "task_id": task_id},
+            ))
+
+        return scenarios
+
+    # ------------------------------------------------------------------
+    # Auto-discovery constructor (AgentDojoDataset(...))
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _import_suites() -> dict:
         """
-        Discover agentdojo task suite objects, trying multiple API patterns
-        across different package versions.
+        Try multiple agentdojo API patterns to return a dict of suite objects.
+        Raises ImportError with a detailed message if none work.
         """
+        import importlib
         errors: list[str] = []
 
-        # Pattern 1: default_suites registry (agentdojo >= 0.2)
+        # Pattern 1: agentdojo.default_suites.v1.<name> module (>= 0.2)
         try:
-            import importlib
-            suite_names_default = ["workspace", "banking", "slack", "travel"]
             suites: dict = {}
-            for name in suite_names_default:
+            for name in ("workspace", "banking", "slack", "travel"):
                 try:
                     mod = importlib.import_module(f"agentdojo.default_suites.v1.{name}")
                     suite = (
@@ -298,18 +389,18 @@ class AgentDojoDataset(IPIDataset):
                     pass
             if suites:
                 return suites
-            errors.append("default_suites.v1.<name>: no task_suite attribute found")
+            errors.append("default_suites.v1.<name>: modules found but no task_suite attr")
         except Exception as e:
             errors.append(f"default_suites.v1: {e}")
 
-        # Pattern 2: top-level task_suites module with get_suites() helper
+        # Pattern 2: get_suites() helper function
         try:
             from agentdojo.task_suites import get_suites  # type: ignore[attr-defined]
             return get_suites()
         except (ImportError, AttributeError) as e:
             errors.append(f"task_suites.get_suites(): {e}")
 
-        # Pattern 3: TASK_SUITES / REGISTERED_SUITES registry dict
+        # Pattern 3: module-level registry dict
         for attr in ("TASK_SUITES", "REGISTERED_SUITES", "SUITES"):
             try:
                 mod = importlib.import_module("agentdojo.task_suites")
@@ -320,10 +411,11 @@ class AgentDojoDataset(IPIDataset):
                 errors.append(f"task_suites.{attr}: {e}")
 
         raise ImportError(
-            "Could not load agentdojo task suites. agentdojo is installed but the "
-            "suite registry API was not found. Tried:\n"
-            + "\n".join(f"  - {e}" for e in errors)
-            + "\n\nPlease open an issue or check which agentdojo version you installed."
+            "agentdojo is installed but the suite registry API was not found.\n"
+            "Tried:\n" + "\n".join(f"  - {e}" for e in errors) + "\n\n"
+            "Use AgentDojoDataset.from_suite() instead:\n"
+            "  from agentdojo.default_suites.v1.workspace import task_suite\n"
+            "  dataset = AgentDojoDataset.from_suite(task_suite, 'workspace')"
         )
 
     @staticmethod
@@ -342,89 +434,45 @@ class AgentDojoDataset(IPIDataset):
 
         all_suites = AgentDojoDataset._import_suites()
         if suite_names is not None:
-            suites = {k: v for k, v in all_suites.items() if k in suite_names}
-        else:
-            suites = all_suites
+            all_suites = {k: v for k, v in all_suites.items() if k in suite_names}
 
         scenarios: list[IPIScenario] = []
-        for suite_name, suite in suites.items():
-            count = 0
-            # Each suite has user_tasks and injection_tasks
-            user_tasks = getattr(suite, "user_tasks", []) or []
-            injection_tasks = getattr(suite, "injection_tasks", []) or []
-
-            # Build tool schema string from suite environment
-            tool_schema = ""
-            if include_tools:
-                tool_schema = AgentDojoDataset._extract_tool_schema(suite)
-
-            for injection_task in injection_tasks:
-                if max_per_suite is not None and count >= max_per_suite:
-                    break
-
-                # Get ground-truth tool call if available
-                target_calls = AgentDojoDataset._extract_target_calls(injection_task)
-                injection_goal = AgentDojoDataset._extract_goal(injection_task)
-
-                # Pair with each user task (or use a default if none)
-                if user_tasks:
-                    # Take only the first user task for brevity, or iterate all
-                    for user_task in user_tasks[:1]:
-                        user_task_str = AgentDojoDataset._extract_user_task(user_task)
-                        scenario_id = (
-                            f"agentdojo/{suite_name}/"
-                            f"inj{getattr(injection_task, 'id', count)}"
-                        )
-                        scenarios.append(IPIScenario(
-                            id=scenario_id,
-                            user_task=user_task_str,
-                            injection_goal=injection_goal,
-                            target_tool_calls=target_calls,
-                            tool_schema=tool_schema,
-                            metadata={
-                                "suite": suite_name,
-                                "injection_task_id": getattr(injection_task, "id", None),
-                            },
-                        ))
-                        count += 1
-                        if max_per_suite is not None and count >= max_per_suite:
-                            break
-                else:
-                    scenario_id = f"agentdojo/{suite_name}/inj{count}"
-                    scenarios.append(IPIScenario(
-                        id=scenario_id,
-                        user_task="",
-                        injection_goal=injection_goal,
-                        target_tool_calls=target_calls,
-                        tool_schema=tool_schema,
-                        metadata={"suite": suite_name},
-                    ))
-                    count += 1
+        for suite_name, suite in all_suites.items():
+            extracted = AgentDojoDataset._extract_from_suite(
+                suite, suite_name, max_per_suite, include_tools
+            )
+            scenarios.extend(extracted)
 
         return scenarios
 
-    @staticmethod
-    def _extract_goal(injection_task) -> str:
-        """Extract the attacker goal string from an AgentDojo injection task."""
-        # AgentDojo InjectionTask has: goal, injections, ground_truth
-        for attr in ("goal", "GOAL", "injection_goal", "description"):
-            val = getattr(injection_task, attr, None)
-            if val and isinstance(val, str):
-                return val
-        return str(injection_task)
+    # ------------------------------------------------------------------
+    # Static extraction helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_target_calls(injection_task) -> str:
-        """Extract expected tool calls from injection_task.ground_truth."""
-        ground_truth = getattr(injection_task, "ground_truth", None)
-        if ground_truth is None:
+    def _extract_goal(task) -> str:
+        """Extract the attacker goal string from a task object or class."""
+        # agentdojo uses ClassVar GOAL; also check lowercase variants
+        for attr in ("GOAL", "goal", "injection_goal", "description"):
+            val = getattr(task, attr, None)
+            if val and isinstance(val, str):
+                return val
+        return str(task)
+
+    @staticmethod
+    def _extract_target_calls(task) -> str:
+        """
+        Extract expected tool calls from the task's ground_truth attribute.
+        Returns "" when ground_truth is a method (requires environment execution).
+        """
+        gt = getattr(task, "ground_truth", None)
+        if gt is None or callable(gt):
             return ""
-        if isinstance(ground_truth, str):
-            return ground_truth
-        if isinstance(ground_truth, list):
-            # List of FunctionCall or similar objects
+        if isinstance(gt, str):
+            return gt
+        if isinstance(gt, list):
             parts = []
-            for call in ground_truth:
+            for call in gt:
                 if hasattr(call, "function") and hasattr(call, "args"):
                     args_str = ", ".join(
                         f"{k}={v!r}" for k, v in (call.args or {}).items()
@@ -433,16 +481,16 @@ class AgentDojoDataset(IPIDataset):
                 else:
                     parts.append(str(call))
             return "; ".join(parts)
-        return str(ground_truth)
+        return str(gt)
 
     @staticmethod
-    def _extract_user_task(user_task) -> str:
-        """Extract the task string from an AgentDojo user task."""
-        for attr in ("task", "TASK", "user_task", "prompt", "description"):
-            val = getattr(user_task, attr, None)
+    def _extract_user_task(task) -> str:
+        """Extract the task string from a user-task object or class."""
+        for attr in ("TASK", "task", "user_task", "prompt", "description"):
+            val = getattr(task, attr, None)
             if val and isinstance(val, str):
                 return val
-        return str(user_task)
+        return str(task)
 
     @staticmethod
     def _extract_tool_schema(suite) -> str:
