@@ -270,7 +270,7 @@ def run_tap(
     if isinstance(attacker_model, UnifiedLLM):
         attacker = attacker_model
     else:
-        attacker = UnifiedLLM(
+        attacker = APILLM(
             model=attacker_model,
             temperature=ATTACK_TEMP,
             top_p=ATTACK_TOP_P,
@@ -280,9 +280,9 @@ def run_tap(
     # Phase 1 on-topic evaluator — reuse attacker LLM or create a separate one
     on_topic_llm: Optional[UnifiedLLM] = None
     if on_topic_prune:
-        attacker_name = attacker.model_name if isinstance(attacker, UnifiedLLM) else attacker_model
+        attacker_name = attacker.model_name
         if on_topic_model and on_topic_model != attacker_name:
-            on_topic_llm = UnifiedLLM(
+            on_topic_llm = APILLM(
                 model=on_topic_model,
                 temperature=0.0,
                 top_p=1.0,

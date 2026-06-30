@@ -273,20 +273,74 @@ class AgentDojoDataset(IPIDataset):
         self._scenarios = self._load(suite_names, max_per_suite, include_tools)
 
     @staticmethod
+    def _import_suites() -> dict:
+        """
+        Discover agentdojo task suite objects, trying multiple API patterns
+        across different package versions.
+        """
+        errors: list[str] = []
+
+        # Pattern 1: default_suites registry (agentdojo >= 0.2)
+        try:
+            import importlib
+            suite_names_default = ["workspace", "banking", "slack", "travel"]
+            suites: dict = {}
+            for name in suite_names_default:
+                try:
+                    mod = importlib.import_module(f"agentdojo.default_suites.v1.{name}")
+                    suite = (
+                        getattr(mod, "task_suite", None)
+                        or getattr(mod, f"{name}_task_suite", None)
+                    )
+                    if suite is not None:
+                        suites[name] = suite
+                except ImportError:
+                    pass
+            if suites:
+                return suites
+            errors.append("default_suites.v1.<name>: no task_suite attribute found")
+        except Exception as e:
+            errors.append(f"default_suites.v1: {e}")
+
+        # Pattern 2: top-level task_suites module with get_suites() helper
+        try:
+            from agentdojo.task_suites import get_suites  # type: ignore[attr-defined]
+            return get_suites()
+        except (ImportError, AttributeError) as e:
+            errors.append(f"task_suites.get_suites(): {e}")
+
+        # Pattern 3: TASK_SUITES / REGISTERED_SUITES registry dict
+        for attr in ("TASK_SUITES", "REGISTERED_SUITES", "SUITES"):
+            try:
+                mod = importlib.import_module("agentdojo.task_suites")
+                registry = getattr(mod, attr, None)
+                if isinstance(registry, dict) and registry:
+                    return registry
+            except Exception as e:
+                errors.append(f"task_suites.{attr}: {e}")
+
+        raise ImportError(
+            "Could not load agentdojo task suites. agentdojo is installed but the "
+            "suite registry API was not found. Tried:\n"
+            + "\n".join(f"  - {e}" for e in errors)
+            + "\n\nPlease open an issue or check which agentdojo version you installed."
+        )
+
+    @staticmethod
     def _load(
         suite_names: Optional[list[str]],
         max_per_suite: Optional[int],
         include_tools: bool,
     ) -> list[IPIScenario]:
         try:
-            from agentdojo.task_suites import get_suites
+            import agentdojo  # noqa: F401
         except ImportError as exc:
             raise ImportError(
                 "agentdojo is required for AgentDojoDataset. "
                 "Install it with: pip install agentdojo"
             ) from exc
 
-        all_suites = get_suites()
+        all_suites = AgentDojoDataset._import_suites()
         if suite_names is not None:
             suites = {k: v for k, v in all_suites.items() if k in suite_names}
         else:

@@ -24,7 +24,7 @@ from difflib import SequenceMatcher
 from typing import Optional
 
 from .config import JUDGE_TEMP, JUDGE_MAX_TOKENS, SUCCESS_THRESHOLD
-from .llm_unified import UnifiedLLM
+from .llm_unified import APILLM, UnifiedLLM
 from .prompts import get_judge_prompt_original, JUDGE_PROMPT_IPI
 
 log = logging.getLogger(__name__)
@@ -129,7 +129,7 @@ class IPILLMJudge(Judge):
         success_threshold: int = 9,
         n_retries: int = 1,
     ):
-        self.llm = UnifiedLLM(model=model, temperature=JUDGE_TEMP, max_tokens=JUDGE_MAX_TOKENS)
+        self.llm = APILLM(model=model, temperature=JUDGE_TEMP, max_tokens=JUDGE_MAX_TOKENS)
         self.user_task = user_task
         self.target_tool_calls = target_tool_calls
         self.success_threshold = success_threshold
@@ -186,7 +186,7 @@ class GPTJudge(Judge):
     """
 
     def __init__(self, model: str, success_threshold: int = 9):
-        self.llm = UnifiedLLM(model=model, temperature=JUDGE_TEMP, max_tokens=JUDGE_MAX_TOKENS)
+        self.llm = APILLM(model=model, temperature=JUDGE_TEMP, max_tokens=JUDGE_MAX_TOKENS)
         self.success_threshold = success_threshold
 
     def score(self, injection: str, response: str, **ctx) -> int:

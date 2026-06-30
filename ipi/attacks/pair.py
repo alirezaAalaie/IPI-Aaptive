@@ -165,7 +165,7 @@ def run_pair(
     if isinstance(attacker_model, UnifiedLLM):
         attacker = attacker_model
     else:
-        attacker = UnifiedLLM(
+        attacker = APILLM(
             model=attacker_model,
             temperature=ATTACK_TEMP,
             top_p=ATTACK_TOP_P,
