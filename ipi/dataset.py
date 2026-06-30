@@ -269,8 +269,9 @@ class AgentDojoDataset(IPIDataset):
         suite_names: Optional[list[str]] = None,
         max_per_suite: Optional[int] = None,
         include_tools: bool = True,
+        pair_all_user_tasks: bool = False,
     ):
-        self._scenarios = self._load(suite_names, max_per_suite, include_tools)
+        self._scenarios = self._load(suite_names, max_per_suite, include_tools, pair_all_user_tasks)
 
     # ------------------------------------------------------------------
     # Public constructor: import agentdojo yourself and pass the suite
@@ -283,26 +284,82 @@ class AgentDojoDataset(IPIDataset):
         suite_name: str = "",
         max_scenarios: Optional[int] = None,
         include_tools: bool = True,
+        pair_all_user_tasks: bool = False,
+        skip_empty_targets: bool = False,
     ) -> "AgentDojoDataset":
         """
         Create an AgentDojoDataset from a pre-imported agentdojo TaskSuite.
 
-        Import the suite yourself in the notebook, then pass it here.
-        This avoids any internal import-discovery issues.
-
         Example::
 
             from agentdojo.default_suites.v1.workspace import task_suite
-            dataset = AgentDojoDataset.from_suite(task_suite, suite_name='workspace', max_scenarios=20)
+
+            # 4 static injection tasks × 40 user tasks = 160 scenarios
+            dataset = AgentDojoDataset.from_suite(
+                task_suite, suite_name='workspace',
+                pair_all_user_tasks=True,
+                skip_empty_targets=True,   # drop tasks whose ground_truth needs live env
+            )
 
         Args:
-            suite:         An agentdojo TaskSuite instance.
-            suite_name:    Name embedded in scenario IDs (e.g. ``"workspace"``).
-            max_scenarios: Cap on number of scenarios extracted. None = all.
-            include_tools: Whether to extract and include the tool schema string.
+            suite:               An agentdojo TaskSuite instance.
+            suite_name:          Name embedded in scenario IDs (e.g. ``"workspace"``).
+            max_scenarios:       Cap on total scenarios extracted. None = all.
+            include_tools:       Whether to extract and include the tool schema string.
+            pair_all_user_tasks: Create one scenario per (injection_task × user_task)
+                                 pair instead of only pairing with the first user task.
+            skip_empty_targets:  Drop scenarios whose target_tool_calls could not be
+                                 extracted (i.e. ground_truth() needs a live environment).
         """
         obj = cls.__new__(cls)
-        obj._scenarios = cls._extract_from_suite(suite, suite_name, max_scenarios, include_tools)
+        scenarios = cls._extract_from_suite(
+            suite, suite_name, max_scenarios, include_tools, pair_all_user_tasks
+        )
+        if skip_empty_targets:
+            scenarios = [s for s in scenarios if s.target_tool_calls]
+        obj._scenarios = scenarios
+        return obj
+
+    @classmethod
+    def from_suites(
+        cls,
+        suites: dict,
+        max_per_suite: Optional[int] = None,
+        include_tools: bool = True,
+        pair_all_user_tasks: bool = False,
+        skip_empty_targets: bool = False,
+    ) -> "AgentDojoDataset":
+        """
+        Create an AgentDojoDataset from multiple pre-imported suites.
+
+        Example::
+
+            from agentdojo.default_suites.v1.workspace import task_suite as ws
+            from agentdojo.default_suites.v1.banking   import task_suite as bk
+
+            dataset = AgentDojoDataset.from_suites(
+                {'workspace': ws, 'banking': bk},
+                pair_all_user_tasks=True,
+                skip_empty_targets=True,
+            )
+
+        Args:
+            suites:              Dict mapping suite_name -> TaskSuite instance.
+            max_per_suite:       Cap per suite. None = all.
+            include_tools:       Whether to include tool schema.
+            pair_all_user_tasks: Create all (injection_task × user_task) pairs.
+            skip_empty_targets:  Drop scenarios with empty target_tool_calls.
+        """
+        scenarios: list[IPIScenario] = []
+        for suite_name, suite in suites.items():
+            extracted = cls._extract_from_suite(
+                suite, suite_name, max_per_suite, include_tools, pair_all_user_tasks
+            )
+            scenarios.extend(extracted)
+        if skip_empty_targets:
+            scenarios = [s for s in scenarios if s.target_tool_calls]
+        obj = cls.__new__(cls)
+        obj._scenarios = scenarios
         return obj
 
     # ------------------------------------------------------------------
@@ -329,37 +386,56 @@ class AgentDojoDataset(IPIDataset):
         suite_name: str,
         max_scenarios: Optional[int],
         include_tools: bool,
+        pair_all_user_tasks: bool = False,
     ) -> list[IPIScenario]:
         """Convert one agentdojo TaskSuite into a list of IPIScenario objects."""
-        inj_raw  = getattr(suite, "injection_tasks", None) or {}
-        usr_raw  = getattr(suite, "user_tasks",      None) or {}
+        inj_raw = getattr(suite, "injection_tasks", None) or {}
+        usr_raw = getattr(suite, "user_tasks",      None) or {}
 
         inj_items = AgentDojoDataset._normalize_collection(inj_raw)
         usr_items = AgentDojoDataset._normalize_collection(usr_raw)
 
         tool_schema = AgentDojoDataset._extract_tool_schema(suite) if include_tools else ""
+        env         = AgentDojoDataset._get_default_environment(suite)
 
-        # Use the first user task string as shared context (or empty)
-        user_task_str = ""
-        if usr_items:
-            user_task_str = AgentDojoDataset._extract_user_task(usr_items[0][1])
-
-        # Get a default environment instance to call ground_truth() on each task
-        env = AgentDojoDataset._get_default_environment(suite)
+        # Decide which user tasks to pair with each injection task
+        if pair_all_user_tasks and usr_items:
+            user_task_pairs = [
+                (uid, AgentDojoDataset._extract_user_task(ut))
+                for uid, ut in usr_items
+            ]
+        else:
+            # Default: use only the first user task
+            first_str = AgentDojoDataset._extract_user_task(usr_items[0][1]) if usr_items else ""
+            user_task_pairs = [(usr_items[0][0] if usr_items else "u0", first_str)]
 
         scenarios: list[IPIScenario] = []
-        for task_id, injection_task in inj_items:
+        for inj_id, injection_task in inj_items:
             if max_scenarios is not None and len(scenarios) >= max_scenarios:
                 break
-            sid = f"agentdojo/{suite_name}/{task_id}" if suite_name else f"agentdojo/{task_id}"
-            scenarios.append(IPIScenario(
-                id=sid,
-                user_task=user_task_str,
-                injection_goal=AgentDojoDataset._extract_goal(injection_task),
-                target_tool_calls=AgentDojoDataset._extract_target_calls(injection_task, env),
-                tool_schema=tool_schema,
-                metadata={"suite": suite_name, "task_id": task_id},
-            ))
+            goal         = AgentDojoDataset._extract_goal(injection_task)
+            target_calls = AgentDojoDataset._extract_target_calls(injection_task, env)
+
+            for usr_id, user_task_str in user_task_pairs:
+                if max_scenarios is not None and len(scenarios) >= max_scenarios:
+                    break
+                # Include user task id in scenario id only when pairing multiple
+                if pair_all_user_tasks:
+                    sid = f"agentdojo/{suite_name}/{inj_id}/{usr_id}"
+                else:
+                    sid = f"agentdojo/{suite_name}/{inj_id}"
+                scenarios.append(IPIScenario(
+                    id=sid,
+                    user_task=user_task_str,
+                    injection_goal=goal,
+                    target_tool_calls=target_calls,
+                    tool_schema=tool_schema,
+                    metadata={
+                        "suite": suite_name,
+                        "injection_task_id": inj_id,
+                        "user_task_id": usr_id,
+                    },
+                ))
 
         return scenarios
 
@@ -426,6 +502,7 @@ class AgentDojoDataset(IPIDataset):
         suite_names: Optional[list[str]],
         max_per_suite: Optional[int],
         include_tools: bool,
+        pair_all_user_tasks: bool = False,
     ) -> list[IPIScenario]:
         try:
             import agentdojo  # noqa: F401
@@ -442,7 +519,7 @@ class AgentDojoDataset(IPIDataset):
         scenarios: list[IPIScenario] = []
         for suite_name, suite in all_suites.items():
             extracted = AgentDojoDataset._extract_from_suite(
-                suite, suite_name, max_per_suite, include_tools
+                suite, suite_name, max_per_suite, include_tools, pair_all_user_tasks
             )
             scenarios.extend(extracted)
 
