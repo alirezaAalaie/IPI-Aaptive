@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "ipi-adaptive"
+version = "0.1.0"
+description = "Adaptive adversarial attacks for Indirect Prompt Injection research"
+requires-python = ">=3.10"
+dependencies = [
+    "litellm>=1.0",
+    "openai>=1.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+local = [
+    "transformers>=4.40",
+    "accelerate>=0.28",
+    "torch>=2.1",
+]
+agentdojo = [
+    "agentdojo>=0.1",
+]
+dev = [
+    "pandas",
+    "jupyter",
+    "ipykernel",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ipi*"]
