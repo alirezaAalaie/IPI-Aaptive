@@ -344,6 +344,9 @@ class AgentDojoDataset(IPIDataset):
         if usr_items:
             user_task_str = AgentDojoDataset._extract_user_task(usr_items[0][1])
 
+        # Get a default environment instance to call ground_truth() on each task
+        env = AgentDojoDataset._get_default_environment(suite)
+
         scenarios: list[IPIScenario] = []
         for task_id, injection_task in inj_items:
             if max_scenarios is not None and len(scenarios) >= max_scenarios:
@@ -353,7 +356,7 @@ class AgentDojoDataset(IPIDataset):
                 id=sid,
                 user_task=user_task_str,
                 injection_goal=AgentDojoDataset._extract_goal(injection_task),
-                target_tool_calls=AgentDojoDataset._extract_target_calls(injection_task),
+                target_tool_calls=AgentDojoDataset._extract_target_calls(injection_task, env),
                 tool_schema=tool_schema,
                 metadata={"suite": suite_name, "task_id": task_id},
             ))
@@ -460,28 +463,75 @@ class AgentDojoDataset(IPIDataset):
         return str(task)
 
     @staticmethod
-    def _extract_target_calls(task) -> str:
+    def _get_default_environment(suite):
         """
-        Extract expected tool calls from the task's ground_truth attribute.
-        Returns "" when ground_truth is a method (requires environment execution).
+        Return a default environment instance for the suite so we can call
+        ground_truth(pre_environment) on each injection task.
+
+        Tries in order:
+          1. suite.environment  — already-instantiated env on the suite object
+          2. suite.environment_type()  — instantiate the env class with no args
+          3. None  — fall back silently; target_tool_calls will be empty
         """
-        gt = getattr(task, "ground_truth", None)
-        if gt is None or callable(gt):
+        env = getattr(suite, "environment", None)
+        if env is not None:
+            return env
+        env_type = getattr(suite, "environment_type", None)
+        if env_type is not None:
+            try:
+                return env_type()
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _format_function_calls(calls: list) -> str:
+        """Format a list of agentdojo FunctionCall objects as a readable string."""
+        parts = []
+        for call in calls:
+            if hasattr(call, "function") and hasattr(call, "args"):
+                args_str = ", ".join(
+                    f"{k}={v!r}" for k, v in (call.args or {}).items()
+                )
+                parts.append(f"{call.function}({args_str})")
+            else:
+                parts.append(str(call))
+        return "; ".join(parts)
+
+    @staticmethod
+    def _extract_target_calls(task, env=None) -> str:
+        """
+        Extract expected tool calls from the task's ground_truth.
+
+        agentdojo tasks define ground_truth as an instance method:
+            def ground_truth(self, pre_environment) -> list[FunctionCall]
+
+        We instantiate the task class and call it with the provided environment.
+        Falls back to "" if the task cannot be instantiated or ground_truth fails.
+        """
+        gt_attr = getattr(task, "ground_truth", None)
+        if gt_attr is None:
             return ""
-        if isinstance(gt, str):
-            return gt
-        if isinstance(gt, list):
-            parts = []
-            for call in gt:
-                if hasattr(call, "function") and hasattr(call, "args"):
-                    args_str = ", ".join(
-                        f"{k}={v!r}" for k, v in (call.args or {}).items()
-                    )
-                    parts.append(f"{call.function}({args_str})")
-                else:
-                    parts.append(str(call))
-            return "; ".join(parts)
-        return str(gt)
+
+        # Static: already a plain string or list of FunctionCall objects
+        if isinstance(gt_attr, str):
+            return gt_attr
+        if isinstance(gt_attr, list):
+            return AgentDojoDataset._format_function_calls(gt_attr)
+
+        # Callable method — instantiate the task class and call ground_truth(env)
+        if callable(gt_attr) and env is not None:
+            try:
+                task_instance = task() if isinstance(task, type) else task
+                result = task_instance.ground_truth(env)
+                if isinstance(result, list):
+                    return AgentDojoDataset._format_function_calls(result)
+                if isinstance(result, str):
+                    return result
+            except Exception:
+                pass
+
+        return ""
 
     @staticmethod
     def _extract_user_task(task) -> str:
