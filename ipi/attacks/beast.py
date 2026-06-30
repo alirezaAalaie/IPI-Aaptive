@@ -55,11 +55,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .attacker import BaseAttacker
-from .evaluator import check_ipi_success
-from .judges import Judge
-from .llm_unified import LocalLLM, UnifiedLLM
-from .victim import Victim
+from ..attacker import BaseAttacker
+from ..evaluator import check_ipi_success
+from ..judges import Judge
+from ..llm_unified import LocalLLM, UnifiedLLM
+from ..victim import Victim
 
 log = logging.getLogger(__name__)
 
@@ -401,7 +401,7 @@ class BEASTAttacker(BaseAttacker):
         return True
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from .evaluator import ScenarioResult, make_scenario_target_fn
+        from ..evaluator import ScenarioResult, make_scenario_target_fn
         target_fn = make_scenario_target_fn(scenario, target)
         r = run_beast(
             prompt_prefix=self.prompt_prefix,

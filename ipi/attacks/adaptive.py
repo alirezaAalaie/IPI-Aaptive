@@ -58,15 +58,15 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from .attacker import BaseAttacker
-from .evaluator import (
+from ..attacker import BaseAttacker
+from ..evaluator import (
     check_ipi_success,
     get_target_token,
     ipi_early_stopping_condition,
 )
-from .judges import Judge
-from .llm_unified import _extract_logprob
-from .victim import Victim
+from ..judges import Judge
+from ..llm_unified import _extract_logprob
+from ..victim import Victim
 
 log = logging.getLogger(__name__)
 
@@ -1024,7 +1024,7 @@ class RSAttacker(BaseAttacker):
         self.seed                 = seed
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from .evaluator import ScenarioResult
+        from ..evaluator import ScenarioResult
         r = run_adaptive_rs(
             goal=scenario.injection_goal,
             target_llm=target,
@@ -1111,7 +1111,7 @@ class BeamRSAttacker(BaseAttacker):
         self.seed                 = seed
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from .evaluator import ScenarioResult
+        from ..evaluator import ScenarioResult
         r = run_adaptive_beam(
             goal=scenario.injection_goal,
             target_llm=target,

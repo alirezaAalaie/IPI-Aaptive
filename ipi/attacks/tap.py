@@ -36,15 +36,15 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
-from .attacker import BaseAttacker
-from .config import (
+from ..attacker import BaseAttacker
+from ..config import (
     ATTACK_TEMP, ATTACK_TOP_P, ATTACK_MAX_TOKENS,
     MAX_ATTACK_ATTEMPTS, TAP_DEPTH, TAP_WIDTH, TAP_BRANCHING,
 )
-from .judges import Judge
-from .llm_unified import APILLM, UnifiedLLM, parse_json_response
-from .victim import Victim
-from .prompts import (
+from ..judges import Judge
+from ..llm_unified import APILLM, UnifiedLLM, parse_json_response
+from ..victim import Victim
+from ..prompts import (
     get_attacker_prompt_original,
     get_on_topic_prompt,
     ATTACKER_PROMPT_IPI_SINGLE,
@@ -475,7 +475,7 @@ class TAPAttacker(BaseAttacker):
         self.on_topic_model   = on_topic_model
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from .evaluator import ScenarioResult, make_scenario_target_fn
+        from ..evaluator import ScenarioResult, make_scenario_target_fn
         target_fn = make_scenario_target_fn(scenario, target)
         r = run_tap(
             goal=scenario.injection_goal,

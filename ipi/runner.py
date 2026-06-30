@@ -11,8 +11,8 @@ from typing import Callable, Literal, Optional, Union
 
 from .judges import Judge
 from .llm_unified import APILLM, UnifiedLLM
-from .pair import PAIRResult, run_pair
-from .tap import TAPResult, run_tap
+from .attacks.pair import PAIRResult, run_pair
+from .attacks.tap import TAPResult, run_tap
 
 log = logging.getLogger(__name__)
 

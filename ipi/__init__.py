@@ -12,10 +12,11 @@ File layout
   attacker.py     — BaseAttacker ABC
   prompts.py      — attacker and judge system prompts
   judges.py       — EditDistanceJudge, IPILLMJudge, GPTJudge, KeywordJudge
-  tap.py          — TAP + TAPAttacker
-  pair.py         — PAIR + PAIRAttacker
-  adaptive.py     — RS + Beam-RS + RSAttacker + BeamRSAttacker
-  beast.py        — BEAST + BEASTAttacker  (local-only)
+  attacks/        — attack implementations (subpackage)
+    tap.py        — TAP + TAPAttacker
+    pair.py       — PAIR + PAIRAttacker
+    adaptive.py   — RS + Beam-RS + RSAttacker + BeamRSAttacker
+    beast.py      — BEAST + BEASTAttacker  (local-only)
   dataset.py      — IPIScenario, IPIDataset, ManualIPIDataset, AgentDojoDataset
   evaluator.py    — IPI success checks + AttackEvaluator
   runner.py       — run_attack / run_experiment (simple scenario-level API)
@@ -85,13 +86,13 @@ from .judges import EditDistanceJudge, GPTJudge, IPILLMJudge, KeywordJudge
 from .attacker import BaseAttacker
 
 # ---- Attack classes + low-level functions ----
-from .tap import TAPAttacker, TAPResult, run_tap
-from .pair import PAIRAttacker, PAIRResult, run_pair
-from .adaptive import (
+from .attacks.tap import TAPAttacker, TAPResult, run_tap
+from .attacks.pair import PAIRAttacker, PAIRResult, run_pair
+from .attacks.adaptive import (
     RSAttacker, BeamRSAttacker, AdaptiveResult,
     run_adaptive_rs, run_adaptive_beam,
 )
-from .beast import BEASTAttacker, BEASTResult, run_beast
+from .attacks.beast import BEASTAttacker, BEASTResult, run_beast
 
 # ---- Dataset ----
 from .dataset import IPIScenario, IPIDataset, ManualIPIDataset, AgentDojoDataset
