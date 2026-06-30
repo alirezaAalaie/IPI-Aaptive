@@ -506,8 +506,11 @@ class AgentDojoDataset(IPIDataset):
         agentdojo tasks define ground_truth as an instance method:
             def ground_truth(self, pre_environment) -> list[FunctionCall]
 
-        We instantiate the task class and call it with the provided environment.
-        Falls back to "" if the task cannot be instantiated or ground_truth fails.
+        Many tasks ignore the environment argument (static goals like
+        "delete file id 13"), so we can call ground_truth(None) and it works.
+        Tasks that actually read from the environment (e.g. tasks 3, 5 which
+        need live email content) will raise an exception — we catch it and
+        return "" for those.
         """
         gt_attr = getattr(task, "ground_truth", None)
         if gt_attr is None:
@@ -519,8 +522,10 @@ class AgentDojoDataset(IPIDataset):
         if isinstance(gt_attr, list):
             return AgentDojoDataset._format_function_calls(gt_attr)
 
-        # Callable method — instantiate the task class and call ground_truth(env)
-        if callable(gt_attr) and env is not None:
+        # Callable method — task instances are stored directly in the dict,
+        # so no need to instantiate. Pass env (may be None); tasks that don't
+        # access the environment work fine with None.
+        if callable(gt_attr):
             try:
                 task_instance = task() if isinstance(task, type) else task
                 result = task_instance.ground_truth(env)
@@ -529,7 +534,7 @@ class AgentDojoDataset(IPIDataset):
                 if isinstance(result, str):
                     return result
             except Exception:
-                pass
+                pass  # task reads from env (e.g. email body) — skip gracefully
 
         return ""
 
