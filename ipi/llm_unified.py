@@ -827,13 +827,14 @@ class LocalLLM(UnifiedLLM):
             messages = msgs
 
         try:
-            result = self._tokenizer_obj.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True,
+            # Always use tokenize=False — returns a plain str on every tokenizer
+            # version. Then encode separately, which always returns list[int].
+            # Using tokenize=True is unreliable: some versions return str,
+            # some return list[int], causing downstream torch.tensor() failures.
+            rendered = self._tokenizer_obj.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
             )
-            # Some tokenizer versions return the rendered string instead of IDs
-            if isinstance(result, str):
-                result = self._tokenizer_obj.encode(result, add_special_tokens=False)
-            return result
+            return self._tokenizer_obj.encode(rendered, add_special_tokens=False)
         except ValueError:
             # Tokenizer has no chat_template (older models like Vicuna v1.3,
             # base LLaMA, etc.) — fall back to a simple human/assistant format.
