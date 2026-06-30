@@ -744,6 +744,46 @@ class LocalLLM(UnifiedLLM):
 
         return torch.exp(logs / (len(x2[0]) - len(x1[0])))
 
+    # --- Config fork (share GPU weights, change settings) ---
+
+    def with_config(
+        self,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+    ) -> "LocalLLM":
+        """
+        Return a shallow copy of this LocalLLM with updated config values.
+
+        The copy **shares** the underlying HuggingFace model and tokenizer objects
+        (same GPU tensors, no extra VRAM), so this is the correct way to use one
+        loaded model in multiple roles (target / attacker / judge) with different
+        system prompts or sampling settings.
+
+        Example::
+
+            base = LocalLLM('lmsys/vicuna-7b-v1.5')          # loads once
+
+            target  = base.with_config(system_prompt=AGENT_SYSTEM_PROMPT,
+                                       temperature=0.0, max_tokens=500)
+            attacker = base.with_config(temperature=1.0, max_tokens=1024)
+            judge    = base.with_config(temperature=0.0, max_tokens=20)
+        """
+        clone = copy.copy(self)                          # shallow: shares _hf_model_obj
+        if system_prompt is not None:
+            clone.system_prompt = system_prompt
+        if temperature is not None:
+            clone.temperature = temperature
+        if max_tokens is not None:
+            clone.max_tokens = max_tokens
+        if top_p is not None:
+            clone.top_p = top_p
+        if top_k is not None:
+            clone.top_k = top_k
+        return clone
+
     # --- Private: init ---
 
     def _init_local(self, device_map: str, torch_dtype) -> None:
