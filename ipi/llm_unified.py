@@ -817,11 +817,23 @@ class LocalLLM(UnifiedLLM):
 
     # --- Private: local generation ---
 
-    def _build_local_prompt_ids(self, messages: list[dict]) -> list[int]:
+    def _build_local_prompt_ids(self, messages) -> list[int]:
+        # Accept a plain string — wrap it so callers can do generate("hi")
+        if isinstance(messages, str):
+            msgs: list[dict] = []
+            if self.system_prompt:
+                msgs.append({"role": "system", "content": self.system_prompt})
+            msgs.append({"role": "user", "content": messages})
+            messages = msgs
+
         try:
-            return self._tokenizer_obj.apply_chat_template(
+            result = self._tokenizer_obj.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True,
             )
+            # Some tokenizer versions return the rendered string instead of IDs
+            if isinstance(result, str):
+                result = self._tokenizer_obj.encode(result, add_special_tokens=False)
+            return result
         except ValueError:
             # Tokenizer has no chat_template (older models like Vicuna v1.3,
             # base LLaMA, etc.) — fall back to a simple human/assistant format.
