@@ -334,7 +334,7 @@ class AttackEvaluator:
         """Apply success_fn or fall back to function-name heuristic."""
         if self.success_fn is not None:
             return self.success_fn(response, target_tool_calls)
-        return check_ipi_success(response, target_tool_calls, mode="function_name")
+        return check_ipi_success(response, target_tool_calls, mode="contains")
 
     def run(self, dataset: IPIDataset) -> EvalResult:
         """
