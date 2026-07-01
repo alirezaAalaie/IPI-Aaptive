@@ -618,27 +618,45 @@ class AgentDojoDataset(IPIDataset):
     @staticmethod
     def _extract_user_task(task) -> str:
         """Extract the task string from a user-task object or class."""
-        for attr in ("TASK", "task", "user_task", "prompt", "description"):
+        # AgentDojo stores the instruction in PROMPT (ClassVar[str])
+        for attr in ("PROMPT", "TASK", "DESCRIPTION", "prompt", "task", "user_task", "description"):
             val = getattr(task, attr, None)
-            if val and isinstance(val, str):
+            if isinstance(val, str) and val:
                 return val
         return str(task)
 
     @staticmethod
     def _extract_tool_schema(suite) -> str:
-        """Extract a human-readable tool schema from the suite environment."""
+        """Extract a human-readable tool schema from the suite.
+
+        AgentDojo TaskSuite exposes tools directly via suite.tools.
+        Falls back to suite.environment.tools for other suite shapes.
+        Includes parameter signatures when available (Pydantic model_fields).
+        """
         try:
-            env = getattr(suite, "environment", None) or getattr(suite, "env", None)
-            if env is None:
-                return ""
-            tools = getattr(env, "tools", None) or getattr(env, "available_tools", None)
+            # Primary: AgentDojo stores tools directly on the suite object
+            tools = getattr(suite, "tools", None)
+            if not tools:
+                # Fallback: some suite shapes nest tools under environment
+                env = getattr(suite, "environment", None) or getattr(suite, "env", None)
+                tools = getattr(env, "tools", None) or getattr(env, "available_tools", None)
             if not tools:
                 return ""
+
             lines = []
             for tool in tools:
                 name = getattr(tool, "name", str(tool))
                 desc = getattr(tool, "description", "")
-                lines.append(f"{name}: {desc}")
+                # Include parameter names when available (Pydantic v1 or v2)
+                schema = getattr(tool, "parameters", None)
+                params: list[str] = []
+                if schema is not None:
+                    if hasattr(schema, "model_fields"):      # pydantic v2
+                        params = list(schema.model_fields.keys())
+                    elif hasattr(schema, "__fields__"):      # pydantic v1
+                        params = list(schema.__fields__.keys())
+                signature = f"{name}({', '.join(params)})" if params else name
+                lines.append(f"{signature}: {desc}")
             return "\n".join(lines)
         except Exception:
             return ""
