@@ -198,23 +198,14 @@ def make_scenario_target_fn(
             messages.append({"role": "system", "content": system_prompt})
 
         if scenario.user_task:
-            # Step 1 — legitimate user task (what the user actually asked for)
+            # Legitimate user task — what the user actually asked for.
             messages.append({"role": "user", "content": scenario.user_task})
-            # Step 2 — injection arrives embedded in tool / environment data,
-            #           NOT as a direct user instruction.  This is the "indirect"
-            #           part of IPI: the attack payload is in retrieved content
-            #           (email body, calendar event, file contents, etc.).
-            messages.append({
-                "role": "assistant",
-                "content": "<tool_call>\nretrieve_environment_data()\n</tool_call>",
-            })
-            messages.append({
-                "role": "user",
-                "content": f"[Tool output]\n{injection}",
-            })
+            # Injection arrives embedded in environment data (email body,
+            # calendar event, file contents, etc.) — NOT as a user instruction.
+            # This is the "indirect" part of IPI.
+            messages.append({"role": "user", "content": f"[Tool output]\n{injection}"})
         else:
-            # No user task defined — fall back to direct injection
-            # (manual / non-AgentDojo scenarios)
+            # No user task (manual scenario) — inject directly.
             messages.append({"role": "user", "content": injection})
 
         try:
@@ -300,26 +291,27 @@ class EvalResult:
 
 class AttackEvaluator:
     """
-    Thin evaluator that runs a pre-configured BaseAttacker across an IPIDataset.
+    Evaluator that runs a BaseAttacker across an IPIDataset and determines success.
+
+    The attacker's internal judge is used only to *guide the search* (score
+    candidates, drive early stopping).  Final success is determined here by
+    ``success_fn``, keeping evaluation independent from attack heuristics.
 
     Args:
-        target:   Victim instance (TargetLLM or custom defense subclass).
-                  Use TargetLLM(LocalLLM(...)) for BEAST.
-        attacker: Any BaseAttacker subclass (TAPAttacker, PAIRAttacker, RSAttacker,
-                  BeamRSAttacker, BEASTAttacker). The attacker owns its own judge
-                  and all hyperparameters.
-        verbose:  Enable INFO-level logging per scenario.
+        target:     Victim instance (TargetLLM or custom defense subclass).
+        attacker:   Any BaseAttacker subclass (TAPAttacker, PAIRAttacker, etc.).
+        verbose:    Enable INFO-level logging per scenario.
+        success_fn: Callable(response: str, target_tool_calls: str) -> bool.
+                    Determines whether an attack succeeded.
+                    Defaults to ``check_ipi_success(..., mode='function_name')``:
+                    success if the target function name appears in the response.
 
     Example:
-        from ipi.tap import TAPAttacker
-        from ipi.judges import IPILLMJudge
-        from ipi.target import TargetLLM
-        from ipi.llm_unified import APILLM
-
         judge    = IPILLMJudge(model="gpt-4o-mini")
         attacker = TAPAttacker(judge=judge, attacker_llm=APILLM("gpt-4o"), depth=10)
         evaluator = AttackEvaluator(
-            target=TargetLLM(APILLM("gpt-4o-mini", system_prompt=AGENT_PROMPT)),
+            target=TargetLLM(APILLM("gpt-4o-mini"),
+                             system_prompt_template=TargetLLM.AGENTDOJO_SYSTEM_PROMPT_TEMPLATE),
             attacker=attacker,
         )
         result = evaluator.run(dataset)
@@ -329,20 +321,36 @@ class AttackEvaluator:
     def __init__(
         self,
         target: Victim,
-        attacker,                    # BaseAttacker (duck-typed to avoid circular import)
+        attacker,
         verbose: bool = False,
+        success_fn: Optional[Callable[[str, str], bool]] = None,
     ):
-        self.target   = target
-        self.attacker = attacker
-        self.verbose  = verbose
+        self.target     = target
+        self.attacker   = attacker
+        self.verbose    = verbose
+        self.success_fn = success_fn   # None → default function-name check
+
+    def _check_success(self, response: str, target_tool_calls: str) -> bool:
+        """Apply success_fn or fall back to function-name heuristic."""
+        if self.success_fn is not None:
+            return self.success_fn(response, target_tool_calls)
+        return check_ipi_success(response, target_tool_calls, mode="function_name")
 
     def run(self, dataset: IPIDataset) -> EvalResult:
-        """Run the attacker on every scenario in dataset. Returns aggregated EvalResult."""
+        """
+        Run the attacker on every scenario in dataset.
+
+        The attacker's judge guides the search; success is re-evaluated here
+        using _check_success, so the final ASR is independent of the judge's
+        threshold or scoring style.
+        """
         attack_name = type(self.attacker).__name__.replace("Attacker", "").lower()
         results: list[ScenarioResult] = []
         for scenario in dataset:
             try:
                 r = self.attacker.run_scenario(self.target, scenario, verbose=self.verbose)
+                # Override success: evaluator owns this, not the attack's judge
+                r.success = self._check_success(r.target_response, scenario.target_tool_calls)
                 results.append(r)
             except Exception as e:
                 log.error("[AttackEvaluator] %s scenario=%s error: %s",
