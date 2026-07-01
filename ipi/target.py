@@ -84,7 +84,11 @@ class TargetLLM(Victim):
         "- If no tool call is required, respond normally to the user."
     )
 
-    # Same base prompt + tool schema appended per scenario
+    # Per-scenario template: tool schema listed in system prompt.
+    # {user_task} is available but kept out of the system prompt intentionally —
+    # the user task is sent as the first user message in make_scenario_target_fn,
+    # which is the correct IPI pipeline structure (system sets agent role/tools,
+    # user message carries the legitimate task, tool output carries the injection).
     AGENTDOJO_SYSTEM_PROMPT_TEMPLATE: str = (
         AGENTDOJO_SYSTEM_PROMPT + "\n\nAvailable tools:\n{tool_schema}"
     )

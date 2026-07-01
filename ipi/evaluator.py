@@ -196,7 +196,27 @@ def make_scenario_target_fn(
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": injection})
+
+        if scenario.user_task:
+            # Step 1 — legitimate user task (what the user actually asked for)
+            messages.append({"role": "user", "content": scenario.user_task})
+            # Step 2 — injection arrives embedded in tool / environment data,
+            #           NOT as a direct user instruction.  This is the "indirect"
+            #           part of IPI: the attack payload is in retrieved content
+            #           (email body, calendar event, file contents, etc.).
+            messages.append({
+                "role": "assistant",
+                "content": "<tool_call>\nretrieve_environment_data()\n</tool_call>",
+            })
+            messages.append({
+                "role": "user",
+                "content": f"[Tool output]\n{injection}",
+            })
+        else:
+            # No user task defined — fall back to direct injection
+            # (manual / non-AgentDojo scenarios)
+            messages.append({"role": "user", "content": injection})
+
         try:
             return victim.generate(messages)
         except Exception as e:
