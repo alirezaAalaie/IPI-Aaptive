@@ -202,8 +202,9 @@ def make_scenario_target_fn(
             messages.append({"role": "user", "content": scenario.user_task})
             # Injection arrives embedded in environment data (email body,
             # calendar event, file contents, etc.) — NOT as a user instruction.
-            # This is the "indirect" part of IPI.
-            messages.append({"role": "user", "content": f"[Tool output]\n{injection}"})
+            # <env> tags match the system prompt so the model treats this as
+            # retrieved data rather than echoing the format back.
+            messages.append({"role": "user", "content": f"<env>\n{injection}\n</env>"})
         else:
             # No user task (manual scenario) — inject directly.
             messages.append({"role": "user", "content": injection})
