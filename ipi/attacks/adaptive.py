@@ -58,7 +58,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from ..attacker import BaseAttacker
+from ..attacker import AdaptiveAttacker
 from ..evaluator import (
     check_ipi_success,
     get_target_token,
@@ -990,7 +990,7 @@ def run_adaptive_beam(
 # RSAttacker — class-based API
 # ---------------------------------------------------------------------------
 
-class RSAttacker(BaseAttacker):
+class RSAttacker(AdaptiveAttacker):
     """
     Adaptive Random Search (RS) attacker class.
 
@@ -1082,7 +1082,7 @@ class RSAttacker(BaseAttacker):
 # BeamRSAttacker — class-based API
 # ---------------------------------------------------------------------------
 
-class BeamRSAttacker(BaseAttacker):
+class BeamRSAttacker(AdaptiveAttacker):
     """
     Beam Random Search (Beam-RS) attacker class.
 

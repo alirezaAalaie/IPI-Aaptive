@@ -71,7 +71,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..attacker import BaseAttacker
+from ..attacker import AdaptiveAttacker
 from ..evaluator import check_ipi_success
 from ..judges import Judge
 from ..victim import Victim
@@ -607,7 +607,7 @@ def run_gcg(
 # GCGAttacker — class-based API
 # ---------------------------------------------------------------------------
 
-class GCGAttacker(BaseAttacker):
+class GCGAttacker(AdaptiveAttacker):
     """
     GCG (Greedy Coordinate Gradient) attacker class.
 

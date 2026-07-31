@@ -62,7 +62,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from ..attacker import BaseAttacker
+from ..attacker import StaticAttacker
 from ..evaluator import check_ipi_success
 from ..judges import Judge
 from ..victim import Victim
@@ -338,7 +338,7 @@ def run_static_injection(
 # Attacker classes — one per strategy
 # ---------------------------------------------------------------------------
 
-class _StaticInjectionAttacker(BaseAttacker):
+class _StaticInjectionAttacker(StaticAttacker):
     """
     Base class for all static (single-query) injection attackers.
 
@@ -350,7 +350,7 @@ class _StaticInjectionAttacker(BaseAttacker):
 
     def __init__(
         self,
-        judge: Judge,
+        judge: Optional[Judge] = None,
         fake_answer: str = "",
         eval_mode: str = "function_name",
     ):
@@ -428,7 +428,7 @@ class NaiveAttacker(_StaticInjectionAttacker):
     _STRATEGY   = "naive"
     _ATTACK_NAME = "naive"
 
-    def __init__(self, judge: Judge, eval_mode: str = "function_name"):
+    def __init__(self, judge: Optional[Judge] = None, eval_mode: str = "function_name"):
         super().__init__(judge=judge, fake_answer="", eval_mode=eval_mode)
 
 
@@ -450,7 +450,7 @@ class EscapeAttacker(_StaticInjectionAttacker):
     _STRATEGY   = "escape"
     _ATTACK_NAME = "escape"
 
-    def __init__(self, judge: Judge, eval_mode: str = "function_name"):
+    def __init__(self, judge: Optional[Judge] = None, eval_mode: str = "function_name"):
         super().__init__(judge=judge, fake_answer="", eval_mode=eval_mode)
 
 
@@ -472,7 +472,7 @@ class IgnoreAttacker(_StaticInjectionAttacker):
     _STRATEGY   = "ignore"
     _ATTACK_NAME = "ignore"
 
-    def __init__(self, judge: Judge, eval_mode: str = "function_name"):
+    def __init__(self, judge: Optional[Judge] = None, eval_mode: str = "function_name"):
         super().__init__(judge=judge, fake_answer="", eval_mode=eval_mode)
 
 
@@ -499,7 +499,7 @@ class FakeCompletionAttacker(_StaticInjectionAttacker):
 
     def __init__(
         self,
-        judge: Judge,
+        judge: Optional[Judge] = None,
         fake_answer: str = "",
         eval_mode: str = "function_name",
     ):
@@ -532,7 +532,7 @@ class CombinedAttacker(_StaticInjectionAttacker):
 
     def __init__(
         self,
-        judge: Judge,
+        judge: Optional[Judge] = None,
         fake_answer: str = "",
         eval_mode: str = "function_name",
     ):
@@ -549,7 +549,7 @@ class CombinedAttacker(_StaticInjectionAttacker):
 
 def create_static_attacker(
     strategy: str,
-    judge: Judge,
+    judge: Optional[Judge] = None,
     fake_answer: str = "",
     eval_mode: str = "function_name",
 ) -> _StaticInjectionAttacker:
@@ -583,6 +583,6 @@ def create_static_attacker(
             f"Valid: {sorted(_MAP)}"
         )
     cls = _MAP[strategy]
-    if strategy in ("fake_completion", "combined"):
-        return cls(judge=judge, fake_answer=fake_answer, eval_mode=eval_mode)
-    return cls(judge=judge, eval_mode=eval_mode)
+    return cls(judge=judge, fake_answer=fake_answer, eval_mode=eval_mode) if strategy in (
+        "fake_completion", "combined"
+    ) else cls(judge=judge, eval_mode=eval_mode)

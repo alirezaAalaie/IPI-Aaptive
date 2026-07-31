@@ -22,7 +22,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
-from ..attacker import BaseAttacker
+from ..attacker import AdaptiveAttacker
 from ..config import (
     ATTACK_TEMP, ATTACK_TOP_P, ATTACK_MAX_TOKENS,
     MAX_ATTACK_ATTEMPTS, PAIR_N_STREAMS, PAIR_N_ITERATIONS,
@@ -289,7 +289,7 @@ def run_pair(
 # PAIRAttacker — class-based API
 # ---------------------------------------------------------------------------
 
-class PAIRAttacker(BaseAttacker):
+class PAIRAttacker(AdaptiveAttacker):
     """
     PAIR (Prompt Automatic Iterative Refinement) attacker class.
 

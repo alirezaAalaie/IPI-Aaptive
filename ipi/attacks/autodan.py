@@ -69,7 +69,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ..attacker import BaseAttacker
+from ..attacker import AdaptiveAttacker
 from ..evaluator import check_ipi_success
 from ..judges import Judge
 from ..victim import Victim
@@ -982,7 +982,7 @@ def run_autodan_hga(
 # AutoDANAttacker — class-based API (mirrors all other attackers)
 # ---------------------------------------------------------------------------
 
-class AutoDANAttacker(BaseAttacker):
+class AutoDANAttacker(AdaptiveAttacker):
     """
     AutoDAN (Hierarchical Genetic Algorithm) attacker class.
 

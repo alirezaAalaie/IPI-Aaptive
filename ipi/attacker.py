@@ -45,23 +45,27 @@ if TYPE_CHECKING:
 
 class BaseAttacker(ABC):
     """
-    Abstract base class for IPI attackers.
+    Abstract base class for all IPI attackers.
 
-    Args:
-        judge: Judge instance. Owned exclusively by this attacker —
-               it is never passed to AttackEvaluator or shared externally.
+    Subclasses implement ``run_scenario(target, scenario, verbose) -> ScenarioResult``.
     """
 
-    def __init__(self, judge: Judge):
+    def __init__(self, judge: Optional[Judge] = None):
         self.judge = judge
 
     @classmethod
     def requires_local_target(cls) -> bool:
         """
         Return True if this attack requires a LocalLLM target model.
-        Default False; overridden by BEASTAttacker.
+        Default False; overridden by BEASTAttacker, GCGAttacker, etc.
         """
         return False
+
+    @property
+    @abstractmethod
+    def is_iterative(self) -> bool:
+        """Return True if the attack performs iterative optimization/search."""
+        ...
 
     @abstractmethod
     def run_scenario(
@@ -84,3 +88,43 @@ class BaseAttacker(ABC):
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(judge={self.judge!r})"
+
+
+class StaticAttacker(BaseAttacker):
+    """
+    Base class for single-query, template-based static prompt injection attacks (OPI).
+
+    Static attacks (Naive, Escape, Ignore, FakeCompletion, Combined) construct
+    the injection string deterministically from a fixed template in 1 query.
+    They do NOT require an LLM judge during injection generation (judge is optional).
+
+    Args:
+        judge: Optional Judge instance (used only if explicit quality scoring is requested).
+    """
+
+    def __init__(self, judge: Optional[Judge] = None):
+        super().__init__(judge=judge)
+
+    @property
+    def is_iterative(self) -> bool:
+        return False
+
+
+class AdaptiveAttacker(BaseAttacker):
+    """
+    Base class for iterative, search-based, or gradient-based adaptive attacks.
+
+    Adaptive attacks (TAP, PAIR, RS, Beam-RS, BEAST, AutoDAN, GCG) optimize
+    the injection iteratively using feedback from an LLM judge, logprob signals,
+    or white-box gradients across multiple target model queries.
+
+    Args:
+        judge: Judge instance used to guide the iterative search.
+    """
+
+    def __init__(self, judge: Optional[Judge] = None):
+        super().__init__(judge=judge)
+
+    @property
+    def is_iterative(self) -> bool:
+        return True

@@ -55,7 +55,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..attacker import BaseAttacker
+from ..attacker import AdaptiveAttacker
 from ..evaluator import check_ipi_success
 from ..judges import Judge
 from ..llm_unified import LocalLLM, UnifiedLLM
@@ -359,7 +359,7 @@ def run_beast(
 # BEASTAttacker — class-based API
 # ---------------------------------------------------------------------------
 
-class BEASTAttacker(BaseAttacker):
+class BEASTAttacker(AdaptiveAttacker):
     """
     BEAST (Beam Search Adversarial Suffix Tokens) attacker class.
 

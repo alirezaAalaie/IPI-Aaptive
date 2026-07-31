@@ -150,7 +150,16 @@ def _format_bipia_prompt_helper(task: str, context: str, metadata: dict, require
         ),
     }
 
-    question = metadata.get("question", "")
+    question_raw = metadata.get("question", "").strip()
+    if not question_raw:
+        question_raw = (metadata.get("user_task") or "").strip()
+    if question_raw.startswith("Q:"):
+        question = question_raw[2:].strip()
+    elif question_raw.startswith("Question:"):
+        question = question_raw[9:].strip()
+    else:
+        question = question_raw
+
     error = metadata.get("error", "")
     code_val = metadata.get("code", "")
 
@@ -294,11 +303,12 @@ def make_scenario_target_fn(
     Returns:
         Callable[[str], str] — target_fn(injection_string) -> response_string.
     """
-    # 1. Custom formatting for BIPIA general prompt-injection scenarios
-    if getattr(scenario, "metadata", {}).get("dataset_type") == "bipia":
+    # 1. Custom formatting for BIPIA & Hijack general prompt-injection scenarios
+    ds_type = getattr(scenario, "metadata", {}).get("dataset_type", "")
+    if ds_type in ("bipia", "hijack"):
         metadata = scenario.metadata
-        task = metadata["task_name"]
-        clean_context = metadata["clean_context"]
+        task = metadata.get("task_name") or metadata.get("source_task") or "qa"
+        clean_context = scenario.pipeline_context or metadata.get("clean_context", "")
         position = metadata.get("position", "end")
         seed = metadata.get("seed", 42)
 
@@ -317,11 +327,13 @@ def make_scenario_target_fn(
             elif hasattr(victim, "require_system_prompt"):
                 require_system = victim.require_system_prompt
 
-            messages = _format_bipia_prompt_helper(task, poisoned_context, metadata, require_system)
+            # Pass scenario.user_task in metadata if question is missing
+            meta_with_task = {"question": scenario.user_task, **metadata}
+            messages = _format_bipia_prompt_helper(task, poisoned_context, meta_with_task, require_system)
             try:
                 return victim.generate(messages)
             except Exception as e:
-                log.warning("[target_fn] BIPIA scenario=%s error: %s", scenario.id, e)
+                log.warning("[target_fn] BIPIA/Hijack scenario=%s error: %s", scenario.id, e)
                 return ""
         return target_fn
 

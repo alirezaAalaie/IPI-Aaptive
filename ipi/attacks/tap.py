@@ -36,7 +36,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
-from ..attacker import BaseAttacker
+from ..attacker import AdaptiveAttacker
 from ..config import (
     ATTACK_TEMP, ATTACK_TOP_P, ATTACK_MAX_TOKENS,
     MAX_ATTACK_ATTEMPTS, TAP_DEPTH, TAP_WIDTH, TAP_BRANCHING,
@@ -432,7 +432,7 @@ def run_tap(
 # TAPAttacker — class-based API
 # ---------------------------------------------------------------------------
 
-class TAPAttacker(BaseAttacker):
+class TAPAttacker(AdaptiveAttacker):
     """
     TAP (Tree of Attacks with Pruning) attacker class.
 
