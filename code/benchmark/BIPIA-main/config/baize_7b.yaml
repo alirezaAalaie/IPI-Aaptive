@@ -1,3 +1,0 @@
-llm_name: "baize"
-load_8bit: False
-model_name: project-baize/baize-v2-7b

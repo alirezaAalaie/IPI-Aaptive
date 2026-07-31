@@ -1,4 +1,0 @@
-load_8bit: False
-llm_name: "alpaca"
-model_name: huggyllama/llama-7b
-delta_weights: tatsu-lab/alpaca-7b-wdiff

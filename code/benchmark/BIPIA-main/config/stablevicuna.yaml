@@ -1,4 +1,0 @@
-load_8bit: False
-model_name: huggyllama/llama-13b
-delta_weights: CarperAI/stable-vicuna-13b-delta
-llm_name: "stablevicuna"

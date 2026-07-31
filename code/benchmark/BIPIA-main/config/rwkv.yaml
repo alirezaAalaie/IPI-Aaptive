@@ -1,3 +1,0 @@
-load_8bit: False
-model_name: BlinkDL/rwkv-4-raven
-llm_name: "rwkv"

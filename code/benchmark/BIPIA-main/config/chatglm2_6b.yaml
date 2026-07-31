@@ -1,3 +1,0 @@
-load_8bit: False
-model_name: "THUDM/chatglm2-6b"
-llm_name: "chatglm"

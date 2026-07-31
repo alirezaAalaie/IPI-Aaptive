@@ -1,3 +1,0 @@
-llm_name: "alpaca"
-model_name: chavinlo/alpaca-13b
-load_8bit: False
