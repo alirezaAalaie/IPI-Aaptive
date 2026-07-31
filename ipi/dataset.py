@@ -322,16 +322,48 @@ class BipiaDataset(IPIDataset):
 
         if benchmark_dir is None:
             # Candidate 3: relative to current working directory
-            for rel in ["code/benchmark/BIPIA-main/benchmark", "benchmark", "../code/benchmark/BIPIA-main/benchmark"]:
+            for rel in ["code/benchmark/BIPIA-main/benchmark", "benchmark", "../code/benchmark/BIPIA-main/benchmark", "../../code/benchmark/BIPIA-main/benchmark"]:
                 if os.path.exists(rel) and os.path.isdir(rel):
                     benchmark_dir = os.path.abspath(rel)
                     break
 
         if benchmark_dir is None:
+            # Candidate 4: Kaggle input directory search
+            import glob
+            kaggle_candidates = glob.glob("/kaggle/input/**/benchmark", recursive=True) + glob.glob("/kaggle/working/**/benchmark", recursive=True)
+            for candidate in kaggle_candidates:
+                if os.path.exists(os.path.join(candidate, "email")) or os.path.exists(os.path.join(candidate, "code")):
+                    benchmark_dir = candidate
+                    break
+
+        if benchmark_dir is None:
+            # Candidate 5: Auto-download/clone BIPIA into ~/.cache/ipi/bipia/
+            cache_dir = os.path.expanduser("~/.cache/ipi/bipia")
+            cached_benchmark = os.path.join(cache_dir, "BIPIA-main", "benchmark")
+            if os.path.exists(cached_benchmark) and os.path.isdir(cached_benchmark):
+                benchmark_dir = cached_benchmark
+            else:
+                try:
+                    import subprocess
+                    os.makedirs(cache_dir, exist_ok=True)
+                    log.info("Auto-downloading BIPIA benchmark to %s...", cache_dir)
+                    subprocess.run(
+                        ["git", "clone", "--depth", "1", "https://github.com/microsoft/BIPIA.git", os.path.join(cache_dir, "BIPIA-main")],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    if os.path.exists(cached_benchmark):
+                        benchmark_dir = cached_benchmark
+                except Exception as e:
+                    log.warning("Auto-download of BIPIA benchmark failed: %s", e)
+
+        if benchmark_dir is None:
             raise FileNotFoundError(
-                "Could not automatically locate the BIPIA benchmark directory. "
+                "Could not automatically locate or download the BIPIA benchmark directory. "
                 "Please specify 'benchmark_dir' path when creating BipiaDataset."
             )
+
 
         # Resolve paths
         context_file = os.path.join(benchmark_dir, task_name, f"{split}.jsonl")

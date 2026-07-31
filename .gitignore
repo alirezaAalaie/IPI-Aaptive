@@ -10,5 +10,4 @@ build/
 .pytest_cache/
 .DS_Store
 results.json
-code/
 papers/
