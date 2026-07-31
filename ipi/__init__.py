@@ -20,7 +20,7 @@ File layout
     autodan.py    — AutoDAN GA/HGA + AutoDANAttacker  (local-only)
     gcg.py        — GCG + GCGAttacker  (local-only)
     static_injection.py — Naive, Escape, Ignore, FakeCompletion, Combined (OPI, API-compatible)
-  dataset.py      — IPIScenario, IPIDataset, ManualIPIDataset, AgentDojoDataset
+  dataset.py      — IPIScenario, IPIDataset, ManualIPIDataset, AgentDojoDataset, BipiaDataset, HijackDataset
   evaluator.py    — IPI success checks + AttackEvaluator
   runner.py       — run_attack / run_experiment (simple scenario-level API)
   target.py       — TargetLLM (Victim wrapping UnifiedLLM) + make_target factory
@@ -109,7 +109,10 @@ from .attacks.static_injection import (
 )
 
 # ---- Dataset ----
-from .dataset import IPIScenario, IPIDataset, ManualIPIDataset, AgentDojoDataset, BipiaDataset
+from .dataset import (
+    IPIScenario, IPIDataset, ManualIPIDataset, AgentDojoDataset, BipiaDataset,
+    HijackDataset, HIJACK_ATTACKS, _BIPIA_TARGET_MAP, _BIPIA_OPTIM_TARGET_MAP,
+)
 
 # ---- Evaluator ----
 from .evaluator import (
@@ -180,6 +183,7 @@ __all__ = [
     "build_fake_completion_injection", "build_combined_injection",
     # Dataset
     "IPIScenario", "IPIDataset", "ManualIPIDataset", "AgentDojoDataset", "BipiaDataset",
+    "HijackDataset", "HIJACK_ATTACKS", "_BIPIA_TARGET_MAP", "_BIPIA_OPTIM_TARGET_MAP",
     # Evaluator
     "check_function_name", "check_exact_function_call", "check_ipi_success",
     "get_target_token", "ipi_early_stopping_condition",

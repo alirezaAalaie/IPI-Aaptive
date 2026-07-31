@@ -671,7 +671,13 @@ class GCGAttacker(BaseAttacker):
         target_fn = make_scenario_target_fn(scenario, target)
         r = run_gcg(
             adv_prefix=self.adv_prefix,
-            target_str=scenario.target_tool_calls or scenario.injection_goal,
+            # optimization_target: tokenized as the full CE-loss target sequence.
+            # Must be a real string — never a sentinel like __base64__.
+            target_str=(
+                scenario.optimization_target
+                or scenario.target_output
+                or scenario.injection_goal
+            ),
             target_llm=target,
             eval_target_fn=target_fn,
             eval_mode=self.eval_mode,

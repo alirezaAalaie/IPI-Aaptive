@@ -1040,7 +1040,14 @@ class RSAttacker(BaseAttacker):
         r = run_adaptive_rs(
             goal=scenario.injection_goal,
             target_llm=target,
-            target_str=scenario.target_tool_calls or scenario.injection_goal,
+            # optimization_target: short literal for RS token-logprob maximization.
+            # Falls back to target_output (only safe when it is a real literal, not a
+            # sentinel like __base64__), then to injection_goal as last resort.
+            target_str=(
+                scenario.optimization_target
+                or scenario.target_output
+                or scenario.injection_goal
+            ),
             prompt_template=self.prompt_template,
             n_tokens_adv=self.n_tokens_adv,
             n_tokens_change_max=self.n_tokens_change_max,
@@ -1127,7 +1134,11 @@ class BeamRSAttacker(BaseAttacker):
         r = run_adaptive_beam(
             goal=scenario.injection_goal,
             target_llm=target,
-            target_str=scenario.target_tool_calls or scenario.injection_goal,
+            target_str=(
+                scenario.optimization_target
+                or scenario.target_output
+                or scenario.injection_goal
+            ),
             prompt_template=self.prompt_template,
             n_tokens_adv=self.n_tokens_adv,
             n_tokens_change_max=self.n_tokens_change_max,
