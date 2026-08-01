@@ -165,7 +165,7 @@ def build_escape_injection(goal: str, user_task: str = "") -> str:
 
     ``\n\n\n[goal]``
     """
-    return f"\n\n\n{goal}"
+    return f"\n\n\n\n{goal}"
 
 
 
