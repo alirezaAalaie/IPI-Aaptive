@@ -161,11 +161,12 @@ def build_naive_injection(goal: str, user_task: str = "") -> str:
 
 def build_escape_injection(goal: str, user_task: str = "") -> str:
     """
-    Escape-character attack: newline used as separator.
+    Escape-character attack: multiple newlines used as structural break.
 
-    ``\n[goal]``
+    ``\n\n\n[goal]``
     """
-    return f"\n{goal}"
+    return f"\n\n\n{goal}"
+
 
 
 def build_ignore_injection(goal: str, user_task: str = "") -> str:
