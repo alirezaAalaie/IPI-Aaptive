@@ -117,7 +117,11 @@ class TargetLLM(Victim):
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
     ) -> str:
-        return self.llm.generate(messages, max_tokens=max_tokens, temperature=temperature)
+        self.last_input_messages = messages
+        resp = self.llm.generate(messages, max_tokens=max_tokens, temperature=temperature)
+        self.last_response = resp
+        return resp
+
 
     # ------------------------------------------------------------------
     # RS / Beam-RS — logprob access

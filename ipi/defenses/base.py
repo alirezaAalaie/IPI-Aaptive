@@ -68,10 +68,13 @@ class DefendedVictim(Victim):
         temperature: Optional[float] = None,
     ) -> str:
         processed = self.preprocess_messages(messages)
+        self.last_input_messages = processed
         raw_response = self.target.generate(
             processed, max_tokens=max_tokens, temperature=temperature
         )
+        self.last_response = raw_response
         return self.postprocess_response(raw_response)
+
 
     def get_first_token_logprobs(
         self,

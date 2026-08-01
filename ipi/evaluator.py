@@ -431,6 +431,8 @@ class ScenarioResult:
         n_queries:       Number of calls to the target_fn.
         attack:          Attack name ("tap", "pair", "rs", "beam", "beast").
         utility_success: Optional bool indicating if legitimate user task succeeded.
+        final_prompt:    Optional final prompt / messages list seen by victim model after defense transformation.
+        defense_name:    Optional defense class name or label applied.
         extra:           Optional extra info (trace, depth_reached, etc.).
     """
     scenario_id:     str
@@ -442,6 +444,8 @@ class ScenarioResult:
     n_queries:       int
     attack:          str
     utility_success: Optional[bool] = None
+    final_prompt:    Optional[Any] = None
+    defense_name:    Optional[str] = None
     extra:           dict = field(default_factory=dict)
 
 
@@ -508,12 +512,14 @@ class EvalResult:
         for r in self.results:
             sr_dict = {
                 "scenario_id": r.scenario_id,
+                "defense_name": r.defense_name or r.extra.get("defense_name", ""),
                 "user_task": r.extra.get("user_task", ""),
                 "user_target": r.extra.get("user_target", ""),
                 "injection_goal": r.goal,
                 "target_str": r.extra.get("target_str", ""),
                 "optimization_target": r.extra.get("optimization_target", ""),
                 "attack_str": r.injection,
+                "final_prompt": r.final_prompt if r.final_prompt is not None else r.extra.get("final_prompt"),
                 "model_response": r.target_response,
                 "attack_success": r.success,
                 "utility_success": r.utility_success,
@@ -530,6 +536,7 @@ class EvalResult:
 
         d["results"] = results_list
         return d
+
 
     def save_to_file(
         self,
@@ -663,11 +670,26 @@ class AttackEvaluator:
                 r.success = self._check_success(r.target_response, scenario)
                 r.utility_success = self._check_utility(r.target_response, scenario)
                 
+                # Extract the exact final messages/prompt seen by the model after defense transformation
+                final_prompt = getattr(self.target, "last_input_messages", None)
+                if final_prompt is None and hasattr(self.target, "target"):
+                    final_prompt = getattr(self.target.target, "last_input_messages", None)
+                if final_prompt is None and hasattr(self.target, "llm"):
+                    final_prompt = getattr(self.target.llm, "last_input_messages", None)
+                
+                def_label = defense_name or type(self.target).__name__
+                
+                r.final_prompt = final_prompt
+                r.defense_name = def_label
+
                 # Enrich extra with scenario metadata for comprehensive reporting
                 r.extra["user_task"] = scenario.user_task
                 r.extra["user_target"] = scenario.metadata.get("user_target", "") if scenario.metadata else ""
                 r.extra["target_str"] = scenario.target_output
                 r.extra["optimization_target"] = scenario.optimization_target
+                r.extra["final_prompt"] = final_prompt
+                r.extra["defense_name"] = def_label
+
                 
                 results.append(r)
             except Exception as e:
