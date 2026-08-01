@@ -353,13 +353,11 @@ def make_scenario_target_fn(
             messages.append({"role": "system", "content": system_prompt})
 
         if scenario.user_task:
-            # Legitimate user task — what the user actually asked for.
-            messages.append({"role": "user", "content": scenario.user_task})
-            # Injection arrives embedded in environment data (email body,
-            # calendar event, file contents, etc.) — NOT as a user instruction.
-            # <env> tags match the system prompt so the model treats this as
-            # retrieved data rather than echoing the format back.
-            messages.append({"role": "user", "content": f"<env>\n{injection}\n</env>"})
+            # Combine User Task + Data into a single user message (Instruction -> User Task -> Data flow)
+            # Avoids invalid consecutive 'user' role messages in Chat APIs.
+            data_str = f"{scenario.pipeline_context}\n\n{injection}" if scenario.pipeline_context else f"<env>\n{injection}\n</env>"
+            user_content = f"User Task:\n{scenario.user_task}\n\nContext:\n{data_str}"
+            messages.append({"role": "user", "content": user_content})
         else:
             # No user task (manual scenario) — inject directly.
             messages.append({"role": "user", "content": injection})
