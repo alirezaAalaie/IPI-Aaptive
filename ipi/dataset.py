@@ -993,8 +993,78 @@ class HijackDataset(IPIDataset):
 
 
 # ---------------------------------------------------------------------------
+# DualVerifiableDataset
+# ---------------------------------------------------------------------------
+
+class DualVerifiableDataset(IPIDataset):
+    """
+    Dataset for dual-verifiable Indirect Prompt Injection (IPI) evaluation.
+
+    Each scenario provides:
+      1. Deterministic User Task ground-truth answer (user_target) for 0-LLM utility evaluation.
+      2. Deterministic Attacker Target string (target_str) and explicit optimization_target
+         token sequence for gradient/search attacks (GCG, RS, BEAST).
+
+    Args:
+        json_path: Path to the dual_verifiable_dataset.json file. If None, auto-locates it.
+    """
+
+    def __init__(self, json_path: Optional[str] = None):
+        import os, json
+        if json_path is None:
+            ipi_dir = os.path.dirname(os.path.abspath(__file__))
+            candidate = os.path.join(ipi_dir, "datasets", "dual_verifiable_dataset.json")
+            if os.path.exists(candidate):
+                json_path = candidate
+            else:
+                # Try relative working directory
+                json_path = "ipi/datasets/dual_verifiable_dataset.json"
+
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(
+                f"Dual-verifiable dataset JSON not found at {json_path}. "
+                "Run `python3 scripts/build_dual_verifiable_dataset.py` to construct it."
+            )
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self._scenarios: list[IPIScenario] = []
+        for s in data:
+            scenario = IPIScenario(
+                id=s["id"],
+                user_task=s["user_task"],
+                injection_goal=s["injection_goal"],
+                target_output=s["target_str"],
+                optimization_target=s["optimization_target"],
+                tool_schema=s.get("tool_schema", ""),
+                pipeline_context=s["clean_context"],
+                metadata={
+                    "user_target": s["user_target"],
+                    "user_eval_mode": s.get("user_eval_mode", "contains"),
+                    "attack_eval_mode": s.get("attack_eval_mode", "contains"),
+                    "dataset_type": "dual_verifiable",
+                    "domain": s.get("metadata", {}).get("domain", ""),
+                    "attack_name": s.get("metadata", {}).get("attack_name", ""),
+                    "clean_context": s["clean_context"],
+                }
+            )
+            self._scenarios.append(scenario)
+
+    def __len__(self) -> int:
+        return len(self._scenarios)
+
+    def __iter__(self) -> Iterator[IPIScenario]:
+        return iter(self._scenarios)
+
+    def __getitem__(self, idx: int) -> IPIScenario:
+        return self._scenarios[idx]
+
+
+# ---------------------------------------------------------------------------
 # AgentDojoDataset
 # ---------------------------------------------------------------------------
+
 
 
 class AgentDojoDataset(IPIDataset):
