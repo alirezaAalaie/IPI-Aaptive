@@ -576,7 +576,9 @@ class LocalLLM(UnifiedLLM):
         max_bs: int = 50,
         device_map: str = "auto",
         torch_dtype=None,
+        adapter_path: Optional[str] = None,
     ):
+        self.adapter_path = adapter_path
         super().__init__(
             model, system_prompt, temperature, max_tokens, top_p, top_k,
             api_key, metis_location, extra_messages, max_bs,
@@ -585,6 +587,7 @@ class LocalLLM(UnifiedLLM):
         self._hf_model_obj  = None
         self._device        = None
         self._init_local(device_map, torch_dtype)
+
 
     @classmethod
     def supported_models(cls) -> str:
@@ -820,9 +823,23 @@ class LocalLLM(UnifiedLLM):
         if torch_dtype is None:
             torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-        log.info("[LocalLLM] Loading: %s", self.model_name)
+        base_model_path = self.model_name
+        adapter_dir = self.adapter_path
+
+        # If model_name is a directory containing adapter_config.json, auto-detect base model & adapter
+        if os.path.isdir(self.model_name) and os.path.exists(os.path.join(self.model_name, "adapter_config.json")):
+            adapter_dir = self.model_name
+            try:
+                with open(os.path.join(self.model_name, "adapter_config.json")) as f:
+                    adapter_cfg = json.load(f)
+                    base_model_path = adapter_cfg.get("base_model_name_or_path", self.model_name)
+            except Exception as e:
+                log.warning("[LocalLLM] Could not parse adapter_config.json: %s", e)
+
+        log.info("[LocalLLM] Loading tokenizer from: %s", base_model_path)
+        tokenizer_path = adapter_dir if (adapter_dir and os.path.exists(os.path.join(adapter_dir, "tokenizer_config.json"))) else base_model_path
         self._tokenizer_obj = AutoTokenizer.from_pretrained(
-            self.model_name, use_fast=False, token=os.getenv("HF_TOKEN"),
+            tokenizer_path, use_fast=False, token=os.getenv("HF_TOKEN"), trust_remote_code=True,
         )
         if self._tokenizer_obj.pad_token is None:
             self._tokenizer_obj.pad_token = (
@@ -830,17 +847,37 @@ class LocalLLM(UnifiedLLM):
             )
         self._tokenizer_obj.padding_side = "left"
 
-        self._hf_model_obj = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
+        log.info("[LocalLLM] Loading base model: %s", base_model_path)
+        model_obj = AutoModelForCausalLM.from_pretrained(
+            base_model_path,
             device_map=device_map,
             torch_dtype=torch_dtype,
             use_cache=False,
             low_cpu_mem_usage=True,
             token=os.getenv("HF_TOKEN"),
             trust_remote_code=True,
-        ).eval()
+        )
+
+        # Resize token embeddings if tokenizer vocabulary was expanded
+        if len(self._tokenizer_obj) != model_obj.config.vocab_size:
+            try:
+                model_obj.resize_token_embeddings(len(self._tokenizer_obj), mean_resizing=False)
+            except TypeError:
+                model_obj.resize_token_embeddings(len(self._tokenizer_obj))
+
+        # Attach PEFT adapter if adapter_dir is provided or auto-detected
+        if adapter_dir and os.path.exists(adapter_dir):
+            try:
+                from peft import PeftModel
+                log.info("[LocalLLM] Attaching PEFT adapter from: %s", adapter_dir)
+                model_obj = PeftModel.from_pretrained(model_obj, adapter_dir)
+            except Exception as e:
+                log.warning("[LocalLLM] Could not load PEFT adapter: %s", e)
+
+        self._hf_model_obj = model_obj.eval()
         self._device = next(self._hf_model_obj.parameters()).device
         log.info("[LocalLLM] Loaded on device: %s", self._device)
+
 
     # --- Private: local generation ---
 
