@@ -131,14 +131,20 @@ def train_secalign(
 
     config_obj = cfg_cls(**cfg_kwargs)
 
+    trainer_params = set(inspect.signature(trainer_cls.__init__).parameters.keys())
     trainer_kwargs = {
         "model": model,
         "args": config_obj,
         "train_dataset": dataset,
-        "tokenizer": tokenizer,
         "peft_config": peft_config,
     }
+    if "processing_class" in trainer_params:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in trainer_params:
+        trainer_kwargs["tokenizer"] = tokenizer
+
     trainer = trainer_cls(**trainer_kwargs)
+
 
     log.info("Starting SecAlign training...")
     trainer.train()

@@ -203,18 +203,23 @@ def train_struq(
 
     sft_config = SFTConfig(**sft_kwargs)
 
+    trainer_params = set(inspect.signature(SFTTrainer.__init__).parameters.keys())
     trainer_kwargs = {
         "model": model,
         "args": sft_config,
         "train_dataset": dataset,
-        "tokenizer": tokenizer,
         "peft_config": peft_config,
     }
-    trainer_params = set(inspect.signature(SFTTrainer.__init__).parameters.keys())
+    if "processing_class" in trainer_params:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in trainer_params:
+        trainer_kwargs["tokenizer"] = tokenizer
+
     if "max_seq_length" in trainer_params and "max_seq_length" not in sft_kwargs and "max_length" not in sft_kwargs:
         trainer_kwargs["max_seq_length"] = max_length
 
     trainer = SFTTrainer(**trainer_kwargs)
+
 
     log.info("Starting StruQ anti-instruction fine-tuning...")
     trainer.train()
