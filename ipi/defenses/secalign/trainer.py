@@ -138,6 +138,16 @@ def train_secalign(
         "peft_config": peft_config,
     }
 
+    # Patch model.forward.__func__ for TRL compatibility if model.forward is a partial/wrapper
+    if hasattr(model, "forward") and not hasattr(model.forward, "__func__"):
+        try:
+            if hasattr(model.forward, "func"):
+                object.__setattr__(model.forward, "__func__", model.forward.func)
+            else:
+                object.__setattr__(model.forward, "__func__", model.forward)
+        except Exception:
+            pass
+
     try:
         trainer = trainer_cls(processing_class=tokenizer, **trainer_kwargs)
     except TypeError:
@@ -145,6 +155,7 @@ def train_secalign(
             trainer = trainer_cls(tokenizer=tokenizer, **trainer_kwargs)
         except TypeError:
             trainer = trainer_cls(**trainer_kwargs)
+
 
 
 
