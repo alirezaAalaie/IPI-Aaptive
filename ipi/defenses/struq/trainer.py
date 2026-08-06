@@ -210,6 +210,7 @@ def train_struq(
         "peft_config": peft_config,
     }
 
+    orig_forward = model.forward
     # Patch model.forward.__func__ for TRL compatibility if model.forward is a partial/wrapper
     if hasattr(model, "forward") and not hasattr(model.forward, "__func__"):
         try:
@@ -227,6 +228,11 @@ def train_struq(
             trainer = SFTTrainer(tokenizer=tokenizer, **trainer_kwargs)
         except TypeError:
             trainer = SFTTrainer(**trainer_kwargs)
+
+    # Restore original forward if TRL replaced model.forward with _chunked_ce_forward (which has multi-GPU device mismatch bug in TRL 0.14+)
+    if model.forward != orig_forward:
+        model.forward = orig_forward
+
 
 
 
