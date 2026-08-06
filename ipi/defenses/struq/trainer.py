@@ -229,9 +229,31 @@ def train_struq(
         except TypeError:
             trainer = SFTTrainer(**trainer_kwargs)
 
-    # Restore original forward if TRL replaced model.forward with _chunked_ce_forward (which has multi-GPU device mismatch bug in TRL 0.14+)
-    if model.forward != orig_forward:
-        model.forward = orig_forward
+    # Wrap orig_forward to populate num_valid_tokens & entropy_sum expected by TRL SFTTrainer
+    # while bypassing TRL's buggy _chunked_ce_forward on multi-GPU device_map="auto"
+    def safe_forward(*args, **kwargs):
+        outputs = orig_forward(*args, **kwargs)
+        if outputs is not None and hasattr(outputs, "loss") and outputs.loss is not None:
+            if not hasattr(outputs, "num_valid_tokens"):
+                labels = kwargs.get("labels", None)
+                if labels is not None and hasattr(labels, "device"):
+                    num_valid = (labels != -100).sum().to(outputs.loss.device)
+                else:
+                    num_valid = torch.tensor(1, device=outputs.loss.device)
+                try:
+                    setattr(outputs, "num_valid_tokens", num_valid)
+                except Exception:
+                    pass
+            if not hasattr(outputs, "entropy_sum"):
+                entropy_sum = torch.tensor(0.0, device=outputs.loss.device)
+                try:
+                    setattr(outputs, "entropy_sum", entropy_sum)
+                except Exception:
+                    pass
+        return outputs
+
+    model.forward = safe_forward
+
 
 
 
