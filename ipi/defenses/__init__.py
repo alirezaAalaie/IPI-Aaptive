@@ -9,6 +9,11 @@ from .in_context import (
     SpotlightDefense,
     CompositeDefense,
 )
+from .secalign import (
+    SecAlignDefense,
+    generate_secalign_preference_data,
+    train_secalign,
+)
 
 __all__ = [
     "DefendedVictim",
@@ -17,4 +22,8 @@ __all__ = [
     "SandwichDefense",
     "SpotlightDefense",
     "CompositeDefense",
+    "SecAlignDefense",
+    "generate_secalign_preference_data",
+    "train_secalign",
 ]
+
