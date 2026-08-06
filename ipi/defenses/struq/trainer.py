@@ -1,11 +1,12 @@
 """
 StruQ Fine-Tuning & Tokenizer Resizing Module.
+Implemented directly following the original StruQ paper codebase (train.py & struq.py).
 """
 from __future__ import annotations
 
-import inspect
 import logging
-from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any, Sequence
 
 from .config import SPECIAL_DELM_TOKENS, TEXTUAL_DELM_TOKENS
 from .dataset import generate_struq_training_data
@@ -23,7 +24,7 @@ def smart_tokenizer_and_embedding_resize(
     Enlarges vocabulary with new special StruQ delimiter tokens and initializes
     their token embeddings with the embeddings of corresponding textual tokens.
 
-    Textual mapping:
+    Textual mapping (from original paper train.py:smart_tokenizer_and_embedding_resize):
       '[INST]' -> 'instruction'
       '[INPT]' -> 'input'
       '[RESP]' -> 'response'
@@ -73,6 +74,34 @@ def smart_tokenizer_and_embedding_resize(
     return num_new_tokens
 
 
+class DataCollatorForStruQDataset(object):
+    """
+    Collate examples for supervised fine-tuning directly matching original paper train.py.
+    Pads input_ids with pad_token_id and labels with IGNORE_INDEX (-100).
+    """
+
+    def __init__(self, tokenizer: Any, ignore_index: int = -100):
+        self.tokenizer = tokenizer
+        self.ignore_index = ignore_index
+
+    def __call__(self, instances: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        import torch
+        input_ids = [torch.tensor(inst["input_ids"], dtype=torch.long) for inst in instances]
+        labels = [torch.tensor(inst["labels"], dtype=torch.long) for inst in instances]
+
+        input_ids_padded = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        labels_padded = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=self.ignore_index
+        )
+        return dict(
+            input_ids=input_ids_padded,
+            labels=labels_padded,
+            attention_mask=input_ids_padded.ne(self.tokenizer.pad_token_id),
+        )
+
+
 def train_struq(
     model_name_or_path: str,
     output_dir: str,
@@ -90,12 +119,12 @@ def train_struq(
     max_length: int = 512,
 ) -> Any:
     """
-    Trains a StruQ defense model using Supervised Fine-Tuning (SFT) and LoRA/QLoRA.
-    Optimized for Kaggle GPU environments (T4 16GB VRAM).
+    Trains a StruQ defense model using standard HuggingFace `transformers.Trainer`
+    and `DataCollatorForStruQDataset` matching the original paper implementation.
 
     Args:
         model_name_or_path: Hugging Face model identifier or local directory.
-        output_dir: Directory where fine-tuned LoRA weights will be saved.
+        output_dir: Directory where fine-tuned weights / LoRA adapter will be saved.
         train_samples: Raw clean instruction dataset samples.
         attack_type: Anti-instruction injection strategy ('NaiveCompletion', 'Naive', 'Ignore').
         delimiter_scheme: Delimiter configuration scheme key ('SpclSpclSpcl', etc.).
@@ -117,11 +146,10 @@ def train_struq(
         import transformers
         from datasets import Dataset
         from peft import LoraConfig, TaskType, get_peft_model
-        from trl import SFTTrainer, SFTConfig
     except ImportError as e:
         raise ImportError(
-            "StruQ training requires `torch`, `transformers`, `datasets`, `peft`, and `trl`. "
-            "Install them via `pip install trl peft transformers datasets bitsandbytes`."
+            "StruQ training requires `torch`, `transformers`, `datasets`, `peft`. "
+            "Install them via `pip install peft transformers datasets bitsandbytes`."
         ) from e
 
     log.info(f"Loading tokenizer for {model_name_or_path}...")
@@ -139,12 +167,24 @@ def train_struq(
         delimiter_scheme=delimiter_scheme,
     )
 
-    # Format into SFT text field
-    formatted_data = [
-        {"text": f"{d['prompt']}{d['output']}{tokenizer.eos_token or '</s>'}"}
-        for d in raw_dataset
-    ]
-    dataset = Dataset.from_list(formatted_data)
+    # Tokenize prompts & outputs with exact prompt masking (IGNORE_INDEX = -100) from paper
+    sources = [d["prompt"] for d in raw_dataset]
+    targets = [f"{d['output']}{tokenizer.eos_token or '</s>'}" for d in raw_dataset]
+    examples = [s + t for s, t in zip(sources, targets)]
+
+    examples_tokenized = tokenizer(examples, max_length=max_length, truncation=True, padding=False)
+    sources_tokenized = tokenizer(sources, max_length=max_length, truncation=True, padding=False)
+
+    tokenized_instances = []
+    for ex_ids, src_ids in zip(examples_tokenized["input_ids"], sources_tokenized["input_ids"]):
+        labels = list(ex_ids)
+        src_len = len(src_ids)
+        for i in range(min(src_len, len(labels))):
+            labels[i] = -100  # Mask prompt tokens so loss is computed ONLY on completion
+        tokenized_instances.append({"input_ids": ex_ids, "labels": labels})
+
+    dataset = Dataset.from_list(tokenized_instances)
+    data_collator = DataCollatorForStruQDataset(tokenizer=tokenizer)
 
     # Quantization Config for T4 VRAM efficiency
     bnb_config = None
@@ -181,83 +221,30 @@ def train_struq(
         lora_dropout=lora_dropout,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
+    model = get_peft_model(model, peft_config)
 
-    # Build SFTConfig dynamically according to available parameters in installed trl version
-    sft_params = set(inspect.signature(SFTConfig.__init__).parameters.keys())
-    sft_kwargs = {
-        "output_dir": output_dir,
-        "dataset_text_field": "text",
-        "learning_rate": learning_rate,
-        "num_train_epochs": num_train_epochs,
-        "per_device_train_batch_size": per_device_train_batch_size,
-        "gradient_accumulation_steps": gradient_accumulation_steps,
-        "logging_steps": 10,
-        "save_strategy": "epoch",
-        "fp16": torch.cuda.is_available(),
-        "optim": "paged_adamw_8bit" if use_4bit else "adamw_torch",
-    }
-    if "max_seq_length" in sft_params:
-        sft_kwargs["max_seq_length"] = max_length
-    elif "max_length" in sft_params:
-        sft_kwargs["max_length"] = max_length
+    training_args = transformers.TrainingArguments(
+        output_dir=output_dir,
+        learning_rate=learning_rate,
+        num_train_epochs=num_train_epochs,
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        logging_steps=10,
+        save_strategy="epoch",
+        fp16=torch.cuda.is_available(),
+        optim="paged_adamw_8bit" if use_4bit else "adamw_torch",
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,
+        weight_decay=0.0,
+    )
 
-    sft_config = SFTConfig(**sft_kwargs)
-
-    trainer_kwargs = {
-        "model": model,
-        "args": sft_config,
-        "train_dataset": dataset,
-        "peft_config": peft_config,
-    }
-
-    orig_forward = model.forward
-    # Patch model.forward.__func__ for TRL compatibility if model.forward is a partial/wrapper
-    if hasattr(model, "forward") and not hasattr(model.forward, "__func__"):
-        try:
-            if hasattr(model.forward, "func"):
-                object.__setattr__(model.forward, "__func__", model.forward.func)
-            else:
-                object.__setattr__(model.forward, "__func__", model.forward)
-        except Exception:
-            pass
-
-    try:
-        trainer = SFTTrainer(processing_class=tokenizer, **trainer_kwargs)
-    except TypeError:
-        try:
-            trainer = SFTTrainer(tokenizer=tokenizer, **trainer_kwargs)
-        except TypeError:
-            trainer = SFTTrainer(**trainer_kwargs)
-
-    # Wrap orig_forward to populate num_valid_tokens & entropy_sum expected by TRL SFTTrainer
-    # while bypassing TRL's buggy _chunked_ce_forward on multi-GPU device_map="auto"
-    def safe_forward(*args, **kwargs):
-        outputs = orig_forward(*args, **kwargs)
-        if outputs is not None and hasattr(outputs, "loss") and outputs.loss is not None:
-            if not hasattr(outputs, "num_valid_tokens"):
-                labels = kwargs.get("labels", None)
-                if labels is not None and hasattr(labels, "device"):
-                    num_valid = (labels != -100).sum().to(outputs.loss.device)
-                else:
-                    num_valid = torch.tensor(1, device=outputs.loss.device)
-                try:
-                    setattr(outputs, "num_valid_tokens", num_valid)
-                except Exception:
-                    pass
-            if not hasattr(outputs, "entropy_sum"):
-                entropy_sum = torch.tensor(0.0, device=outputs.loss.device)
-                try:
-                    setattr(outputs, "entropy_sum", entropy_sum)
-                except Exception:
-                    pass
-        return outputs
-
-    model.forward = safe_forward
-
-
-
-
-
+    trainer = transformers.Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+    )
 
     log.info("Starting StruQ anti-instruction fine-tuning...")
     trainer.train()
