@@ -3,6 +3,7 @@ StruQ Fine-Tuning & Tokenizer Resizing Module.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Dict, List, Optional, Any
 
@@ -43,7 +44,11 @@ def smart_tokenizer_and_embedding_resize(
     })
 
     if num_new_tokens > 0:
-        model.resize_token_embeddings(len(tokenizer))
+        try:
+            model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+        except TypeError:
+            model.resize_token_embeddings(len(tokenizer))
+
         try:
             input_embeddings = model.get_input_embeddings().weight.data
             output_embeddings = model.get_output_embeddings().weight.data
@@ -177,27 +182,39 @@ def train_struq(
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
 
-    sft_config = SFTConfig(
-        output_dir=output_dir,
-        dataset_text_field="text",
-        learning_rate=learning_rate,
-        num_train_epochs=num_train_epochs,
-        per_device_train_batch_size=per_device_train_batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        max_seq_length=max_length,
-        logging_steps=10,
-        save_strategy="epoch",
-        fp16=torch.cuda.is_available(),
-        optim="paged_adamw_8bit" if use_4bit else "adamw_torch",
-    )
+    # Build SFTConfig dynamically according to available parameters in installed trl version
+    sft_params = set(inspect.signature(SFTConfig.__init__).parameters.keys())
+    sft_kwargs = {
+        "output_dir": output_dir,
+        "dataset_text_field": "text",
+        "learning_rate": learning_rate,
+        "num_train_epochs": num_train_epochs,
+        "per_device_train_batch_size": per_device_train_batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "logging_steps": 10,
+        "save_strategy": "epoch",
+        "fp16": torch.cuda.is_available(),
+        "optim": "paged_adamw_8bit" if use_4bit else "adamw_torch",
+    }
+    if "max_seq_length" in sft_params:
+        sft_kwargs["max_seq_length"] = max_length
+    elif "max_length" in sft_params:
+        sft_kwargs["max_length"] = max_length
 
-    trainer = SFTTrainer(
-        model=model,
-        args=sft_config,
-        train_dataset=dataset,
-        tokenizer=tokenizer,
-        peft_config=peft_config,
-    )
+    sft_config = SFTConfig(**sft_kwargs)
+
+    trainer_kwargs = {
+        "model": model,
+        "args": sft_config,
+        "train_dataset": dataset,
+        "tokenizer": tokenizer,
+        "peft_config": peft_config,
+    }
+    trainer_params = set(inspect.signature(SFTTrainer.__init__).parameters.keys())
+    if "max_seq_length" in trainer_params and "max_seq_length" not in sft_kwargs and "max_length" not in sft_kwargs:
+        trainer_kwargs["max_seq_length"] = max_length
+
+    trainer = SFTTrainer(**trainer_kwargs)
 
     log.info("Starting StruQ anti-instruction fine-tuning...")
     trainer.train()

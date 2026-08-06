@@ -3,6 +3,7 @@ SecAlign Training Pipeline using PEFT LoRA and DPO / ORPO.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Dict, List, Optional, Any
 
@@ -99,55 +100,45 @@ def train_secalign(
     )
 
     if alignment.lower() == "dpo":
-        dpo_config = DPOConfig(
-            output_dir=output_dir,
-            learning_rate=learning_rate,
-            num_train_epochs=num_train_epochs,
-            per_device_train_batch_size=per_device_train_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            max_length=max_length,
-            max_prompt_length=max_prompt_length,
-            beta=0.1,
-            lr_scheduler_type="cosine",
-            warmup_ratio=0.03,
-            logging_steps=10,
-            save_strategy="epoch",
-            fp16=torch.cuda.is_available(),
-            optim="paged_adamw_8bit" if use_4bit else "adamw_torch",
-        )
-        trainer = DPOTrainer(
-            model=model,
-            args=dpo_config,
-            train_dataset=dataset,
-            tokenizer=tokenizer,
-            peft_config=peft_config,
-        )
+        cfg_cls, trainer_cls = DPOConfig, DPOTrainer
     elif alignment.lower() == "orpo":
-        orpo_config = ORPOConfig(
-            output_dir=output_dir,
-            learning_rate=learning_rate,
-            num_train_epochs=num_train_epochs,
-            per_device_train_batch_size=per_device_train_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            max_length=max_length,
-            max_prompt_length=max_prompt_length,
-            beta=0.1,
-            lr_scheduler_type="cosine",
-            warmup_ratio=0.03,
-            logging_steps=10,
-            save_strategy="epoch",
-            fp16=torch.cuda.is_available(),
-            optim="paged_adamw_8bit" if use_4bit else "adamw_torch",
-        )
-        trainer = ORPOTrainer(
-            model=model,
-            args=orpo_config,
-            train_dataset=dataset,
-            tokenizer=tokenizer,
-            peft_config=peft_config,
-        )
+        cfg_cls, trainer_cls = ORPOConfig, ORPOTrainer
     else:
         raise ValueError(f"Unsupported alignment '{alignment}'. Choose 'dpo' or 'orpo'.")
+
+    cfg_params = set(inspect.signature(cfg_cls.__init__).parameters.keys())
+    cfg_kwargs = {
+        "output_dir": output_dir,
+        "learning_rate": learning_rate,
+        "num_train_epochs": num_train_epochs,
+        "per_device_train_batch_size": per_device_train_batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "beta": 0.1,
+        "lr_scheduler_type": "cosine",
+        "warmup_ratio": 0.03,
+        "logging_steps": 10,
+        "save_strategy": "epoch",
+        "fp16": torch.cuda.is_available(),
+        "optim": "paged_adamw_8bit" if use_4bit else "adamw_torch",
+    }
+    if "max_length" in cfg_params:
+        cfg_kwargs["max_length"] = max_length
+    elif "max_seq_length" in cfg_params:
+        cfg_kwargs["max_seq_length"] = max_length
+
+    if "max_prompt_length" in cfg_params:
+        cfg_kwargs["max_prompt_length"] = max_prompt_length
+
+    config_obj = cfg_cls(**cfg_kwargs)
+
+    trainer_kwargs = {
+        "model": model,
+        "args": config_obj,
+        "train_dataset": dataset,
+        "tokenizer": tokenizer,
+        "peft_config": peft_config,
+    }
+    trainer = trainer_cls(**trainer_kwargs)
 
     log.info("Starting SecAlign training...")
     trainer.train()
