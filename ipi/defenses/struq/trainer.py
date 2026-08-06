@@ -234,17 +234,25 @@ def train_struq(
         fp16=torch.cuda.is_available(),
         optim="paged_adamw_8bit" if use_4bit else "adamw_torch",
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
+        warmup_steps=10,
         weight_decay=0.0,
     )
 
-    trainer = transformers.Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-    )
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": dataset,
+        "data_collator": data_collator,
+    }
+
+    try:
+        trainer = transformers.Trainer(processing_class=tokenizer, **trainer_kwargs)
+    except TypeError:
+        try:
+            trainer = transformers.Trainer(tokenizer=tokenizer, **trainer_kwargs)
+        except TypeError:
+            trainer = transformers.Trainer(**trainer_kwargs)
+
 
     log.info("Starting StruQ anti-instruction fine-tuning...")
     trainer.train()
