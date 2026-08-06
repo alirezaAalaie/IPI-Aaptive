@@ -14,6 +14,14 @@ from .secalign import (
     generate_secalign_preference_data,
     train_secalign,
 )
+from .struq import (
+    StruQDefense,
+    generate_struq_training_data,
+    train_struq,
+    format_struq_prompt,
+    smart_tokenizer_and_embedding_resize,
+    STRUQ_DELIMITERS,
+)
 
 __all__ = [
     "DefendedVictim",
@@ -25,5 +33,13 @@ __all__ = [
     "SecAlignDefense",
     "generate_secalign_preference_data",
     "train_secalign",
+    "StruQDefense",
+    "generate_struq_training_data",
+    "train_struq",
+    "format_struq_prompt",
+    "smart_tokenizer_and_embedding_resize",
+    "STRUQ_DELIMITERS",
 ]
+
+
 

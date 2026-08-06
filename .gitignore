@@ -13,4 +13,8 @@ results.json
 results/
 code/
 papers/
+data/
+struq_lora_weights/
+secalign_lora_weights/
+
 

@@ -137,6 +137,8 @@ from .defenses import (
     SandwichDefense,
     SpotlightDefense,
     CompositeDefense,
+    SecAlignDefense,
+    StruQDefense,
 )
 
 # ---- Simple high-level API ----
@@ -161,6 +163,8 @@ __all__ = [
     "DefendedVictim",
     "InstructionalDefense", "ReminderDefense", "SandwichDefense",
     "SpotlightDefense", "CompositeDefense",
+    "SecAlignDefense", "StruQDefense",
+
     # Judges
     "EditDistanceJudge", "IPILLMJudge", "GPTJudge", "KeywordJudge",
     # Attacker Base
