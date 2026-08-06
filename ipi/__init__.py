@@ -86,7 +86,7 @@ from .target import TargetLLM, make_target
 from .judges import EditDistanceJudge, GPTJudge, IPILLMJudge, KeywordJudge
 
 # ---- Abstract Attacker Base ----
-from .attacker import BaseAttacker, StaticAttacker, AdaptiveAttacker
+from .attacker import BaseAttacker, StaticAttacker, AdaptiveAttacker, JudgeGuidedAttacker
 
 # ---- Attack classes + low-level functions ----
 from .attacks.tap import TAPAttacker, TAPResult, run_tap
@@ -164,7 +164,7 @@ __all__ = [
     # Judges
     "EditDistanceJudge", "IPILLMJudge", "GPTJudge", "KeywordJudge",
     # Attacker Base
-    "BaseAttacker", "StaticAttacker", "AdaptiveAttacker",
+    "BaseAttacker", "StaticAttacker", "AdaptiveAttacker", "JudgeGuidedAttacker",
     # Attack classes
     "TAPAttacker", "PAIRAttacker", "RSAttacker", "BeamRSAttacker", "BEASTAttacker",
     "AutoDANAttacker", "GCGAttacker",

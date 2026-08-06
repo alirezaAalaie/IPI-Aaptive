@@ -1013,7 +1013,7 @@ class RSAttacker(AdaptiveAttacker):
 
     def __init__(
         self,
-        judge: Judge,
+        judge: Optional[Judge] = None,
         prompt_template: str = "ipi_tool",
         n_tokens_adv: int = 25,
         n_tokens_change_max: int = 4,
@@ -1105,7 +1105,7 @@ class BeamRSAttacker(AdaptiveAttacker):
 
     def __init__(
         self,
-        judge: Judge,
+        judge: Optional[Judge] = None,
         prompt_template: str = "ipi_tool",
         n_tokens_adv: int = 25,
         n_tokens_change_max: int = 4,

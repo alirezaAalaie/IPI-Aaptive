@@ -114,12 +114,12 @@ class AdaptiveAttacker(BaseAttacker):
     """
     Base class for iterative, search-based, or gradient-based adaptive attacks.
 
-    Adaptive attacks (TAP, PAIR, RS, Beam-RS, BEAST, AutoDAN, GCG) optimize
-    the injection iteratively using feedback from an LLM judge, logprob signals,
-    or white-box gradients across multiple target model queries.
+    Adaptive attacks optimize the injection iteratively using feedback from an
+    LLM judge, logprob signals, target loss, or white-box gradients across
+    multiple target model queries.
 
     Args:
-        judge: Judge instance used to guide the iterative search.
+        judge: Optional Judge instance.
     """
 
     def __init__(self, judge: Optional[Judge] = None):
@@ -128,3 +128,21 @@ class AdaptiveAttacker(BaseAttacker):
     @property
     def is_iterative(self) -> bool:
         return True
+
+
+class JudgeGuidedAttacker(AdaptiveAttacker):
+    """
+    Base class for adaptive attacks that explicitly require an LLM Judge during search.
+
+    Judge-guided attacks (TAP, PAIR) rely on an LLM Judge at every iteration
+    to evaluate candidate injections, score responses, and steer the search tree.
+
+    Args:
+        judge: Required Judge instance.
+    """
+
+    def __init__(self, judge: Judge):
+        if judge is None:
+            raise ValueError(f"{self.__class__.__name__} requires a valid Judge instance.")
+        super().__init__(judge=judge)
+

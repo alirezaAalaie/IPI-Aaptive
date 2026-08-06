@@ -5,11 +5,11 @@ UnifiedLLM — abstract base class. Holds shared config and concrete helpers
              (__call__, get_logprob, get_response, chat, __repr__).
              Subclass with APILLM or LocalLLM.
 
-APILLM     — API-backed model (litellm / OpenAI-compat / Metis proxy).
-             Supports: openai, anthropic, google/gemini, deepseek,
+APILLM     — API-backed model (litellm / OpenAI-compat / Metis proxy / OpenRouter).
+             Supports: openai, anthropic, google/gemini, deepseek, openrouter,
                        metis_openai, metis_deepseek, metis_gemini,
                        and any raw litellm model string.
-             Logprob support: openai, metis_openai, deepseek, metis_deepseek.
+             Logprob support: openai, metis_openai, deepseek, metis_deepseek, openrouter.
              Use: APILLM("gpt-4o-mini", system_prompt="...")
 
 LocalLLM   — Local HuggingFace model. Full logits/logprob access.
@@ -74,7 +74,7 @@ _LITELLM_PREFIXES: dict[str, str] = {
 @dataclass(frozen=True)
 class ModelSpec:
     """Provider + model-ID pair. provider is one of: openai | anthropic | google |
-    deepseek | metis_openai | metis_deepseek | metis_gemini | litellm | local"""
+    deepseek | metis_openai | metis_deepseek | metis_gemini | openrouter | litellm | local"""
     provider: str
     model_id: str
 
@@ -112,6 +112,13 @@ KNOWN_MODELS: dict[str, ModelSpec] = {
     "metis/gemini-2.5-pro":        ModelSpec("metis_gemini", "gemini-2.5-pro"),
     "metis/gemini-2.0-flash":      ModelSpec("metis_gemini", "gemini-2.0-flash"),
     "metis/gemini-2.5-flash-lite": ModelSpec("metis_gemini", "gemini-2.5-flash-lite"),
+    # ---- OpenRouter (Direct & Free Models) ----
+    "google/gemma-4-26b-a4b-it:free":            ModelSpec("openrouter", "google/gemma-4-26b-a4b-it:free"),
+    "openai/gpt-oss-20b:free":                   ModelSpec("openrouter", "openai/gpt-oss-20b:free"),
+    "google/gemma-4-31b-it:free":                ModelSpec("openrouter", "google/gemma-4-31b-it:free"),
+    "openrouter/google/gemma-4-26b-a4b-it:free": ModelSpec("openrouter", "google/gemma-4-26b-a4b-it:free"),
+    "openrouter/openai/gpt-oss-20b:free":        ModelSpec("openrouter", "openai/gpt-oss-20b:free"),
+    "openrouter/google/gemma-4-31b-it:free":     ModelSpec("openrouter", "google/gemma-4-31b-it:free"),
 }
 
 
@@ -127,7 +134,7 @@ class LocalOnlyError(RuntimeError):
     """Raised when a local-only method is called on APILLM."""
 
 
-_LOGPROB_API_PROVIDERS = {"openai", "metis_openai", "deepseek", "metis_deepseek"}
+_LOGPROB_API_PROVIDERS = {"openai", "metis_openai", "deepseek", "metis_deepseek", "openrouter"}
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +164,7 @@ class UnifiedLLM(ABC):
         "metis_openai":   "METIS_API_KEY",
         "metis_deepseek": "METIS_API_KEY",
         "metis_gemini":   "METIS_API_KEY",
+        "openrouter":     "OPENROUTER_API_KEY",
     }
 
     def __init__(
@@ -171,21 +179,28 @@ class UnifiedLLM(ABC):
         metis_location: str = "ir",
         extra_messages: Optional[list[dict]] = None,
         max_bs: int = 50,
+        enable_reasoning: bool = False,
     ):
-        self.model_name     = model
-        self.system_prompt  = system_prompt
-        self.temperature    = temperature
-        self.max_tokens     = max_tokens
-        self.top_p          = top_p
-        self.top_k          = top_k
-        self.max_bs         = max_bs
-        self.extra_messages = extra_messages or []
+        self.model_name       = model
+        self.system_prompt    = system_prompt
+        self.temperature      = temperature
+        self.max_tokens       = max_tokens
+        self.top_p            = top_p
+        self.top_k            = top_k
+        self.max_bs           = max_bs
+        self.extra_messages   = extra_messages or []
+        self.enable_reasoning = enable_reasoning
 
         # Resolve spec (uses self.backend class variable)
-        self._spec = KNOWN_MODELS.get(model) or ModelSpec(
-            "litellm" if self.backend == "api" else "local",
-            model,
-        )
+        self._spec = KNOWN_MODELS.get(model)
+        if self._spec is None:
+            if model.startswith("openrouter/"):
+                self._spec = ModelSpec("openrouter", model.removeprefix("openrouter/"))
+            else:
+                self._spec = ModelSpec(
+                    "litellm" if self.backend == "api" else "local",
+                    model,
+                )
         self._metis_base = METIS_BASE_IR if metis_location == "ir" else METIS_BASE_GLOBAL
         self._api_key    = api_key or self._resolve_api_key(self._spec.provider)
 
@@ -399,7 +414,7 @@ class APILLM(UnifiedLLM):
         top_p: float,
     ) -> str:
         provider = self._spec.provider
-        if provider in ("metis_openai", "metis_deepseek"):
+        if provider in ("metis_openai", "metis_deepseek", "openrouter"):
             return self._openai_compat_generate(messages, max_tokens, temperature, top_p)
         if provider == "metis_gemini":
             return self._metis_gemini_generate(messages, max_tokens, temperature)
@@ -426,15 +441,25 @@ class APILLM(UnifiedLLM):
     ) -> str:
         from openai import OpenAI
         provider = self._spec.provider
-        path = _METIS_OPENAI_PATH if provider == "metis_openai" else _METIS_DEEPSEEK_PATH
-        client = OpenAI(api_key=self._api_key or "dummy", base_url=self._metis_base + path)
-        resp = client.chat.completions.create(
+        if provider == "openrouter":
+            base_url = "https://openrouter.ai/api/v1"
+        elif provider == "metis_openai":
+            base_url = self._metis_base + _METIS_OPENAI_PATH
+        else:
+            base_url = self._metis_base + _METIS_DEEPSEEK_PATH
+
+        client = OpenAI(api_key=self._api_key or "dummy", base_url=base_url)
+        kwargs: dict = dict(
             model=self._spec.model_id,
             messages=messages,   # type: ignore[arg-type]
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
         )
+        if provider == "openrouter" and self.enable_reasoning:
+            kwargs["extra_body"] = {"reasoning": {"enabled": True}}
+
+        resp = client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content.strip()
 
     def _metis_gemini_generate(
@@ -491,6 +516,8 @@ class APILLM(UnifiedLLM):
             base_url = self._metis_base + _METIS_DEEPSEEK_PATH
         elif provider == "deepseek":
             base_url = "https://api.deepseek.com/v1"
+        elif provider == "openrouter":
+            base_url = "https://openrouter.ai/api/v1"
         else:
             base_url = "https://api.openai.com/v1"
 

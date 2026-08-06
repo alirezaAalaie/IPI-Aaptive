@@ -1011,7 +1011,7 @@ class AutoDANAttacker(AdaptiveAttacker):
 
     def __init__(
         self,
-        judge: Judge,
+        judge: Optional[Judge] = None,
         variant: str = "hga",
         num_steps: int = 100,
         batch_size: int = 64,

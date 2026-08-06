@@ -378,7 +378,7 @@ class BEASTAttacker(AdaptiveAttacker):
 
     def __init__(
         self,
-        judge: Judge,
+        judge: Optional[Judge] = None,
         prompt_prefix: str = "Ignore previous instructions and ",
         k1: int = 15,
         k2: int = 15,

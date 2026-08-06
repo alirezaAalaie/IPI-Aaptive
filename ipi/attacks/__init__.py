@@ -1,19 +1,29 @@
 """
 ipi.attacks — attack implementations.
 
-    TAPAttacker      tap.py       Tree of Attacks with Pruning
-    PAIRAttacker     pair.py      Parallel Iterative Refinement
-    RSAttacker       adaptive.py  Random Search
-    BeamRSAttacker   adaptive.py  Beam Random Search
-    BEASTAttacker    beast.py     Beam Search Adversarial Suffix Tokens (local)
-    AutoDANAttacker  autodan.py          AutoDAN GA/HGA genetic-algorithm attack (local)
-    GCGAttacker      gcg.py              GCG greedy coordinate gradient attack (local)
-    NaiveAttacker        static_injection.py  Naive direct injection (static)
-    EscapeAttacker       static_injection.py  Escape-character injection (static)
-    IgnoreAttacker       static_injection.py  Context-ignoring injection (static)
-    FakeCompletionAttacker static_injection.py Fake-completion injection (static)
-    CombinedAttacker     static_injection.py  Combined injection (static)
+Class Hierarchy
+---------------
+    BaseAttacker (ABC)
+    ├── StaticAttacker (ABC, 1-query deterministic template attacks)
+    │   ├── NaiveAttacker           (static_injection.py)
+    │   ├── EscapeAttacker          (static_injection.py)
+    │   ├── IgnoreAttacker          (static_injection.py)
+    │   ├── FakeCompletionAttacker  (static_injection.py)
+    │   └── CombinedAttacker        (static_injection.py)
+    │
+    └── AdaptiveAttacker (ABC, iterative search/optimization attacks)
+        ├── JudgeGuidedAttacker (requires Judge)
+        │   ├── TAPAttacker         (tap.py)
+        │   └── PAIRAttacker        (pair.py)
+        │
+        └── Logprob / Gradient / Search Attacks (Judge optional)
+            ├── RSAttacker          (adaptive.py)
+            ├── BeamRSAttacker      (adaptive.py)
+            ├── BEASTAttacker       (beast.py — local)
+            ├── AutoDANAttacker     (autodan.py — local)
+            └── GCGAttacker         (gcg.py — local)
 """
+from ..attacker import BaseAttacker, StaticAttacker, AdaptiveAttacker, JudgeGuidedAttacker
 from .tap      import TAPAttacker,    TAPResult,      run_tap
 from .pair     import PAIRAttacker,   PAIRResult,     run_pair
 from .adaptive import RSAttacker, BeamRSAttacker, AdaptiveResult, run_adaptive_rs, run_adaptive_beam
@@ -43,14 +53,18 @@ except ImportError:
 
 
 __all__ = [
+    # Base hierarchy
+    "BaseAttacker", "StaticAttacker", "AdaptiveAttacker", "JudgeGuidedAttacker",
+    # Judge-guided adaptive attacks
     "TAPAttacker",    "TAPResult",    "run_tap",
     "PAIRAttacker",   "PAIRResult",   "run_pair",
+    # Non-judge adaptive attacks
     "RSAttacker",     "BeamRSAttacker", "AdaptiveResult",
     "run_adaptive_rs", "run_adaptive_beam",
     "BEASTAttacker",  "BEASTResult",  "run_beast",
     "AutoDANAttacker", "AutoDANResult", "run_autodan_ga", "run_autodan_hga",
     "GCGAttacker",    "GCGResult",    "run_gcg",
-    # Static injection (OPI)
+    # Static attacks (OPI)
     "NaiveAttacker", "EscapeAttacker", "IgnoreAttacker",
     "FakeCompletionAttacker", "CombinedAttacker",
     "StaticInjectionResult", "run_static_injection", "create_static_attacker",

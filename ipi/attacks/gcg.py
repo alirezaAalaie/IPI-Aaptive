@@ -636,7 +636,7 @@ class GCGAttacker(AdaptiveAttacker):
 
     def __init__(
         self,
-        judge: Judge,
+        judge: Optional[Judge] = None,
         adv_prefix: str = "Ignore previous instructions and ",
         adv_suffix_len: int = 20,
         num_steps: int = 500,

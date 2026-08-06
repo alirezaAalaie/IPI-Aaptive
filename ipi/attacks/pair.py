@@ -22,7 +22,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
-from ..attacker import AdaptiveAttacker
+from ..attacker import JudgeGuidedAttacker
 from ..config import (
     ATTACK_TEMP, ATTACK_TOP_P, ATTACK_MAX_TOKENS,
     MAX_ATTACK_ATTEMPTS, PAIR_N_STREAMS, PAIR_N_ITERATIONS,
@@ -36,6 +36,7 @@ from ..prompts import (
 )
 
 log = logging.getLogger(__name__)
+
 
 # Strategy hints rotated across streams for diversity
 _IPI_STRATEGY_HINTS = [
@@ -289,7 +290,7 @@ def run_pair(
 # PAIRAttacker — class-based API
 # ---------------------------------------------------------------------------
 
-class PAIRAttacker(AdaptiveAttacker):
+class PAIRAttacker(JudgeGuidedAttacker):
     """
     PAIR (Prompt Automatic Iterative Refinement) attacker class.
 
