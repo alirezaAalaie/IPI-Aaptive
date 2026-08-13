@@ -1,45 +1,53 @@
 """
 SecAlign Defense Wrapper for `ipi` Benchmark Evaluation.
+
+Port of the inference path in
+``code/defense/SecAlign-main/test.py`` (``form_llm_input`` + ``recursive_filter``).
 """
 from __future__ import annotations
 
-from copy import deepcopy
-from typing import Dict, List
+from typing import Sequence
 
-from ..base import DefendedVictim
 from ...victim import Victim
-from .config import PROMPT_FORMAT
+from ..channels import StructuredChannelDefense
+from .config import DELIMITERS, FILTERED_TOKENS, PROMPT_FORMAT
 
 
-class SecAlignDefense(DefendedVictim):
+class SecAlignDefense(StructuredChannelDefense):
     """
-    SecAlign Defense Wrapper for `ipi` Benchmark.
-    Evaluates SecAlign fine-tuned models on prompt injection benchmarks.
+    SecAlign defense wrapper.
+
+    SecAlign shares StruQ's structured prompt and defensive filter; what differs
+    is how the model got there — preference optimisation (DPO) against a
+    rejected response that follows the injection, rather than SFT.
+
+    The instruction/data split is recovered from the harness messages list (see
+    ``ipi/defenses/channels.py``); call :meth:`set_channels` when the caller
+    knows it exactly.
+
+    Args:
+        target:                 Underlying Victim carrying the SecAlign model.
+        frontend_delimiters:    Must match the scheme the model was aligned on.
+        apply_defensive_filter: Strip ``FILTERED_TOKENS`` from the data channel.
     """
 
-    def __init__(self, target: Victim, frontend_delimiters: str = "TextTextText"):
-        super().__init__(target)
+    filtered_tokens: Sequence[str] = FILTERED_TOKENS
+
+    def __init__(
+        self,
+        target: Victim,
+        frontend_delimiters: str = "TextTextText",
+        apply_defensive_filter: bool = True,
+    ):
+        super().__init__(target, apply_defensive_filter=apply_defensive_filter)
+        if frontend_delimiters not in DELIMITERS:
+            raise ValueError(
+                f"Unknown frontend_delimiters {frontend_delimiters!r}; "
+                f"expected one of {sorted(DELIMITERS)}."
+            )
         self.frontend_delimiters = frontend_delimiters
-        self.prompt_dict = PROMPT_FORMAT.get(frontend_delimiters, PROMPT_FORMAT["TextTextText"])
+        self.prompt_dict = PROMPT_FORMAT[frontend_delimiters]
 
-    def preprocess_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        new_msgs = deepcopy(messages)
-        user_content = ""
-        system_content = ""
-
-        for msg in new_msgs:
-            if msg.get("role") == "system":
-                system_content = msg.get("content", "")
-            elif msg.get("role") == "user":
-                user_content = msg.get("content", "")
-
-        inst = system_content if system_content else "Follow the instructions in the prompt."
-        inp = user_content
-
-        sample_dict = {"instruction": inst, "input": inp}
-        if inp:
-            formatted = self.prompt_dict["prompt_input"].format_map(sample_dict)
-        else:
-            formatted = self.prompt_dict["prompt_no_input"].format_map(sample_dict)
-
-        return [{"role": "user", "content": formatted}]
+    def format_prompt(self, instruction: str, data: str) -> str:
+        key = "prompt_input" if (data and data.strip()) else "prompt_no_input"
+        return self.prompt_dict[key].format_map({"instruction": instruction, "input": data})

@@ -7,6 +7,12 @@ DEFAULT_TOKENS = {'pad_token': '[PAD]', 'eos_token': '</s>', 'bos_token': '<s>',
 TEXTUAL_DELM_TOKENS = ['instruction', 'input', 'response', '###', ':']
 SPECIAL_DELM_TOKENS = ['[INST]', '[INPT]', '[RESP]', '[MARK]', '[COLN]']
 
+#: Stripped from the data channel at inference time by ``recursive_filter``.
+#: Upstream ``test.py`` applies this for every SecAlign model regardless of the
+#: frontend delimiter scheme — with TextTextText the '##' entry is what stops an
+#: attacker writing '### instruction:' into the data channel.
+FILTERED_TOKENS = SPECIAL_DELM_TOKENS + ['##']
+
 OTHER_DELM_TOKENS = {
     'mark': ['{s}', '|{s}|', '<{s}>', '[{s}]', '<|{s}|>', '[|{s}|]', '<[{s}]>', '\'\'\'{s}\'\'\'', '***{s}***'],
     'inst': ['Command', 'Rule', 'Prompt', 'Task'],

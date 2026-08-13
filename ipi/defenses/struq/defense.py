@@ -1,14 +1,16 @@
 """
-StruQ Defense Wrapper for ipi framework.
+StruQ Defense Wrapper for the ipi framework.
+
+Port of the inference path in ``code/defense/StruQ-main/test.py``
+(``form_llm_input`` + ``recursive_filter``).
 """
 from __future__ import annotations
 
-from copy import deepcopy
-from typing import Dict, List, Optional, Any
+from typing import Sequence
 
-from ..base import DefendedVictim
 from ...victim import Victim
-from .config import STRUQ_DELIMITERS, SYS_INPUT_PREFIX, SYS_NO_INPUT_PREFIX
+from ..channels import StructuredChannelDefense
+from .config import FILTERED_TOKENS, PROMPT_FORMAT, STRUQ_DELIMITERS
 
 
 def format_struq_prompt(
@@ -17,77 +19,77 @@ def format_struq_prompt(
     delimiter_scheme: str = "SpclSpclSpcl",
 ) -> str:
     """
-    Formats instruction and input using StruQ structured query delimiters.
+    Render a structured query.
+
+    This is the raw formatter and does **not** sanitise ``input_text`` — dataset
+    construction deliberately places delimiters in the data channel. Inference
+    goes through :class:`StruQDefense`, which filters first.
 
     Args:
-        instruction: Trusted instruction / prompt.
-        input_text: Untrusted data / context.
-        delimiter_scheme: Delimiter configuration key (e.g. 'SpclSpclSpcl' or 'TextTextText').
-
-    Returns:
-        Structured query string with separate instruction, input, and response channels.
+        instruction:      Trusted instruction (the instruction channel).
+        input_text:       Untrusted data (the data channel). Empty selects the
+                          ``prompt_no_input`` template.
+        delimiter_scheme: Key into ``STRUQ_DELIMITERS``.
     """
-    delm = STRUQ_DELIMITERS.get(delimiter_scheme, STRUQ_DELIMITERS["SpclSpclSpcl"])
-    if input_text and input_text.strip():
-        return (
-            f"{SYS_INPUT_PREFIX}"
-            f"{delm[0]}\n{instruction}\n\n"
-            f"{delm[1]}\n{input_text}\n\n"
-            f"{delm[2]}\n"
-        )
-    else:
-        return (
-            f"{SYS_NO_INPUT_PREFIX}"
-            f"{delm[0]}\n{instruction}\n\n"
-            f"{delm[2]}\n"
-        )
+    prompt_dict = PROMPT_FORMAT.get(delimiter_scheme) or PROMPT_FORMAT["SpclSpclSpcl"]
+    key = "prompt_input" if (input_text and input_text.strip()) else "prompt_no_input"
+    return prompt_dict[key].format_map({"instruction": instruction, "input": input_text})
 
 
-class StruQDefense(DefendedVictim):
+class StruQDefense(StructuredChannelDefense):
     """
-    StruQ Defense Wrapper for `ipi` Benchmark.
+    StruQ defense wrapper.
 
-    StruQ separates instructions and untrusted data into distinct channels using special
-    structured delimiters (e.g., `[MARK] [INST] [COLN]` vs `[MARK] [INPT] [COLN]`).
-    When combined with a StruQ fine-tuned model, instructions embedded in the input
-    channel are ignored by the model.
+    StruQ has two halves, and both are needed:
+
+    1. **Structured query** — instruction and untrusted data go in separately
+       delimited channels (``[MARK] [INST][COLN]`` vs ``[MARK] [INPT][COLN]``),
+       and the model is fine-tuned to only ever obey the instruction channel.
+    2. **Defensive filter** — the delimiter tokens are stripped from the data
+       channel, so the attacker cannot close the channel and open a fake
+       instruction one.
+
+    The instruction/data split is recovered from the harness messages list (see
+    ``ipi/defenses/channels.py``); call :meth:`set_channels` when the caller
+    knows it exactly.
 
     Args:
-        target: Underlying Victim instance (e.g. LocalLLM loaded with StruQ model/adapter).
-        delimiter_scheme: Delimiter scheme name ('SpclSpclSpcl', 'TextTextText', etc.).
-        use_struq_template: Whether to reformat messages into StruQ structured channels.
+        target:                 Underlying Victim (a LocalLLM carrying the StruQ
+                                model/adapter, wrapped in TargetLLM).
+        delimiter_scheme:       Must match what the model was trained with.
+        apply_defensive_filter: Strip ``FILTERED_TOKENS`` from the data channel.
+                                Only turn this off to measure what the filter
+                                is worth on its own.
+        use_struq_template:     False passes messages through untouched, for an
+                                undefended control run.
     """
+
+    filtered_tokens: Sequence[str] = FILTERED_TOKENS
 
     def __init__(
         self,
         target: Victim,
         delimiter_scheme: str = "SpclSpclSpcl",
+        apply_defensive_filter: bool = True,
         use_struq_template: bool = True,
     ):
-        super().__init__(target)
+        super().__init__(target, apply_defensive_filter=apply_defensive_filter)
+        if delimiter_scheme not in STRUQ_DELIMITERS:
+            raise ValueError(
+                f"Unknown delimiter_scheme {delimiter_scheme!r}; "
+                f"expected one of {sorted(STRUQ_DELIMITERS)}."
+            )
         self.delimiter_scheme = delimiter_scheme
         self.use_struq_template = use_struq_template
 
-    def preprocess_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        if not self.use_struq_template:
-            return messages
-
-        new_msgs = deepcopy(messages)
-        user_content = ""
-        system_content = ""
-
-        for msg in new_msgs:
-            if msg.get("role") == "system":
-                system_content = msg.get("content", "")
-            elif msg.get("role") == "user":
-                user_content = msg.get("content", "")
-
-        inst = system_content if system_content else "Follow the instructions in the prompt."
-        inp = user_content
-
-        formatted_prompt = format_struq_prompt(
-            instruction=inst,
-            input_text=inp,
+    def format_prompt(self, instruction: str, data: str) -> str:
+        return format_struq_prompt(
+            instruction=instruction,
+            input_text=data,
             delimiter_scheme=self.delimiter_scheme,
         )
-        return [{"role": "user", "content": formatted_prompt}]
+
+    def preprocess_messages(self, messages: list[dict]) -> list[dict]:
+        if not self.use_struq_template:
+            return messages
+        return super().preprocess_messages(messages)

@@ -16,6 +16,7 @@ def train_secalign(
     model_name_or_path: str,
     output_dir: str,
     clean_data: Optional[List[Dict[str, Any]]] = None,
+    ref_inst_resp: Optional[Dict[str, str]] = None,
     frontend_delimiters: str = "TextTextText",
     attack: str = "NaiveCompletion",
     alignment: str = "dpo",
@@ -30,9 +31,33 @@ def train_secalign(
     max_length: int = 512,
     max_prompt_length: int = 384,
     max_samples: Optional[int] = None,
+    seed: int = 42,
 ) -> Any:
     """
-    Trains SecAlign model via DPO/ORPO using original paper hyperparameters.
+    Train a SecAlign model via DPO/ORPO using the paper's hyperparameters.
+
+    Args:
+        model_name_or_path: HF model id or local path. SecAlign is applied on
+                            top of a model already instruction-tuned on the
+                            target delimiter scheme (upstream chains it after
+                            the StruQ SFT stage); pointing it at a raw base
+                            model trains a different thing than the paper's.
+        output_dir:         Where the adapter is written.
+        clean_data:         Alpaca-style corpus. None downloads the paper's.
+        ref_inst_resp:      instruction -> response map for the Completion half
+                            of the attack. Pass the map from
+                            :func:`load_paper_datasets`; omitting it falls back
+                            to each sample's own output.
+        frontend_delimiters:Must match what the base model was tuned on.
+        attack:             'Naive' or 'NaiveCompletion'.
+        alignment:          'dpo' or 'orpo'.
+
+    IPI adaptations vs original
+    ---------------------------
+    Upstream runs FSDP across 4 GPUs at effective batch 64. This runs QLoRA on
+    one GPU at a much smaller effective batch, so loss curves will not line up
+    with the paper's even though the LoRA rank, alpha, dropout, beta, LR and
+    epoch count do.
     """
     try:
         import torch
@@ -63,11 +88,13 @@ def train_secalign(
     log.info(f"Generating preference data (attack={attack}, alignment={alignment})...")
     pref_data = generate_secalign_preference_data(
         clean_data=clean_data,
+        ref_inst_resp=ref_inst_resp,
         frontend_delimiters=frontend_delimiters,
         attack=attack,
         alignment=alignment,
         eos_token=tokenizer.eos_token or "</s>",
         max_samples=max_samples,
+        seed=seed,
     )
     dataset = Dataset.from_list(pref_data)
 
@@ -78,7 +105,7 @@ def train_secalign(
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
                 bnb_4bit_use_double_quant=True,
             )
         except ImportError:
@@ -106,6 +133,10 @@ def train_secalign(
     else:
         raise ValueError(f"Unsupported alignment '{alignment}'. Choose 'dpo' or 'orpo'.")
 
+    # DPO compares log-prob differences between two forward passes; fp16 eats
+    # enough precision there to matter, so prefer bf16 wherever it exists.
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
     cfg_params = set(inspect.signature(cfg_cls.__init__).parameters.keys())
     cfg_kwargs = {
         "output_dir": output_dir,
@@ -118,8 +149,10 @@ def train_secalign(
         "warmup_ratio": 0.03,
         "logging_steps": 10,
         "save_strategy": "epoch",
-        "fp16": torch.cuda.is_available(),
+        "bf16": use_bf16,
+        "fp16": torch.cuda.is_available() and not use_bf16,
         "optim": "paged_adamw_8bit" if use_4bit else "adamw_torch",
+        "seed": seed,
     }
     if "max_length" in cfg_params:
         cfg_kwargs["max_length"] = max_length
@@ -139,15 +172,6 @@ def train_secalign(
     }
 
     orig_forward = model.forward
-    # Patch model.forward.__func__ for TRL compatibility if model.forward is a partial/wrapper
-    if hasattr(model, "forward") and not hasattr(model.forward, "__func__"):
-        try:
-            if hasattr(model.forward, "func"):
-                object.__setattr__(model.forward, "__func__", model.forward.func)
-            else:
-                object.__setattr__(model.forward, "__func__", model.forward)
-        except Exception:
-            pass
 
     try:
         trainer = trainer_cls(processing_class=tokenizer, **trainer_kwargs)
@@ -157,8 +181,14 @@ def train_secalign(
         except TypeError:
             trainer = trainer_cls(**trainer_kwargs)
 
-    # Wrap orig_forward to populate num_valid_tokens & entropy_sum expected by TRL trainer
-    # while bypassing TRL's buggy _chunked_ce_forward on multi-GPU device_map="auto"
+    # TRL's newer trainers read `num_valid_tokens` / `entropy_sum` off the model
+    # output, and reach them via a chunked-CE path that miscomputes under
+    # device_map="auto". Populating the two fields ourselves keeps the trainer
+    # happy without entering that path.
+    #
+    # This is assigned on the *base* model rather than trainer.model on purpose:
+    # TRL wrapped `model` in a PeftModel above, and PEFT dispatches through the
+    # base module, where nn.Module.__call__ picks up this instance attribute.
     def safe_forward(*args, **kwargs):
         outputs = orig_forward(*args, **kwargs)
         if outputs is not None and hasattr(outputs, "loss") and outputs.loss is not None:
