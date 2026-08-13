@@ -64,7 +64,6 @@ def train_secalign(
         import transformers
         from datasets import Dataset
         from peft import LoraConfig, TaskType, get_peft_model
-        from trl import DPOTrainer, DPOConfig, ORPOTrainer, ORPOConfig
     except ImportError as e:
         raise ImportError(
             "SecAlign training requires `torch`, `transformers`, `datasets`, `peft`, and `trl`. "
@@ -126,9 +125,31 @@ def train_secalign(
         target_modules=["q_proj", "v_proj"],
     )
 
-    if alignment.lower() == "dpo":
+    alignment_lower = alignment.lower()
+    if alignment_lower == "dpo":
+        try:
+            from trl import DPOConfig, DPOTrainer
+        except ImportError as e:
+            raise ImportError(
+                "SecAlign DPO training requires trl's DPOTrainer/DPOConfig. "
+                "Install/upgrade via `pip install -U trl`."
+            ) from e
         cfg_cls, trainer_cls = DPOConfig, DPOTrainer
-    elif alignment.lower() == "orpo":
+    elif alignment_lower == "orpo":
+        try:
+            # trl >= 1.10 moved ORPO out of the stable top-level namespace into
+            # trl.experimental.orpo; older trl exposes it at the top level.
+            # Try both so this doesn't break across trl versions.
+            from trl import ORPOConfig, ORPOTrainer
+        except ImportError:
+            try:
+                from trl.experimental.orpo import ORPOConfig, ORPOTrainer
+            except ImportError as e:
+                raise ImportError(
+                    "SecAlign ORPO training requires trl's ORPOTrainer/ORPOConfig, "
+                    "which recent trl releases moved to `trl.experimental.orpo`. "
+                    "Install/upgrade via `pip install -U trl`."
+                ) from e
         cfg_cls, trainer_cls = ORPOConfig, ORPOTrainer
     else:
         raise ValueError(f"Unsupported alignment '{alignment}'. Choose 'dpo' or 'orpo'.")
