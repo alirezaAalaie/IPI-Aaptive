@@ -162,6 +162,29 @@ def _make_feedback_message(
     )
 
 
+def _truncate_conv(conv: list[dict], keep_last_n: int) -> list[dict]:
+    """
+    Trim an attacker conversation to system prompt + opening user message +
+    the last ``keep_last_n`` turns (a turn = one assistant reply + one user feedback).
+
+    The opening user message is preserved, not just the system prompt: in the IPI
+    prompt modes the system prompt is generic and the attacker goal / user task /
+    tool schema live in that first user message.  Dropping it would erase the
+    objective mid-search.
+
+    Mirrors the original TAP mutator's ``keep_last_n`` (Mehrotra et al. 2024),
+    which caps history at ``2 * keep_last_n`` messages.
+    """
+    if keep_last_n <= 0:
+        return conv
+    head = conv[:2]                      # system + opening user message
+    tail = conv[2:]
+    max_tail = 2 * keep_last_n
+    if len(tail) <= max_tail:
+        return conv
+    return head + tail[-max_tail:]
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: On-topic pruning
 # ---------------------------------------------------------------------------
@@ -210,6 +233,7 @@ def run_tap(
     context: Optional[dict] = None,
     on_topic_prune: bool = False,
     on_topic_model: Optional[str] = None,
+    keep_last_n: int = 3,
     verbose: bool = False,
 ) -> TAPResult:
     """
@@ -257,6 +281,12 @@ def run_tap(
                          If None, reuses `attacker_model`. Use a cheap/fast model
                          (e.g., "gpt-4o-mini") to reduce cost. Only used when
                          on_topic_prune=True.
+        keep_last_n:     Number of recent attacker turns (user+assistant pairs) kept in
+                         each candidate's conversation. The system prompt and the opening
+                         user message are always retained. Matches the original TAP
+                         mutator's keep_last_n. Default 3.
+                         Without this, conversations grow by 2 messages per depth level
+                         and blow past the context window on deep trees.
         verbose:         Log progress at INFO level.
 
     Returns:
@@ -402,6 +432,7 @@ def run_tap(
                 cand["injection"], cand["response"], cand["score"], goal, prompt_mode
             )
             cand["conv"].append({"role": "user", "content": feedback})
+            cand["conv"] = _truncate_conv(cand["conv"], keep_last_n)
 
         # ---- EARLY STOP ----------------------------------------------------
         if judge.is_success(best_score):
@@ -448,6 +479,8 @@ class TAPAttacker(JudgeGuidedAttacker):
         prompt_mode:      "ipi_single" | "ipi_universal" | "original". Default "ipi_single".
         on_topic_prune:   Enable Phase 1 on-topic pruning. Default False.
         on_topic_model:   Model string for on-topic evaluator. None = reuse attacker_llm.
+        keep_last_n:      Attacker turns retained per candidate conversation. Default 3
+                          (the original TAP value). Set 0 to disable truncation.
     """
 
     def __init__(
@@ -460,6 +493,7 @@ class TAPAttacker(JudgeGuidedAttacker):
         prompt_mode: str = "ipi_single",
         on_topic_prune: bool = False,
         on_topic_model: Optional[str] = None,
+        keep_last_n: int = 3,
     ):
         super().__init__(judge)
         self.attacker_llm    = (
@@ -473,6 +507,7 @@ class TAPAttacker(JudgeGuidedAttacker):
         self.prompt_mode      = prompt_mode
         self.on_topic_prune   = on_topic_prune
         self.on_topic_model   = on_topic_model
+        self.keep_last_n      = keep_last_n
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
         from ..evaluator import ScenarioResult, make_scenario_target_fn
@@ -489,6 +524,7 @@ class TAPAttacker(JudgeGuidedAttacker):
             context=scenario.to_attack_context(),
             on_topic_prune=self.on_topic_prune,
             on_topic_model=self.on_topic_model,
+            keep_last_n=self.keep_last_n,
             verbose=verbose,
         )
         return ScenarioResult(

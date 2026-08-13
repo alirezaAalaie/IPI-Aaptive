@@ -107,6 +107,13 @@ from .attacks.static_injection import (
     build_naive_injection, build_escape_injection, build_ignore_injection,
     build_fake_completion_injection, build_combined_injection,
 )
+from .attacks import (
+    DeepInceptionAttacker, DeepInceptionResult, run_deepinception,
+    ICAAttacker, ICAResult, run_ica,
+    MultilingualAttacker, MultilingualResult, run_multilingual,
+    ReNeLLMAttacker, ReNeLLMResult, run_renellm,
+    GPTFuzzerAttacker, GPTFuzzerResult, run_gptfuzzer,
+)
 
 # ---- Dataset ----
 from .dataset import (
@@ -175,6 +182,9 @@ __all__ = [
     # Static injection (OPI)
     "NaiveAttacker", "EscapeAttacker", "IgnoreAttacker",
     "FakeCompletionAttacker", "CombinedAttacker",
+    # Template / iterative attacks (EasyJailbreak ports)
+    "DeepInceptionAttacker", "ICAAttacker", "MultilingualAttacker",
+    "ReNeLLMAttacker", "GPTFuzzerAttacker",
     # Low-level attack functions
     "run_tap", "TAPResult",
     "run_pair", "PAIRResult",

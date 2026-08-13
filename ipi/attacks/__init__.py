@@ -34,6 +34,13 @@ from .static_injection import (
     build_naive_injection, build_escape_injection, build_ignore_injection,
     build_fake_completion_injection, build_combined_injection,
 )
+# Template / static attacks ported from EasyJailbreak (API-compatible, no torch)
+from .deepinception import DeepInceptionAttacker, DeepInceptionResult, run_deepinception
+from .ica          import ICAAttacker,          ICAResult,          run_ica
+from .multilingual import MultilingualAttacker, MultilingualResult, run_multilingual
+# Iterative attacks ported from EasyJailbreak (require an attacker LLM, no torch)
+from .renellm      import ReNeLLMAttacker,   ReNeLLMResult,   run_renellm
+from .gptfuzzer    import GPTFuzzerAttacker, GPTFuzzerResult, run_gptfuzzer
 
 # Optional local white-box attacks (require torch)
 try:
@@ -70,4 +77,11 @@ __all__ = [
     "StaticInjectionResult", "run_static_injection", "create_static_attacker",
     "build_naive_injection", "build_escape_injection", "build_ignore_injection",
     "build_fake_completion_injection", "build_combined_injection",
+    # Template / static attacks (EasyJailbreak ports)
+    "DeepInceptionAttacker", "DeepInceptionResult", "run_deepinception",
+    "ICAAttacker", "ICAResult", "run_ica",
+    "MultilingualAttacker", "MultilingualResult", "run_multilingual",
+    # Iterative attacks (EasyJailbreak ports)
+    "ReNeLLMAttacker", "ReNeLLMResult", "run_renellm",
+    "GPTFuzzerAttacker", "GPTFuzzerResult", "run_gptfuzzer",
 ]
