@@ -579,6 +579,7 @@ class LocalLLM(UnifiedLLM):
         adapter_path: Optional[str] = None,
     ):
         self.adapter_path = adapter_path
+        self.adapter_loaded = False   # set True in _init_local iff a PEFT adapter actually attached
         super().__init__(
             model, system_prompt, temperature, max_tokens, top_p, top_k,
             api_key, metis_location, extra_messages, max_bs,
@@ -871,8 +872,24 @@ class LocalLLM(UnifiedLLM):
                 from peft import PeftModel
                 log.info("[LocalLLM] Attaching PEFT adapter from: %s", adapter_dir)
                 model_obj = PeftModel.from_pretrained(model_obj, adapter_dir)
+                self.adapter_loaded = True
             except Exception as e:
-                log.warning("[LocalLLM] Could not load PEFT adapter: %s", e)
+                # Non-fatal by design (some callers deliberately fall back to the base
+                # model), but this MUST NOT fail silently: a swallowed adapter-load
+                # error here means every downstream "defended" eval is actually
+                # running the undefended base model while reporting success. Print
+                # (not just log.warning — notebooks often don't surface Python
+                # logging) and leave self.adapter_loaded False so callers can check
+                # `victim._hf_model_obj` / `LocalLLM.adapter_loaded` before trusting
+                # results.
+                msg = (
+                    f"[LocalLLM] ⚠️  PEFT ADAPTER FAILED TO LOAD from {adapter_dir!r}: {e}\n"
+                    f"[LocalLLM] ⚠️  Continuing with the BASE model ({base_model_path!r}) "
+                    f"UNMODIFIED — any defense/fine-tuning this adapter provides is "
+                    f"NOT applied. Check `.adapter_loaded` before trusting results."
+                )
+                log.warning(msg)
+                print(msg)
 
         self._hf_model_obj = model_obj.eval()
         self._device = next(self._hf_model_obj.parameters()).device
