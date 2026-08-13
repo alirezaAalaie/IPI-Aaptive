@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 from typing import Dict, List, Optional, Any
 
 from .dataset import generate_secalign_preference_data
@@ -95,6 +96,26 @@ def train_secalign(
         max_samples=max_samples,
         seed=seed,
     )
+    if not pref_data:
+        # generate_secalign_preference_data() only keeps clean_data items whose
+        # "input" field is non-empty (the injected instruction has to attach
+        # somewhere) — see ipi/defenses/secalign/dataset.py. If max_samples
+        # slices the front of clean_data and that slice happens to contain no
+        # such items (e.g. a small max_samples against a corpus whose leading
+        # rows are all input-less), pref_data silently comes back empty and
+        # DPOTrainer/ORPOTrainer would fail ~200 lines deep with an opaque
+        # `StopIteration: next(iter(train_dataset))`. Fail here instead, with
+        # enough context to fix the call.
+        raise ValueError(
+            f"generate_secalign_preference_data() produced 0 training pairs "
+            f"(clean_data had {len(clean_data) if clean_data is not None else 'unknown (downloaded default)'} "
+            f"items, max_samples={max_samples!r}, attack={attack!r}). "
+            "Every candidate was skipped for having an empty 'input' field "
+            "(only clean_data rows with input+instruction can host the "
+            "injected instruction). Increase max_samples, pass a corpus with "
+            "more non-empty-input rows, or pass max_samples=None to scan all "
+            "of clean_data instead of just its first slice."
+        )
     dataset = Dataset.from_list(pref_data)
 
     bnb_config = None
@@ -158,6 +179,16 @@ def train_secalign(
     # enough precision there to matter, so prefer bf16 wherever it exists.
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
+    # Paper (align.py) uses warmup_ratio=0.03; recent transformers deprecates
+    # `warmup_ratio` on TrainingArguments in favor of `warmup_steps` ("will be
+    # removed in v5.2"). Reproduce the same effective schedule as explicit
+    # steps so this keeps working once warmup_ratio is actually removed.
+    world_size = max(1, torch.cuda.device_count()) if torch.cuda.is_available() else 1
+    effective_batch = per_device_train_batch_size * gradient_accumulation_steps * world_size
+    steps_per_epoch = max(1, -(-len(dataset) // effective_batch))   # ceil div
+    total_steps = max(1, math.ceil(steps_per_epoch * num_train_epochs))
+    warmup_steps = max(1, round(total_steps * 0.03))
+
     cfg_params = set(inspect.signature(cfg_cls.__init__).parameters.keys())
     cfg_kwargs = {
         "output_dir": output_dir,
@@ -167,7 +198,7 @@ def train_secalign(
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "beta": 0.1,
         "lr_scheduler_type": "cosine",
-        "warmup_ratio": 0.03,
+        "warmup_steps": warmup_steps,
         "logging_steps": 10,
         "save_strategy": "epoch",
         "bf16": use_bf16,
