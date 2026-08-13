@@ -907,6 +907,15 @@ class LocalLLM(UnifiedLLM):
             msgs.append({"role": "user", "content": messages})
             messages = msgs
 
+        # A lone {"role": "raw"} turn carries a fully pre-rendered prompt — used
+        # by the structured-query defenses (StruQ / SecAlign), whose models are
+        # fine-tuned on bare Alpaca-format strings and must NOT be wrapped in a
+        # chat template. See ipi/defenses/channels.py:RAW_ROLE.
+        if len(messages) == 1 and messages[0].get("role") == "raw":
+            return self._tokenizer_obj.encode(
+                messages[0].get("content", ""), add_special_tokens=True,
+            )
+
         try:
             # Always use tokenize=False — returns a plain str on every tokenizer
             # version. Then encode separately, which always returns list[int].

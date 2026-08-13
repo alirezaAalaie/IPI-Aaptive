@@ -2,6 +2,12 @@
 IPI Defenses Package.
 """
 from .base import DefendedVictim
+from .channels import (
+    RAW_ROLE,
+    StructuredChannelDefense,
+    recursive_filter,
+    split_instruction_data,
+)
 from .in_context import (
     InstructionalDefense,
     ReminderDefense,
@@ -25,6 +31,10 @@ from .struq import (
 
 __all__ = [
     "DefendedVictim",
+    "StructuredChannelDefense",
+    "split_instruction_data",
+    "recursive_filter",
+    "RAW_ROLE",
     "InstructionalDefense",
     "ReminderDefense",
     "SandwichDefense",

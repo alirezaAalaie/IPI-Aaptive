@@ -23,7 +23,7 @@ ipi/                    ← the package (this is the product; pip-installed on K
   attacks/              tap · pair · adaptive(RS/Beam-RS) · beast · autodan · gcg · static_injection
                         · deepinception · ica · multilingual · renellm · gptfuzzer
                         · ipi_seeds (shared seed pool for AutoDAN + GPTFuzzer)
-  defenses/             base(DefendedVictim) · in_context · secalign/ · struq/
+  defenses/             base(DefendedVictim) · channels · in_context · secalign/ · struq/
 
 code/                   ← vendored reference implementations from other papers (READ-ONLY)
   attack/               AutoDAN · BEAST · EasyJailbreak · JailbreakingLLMs(PAIR)
@@ -117,6 +117,24 @@ use both entry points.
 - StruQ/SecAlign training lives under `ipi/defenses/{struq,secalign}/trainer.py` and has had
   repeated multi-GPU / TRL-compat breakage (see recent commits). Their notebooks are separate:
   `experiments/{struq,secalign}_defense_notebook.ipynb`.
+- **StruQ/SecAlign delimiters are load-bearing strings.** `SpclSpclSpcl` is
+  `'[MARK] [INST][COLN]'` — no space before `[COLN]`. Both configs build them by the same
+  concatenations as upstream so they can't drift; don't hand-edit them into literals. A single
+  stray space silently un-matches every released checkpoint.
+- **StruQ training order is load-bearing.** The tokenizer must be resized *before* the corpus is
+  tokenized, and `modules_to_save=["embed_tokens","lm_head"]` must stay in the `LoraConfig` —
+  otherwise the five delimiter tokens either tokenize differently at train vs inference time, or
+  never receive gradient at all. Both failures are silent.
+- **The defense is two halves.** The structured prompt only holds because `recursive_filter`
+  strips `FILTERED_TOKENS` from the data channel. Don't ship an ASR number with
+  `apply_defensive_filter=False` unless that ablation is the point.
+- `ipi/defenses/channels.py` recovers the instruction/data split from a harness messages list.
+  Role-based guessing does not work — in the AgentDojo shape the legitimate task is *inside* the
+  user turn, and in the BIPIA shape the untrusted context is inside the *system* turn. When a
+  caller knows the split, `defense.set_channels(instruction, data)` beats parsing.
+- Structured defenses emit a single `{"role": "raw"}` turn, which `LocalLLM._build_local_prompt_ids`
+  encodes verbatim. These models are fine-tuned on bare Alpaca-format strings; wrapping them in a
+  chat template feeds them a format they were never aligned on.
 
 ## Current work
 
