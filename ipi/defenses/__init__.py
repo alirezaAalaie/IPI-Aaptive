@@ -21,6 +21,11 @@ from .defensive_token import (
     apply_defensive_tokens,
     build_defensive_token_model,
 )
+from .pisanitizer import (
+    PISanitizer,
+    PISanitizerDefense,
+    SanitizationTrace,
+)
 from .secalign import (
     SecAlignDefense,
     generate_secalign_preference_data,
@@ -50,6 +55,9 @@ __all__ = [
     "apply_defensive_tokens",
     "build_defensive_token_model",
     "DEFENSIVE_TOKEN_NAMES",
+    "PISanitizer",
+    "PISanitizerDefense",
+    "SanitizationTrace",
     "SecAlignDefense",
     "generate_secalign_preference_data",
     "train_secalign",

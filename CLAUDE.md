@@ -24,7 +24,7 @@ ipi/                    ← the package (this is the product; pip-installed on K
                         · deepinception · ica · multilingual · renellm · gptfuzzer
                         · ipi_seeds (shared seed pool for AutoDAN + GPTFuzzer)
   defenses/             base(DefendedVictim) · channels · in_context · secalign/ · struq/
-                        · defensive_token/
+                        · defensive_token/ · pisanitizer/
 
 code/                   ← vendored reference implementations from other papers (READ-ONLY)
   attack/               AutoDAN · BEAST · EasyJailbreak · JailbreakingLLMs(PAIR)
@@ -147,6 +147,20 @@ use both entry points.
   `scripts/check_defensivetoken_fidelity.py` asserts byte-equality against the vendored upstream.
   Notebook: `experiments/defensivetoken_defense_notebook.ipynb`. Tokens are per-model and do not
   transfer; only the four models in `SUPPORTED_MODELS` have released weights.
+- **PISanitizer is the closest published peer to our own defense** — attention-based, and
+  prevention rather than detection. It is the only baseline that also defends an *API* victim,
+  since only the sanitizer needs local weights. `PISanitizerDefense` subclasses `DefendedVictim`
+  directly, not `StructuredChannelDefense`: it edits the untrusted span in place and leaves the
+  message structure alone. If the recovered span isn't found verbatim in a single message the
+  defense is inert — it warns; use `set_channels`. Three things in it are method, not tuning:
+  the anchor prompt *invites* instruction-following (reversing it inverts the signal), the
+  `" X" * 500` padding holds the context off the attention sinks at the prompt boundaries, and
+  `group_peaks` removes **only the single highest span per round** (≤5 rounds, so ≤5 spans ever).
+  `attention.py` reconstructs attention from hidden states because SDPA/flash never materialise
+  it — that couples it to transformers internals (upstream pins 4.56.2). Needs scipy:
+  `pip install ipi-adaptive[pisanitizer]`. `scripts/check_pisanitizer_fidelity.py` differentially
+  tests the port against vendored upstream; notebook:
+  `experiments/pisanitizer_defense_notebook.ipynb`.
 
 ## Current work
 

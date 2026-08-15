@@ -22,6 +22,14 @@ local = [
 agentdojo = [
     "agentdojo>=0.1",
 ]
+# PISanitizer reconstructs attention from model internals (torch/transformers)
+# and finds peaks in the resulting signal (scipy).
+pisanitizer = [
+    "transformers>=4.40",
+    "accelerate>=0.28",
+    "torch>=2.1",
+    "scipy>=1.10",
+]
 dev = [
     "pandas",
     "jupyter",
