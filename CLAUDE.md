@@ -24,6 +24,7 @@ ipi/                    ← the package (this is the product; pip-installed on K
                         · deepinception · ica · multilingual · renellm · gptfuzzer
                         · ipi_seeds (shared seed pool for AutoDAN + GPTFuzzer)
   defenses/             base(DefendedVictim) · channels · in_context · secalign/ · struq/
+                        · defensive_token/
 
 code/                   ← vendored reference implementations from other papers (READ-ONLY)
   attack/               AutoDAN · BEAST · EasyJailbreak · JailbreakingLLMs(PAIR)
@@ -135,6 +136,17 @@ use both entry points.
 - Structured defenses emit a single `{"role": "raw"}` turn, which `LocalLLM._build_local_prompt_ids`
   encodes verbatim. These models are fine-tuned on bare Alpaca-format strings; wrapping them in a
   chat template feeds them a format they were never aligned on.
+- **DefensiveToken fails silently by default.** An unpatched tokenizer renders `add_defensive_tokens`
+  as an undefined Jinja variable — falsy — so the prompt comes out with no tokens in it and the run
+  reports the *undefended* ASR under a defended label. `DefensiveTokenDefense.__init__` probes the
+  template both ways and raises; `apply_defensive_tokens` reads each embedding row back after
+  writing it (a `meta`/offloaded/quantised table swallows the write). Don't remove either check.
+  Its chat templates are also **not** the models' stock ones — they're the Meta-SecAlign-style
+  formats the embeddings were optimised against — and `system` carries the *trusted* instruction
+  while `user` carries the *untrusted* data, which is inverted from Meta-SecAlign's own convention.
+  `scripts/check_defensivetoken_fidelity.py` asserts byte-equality against the vendored upstream.
+  Notebook: `experiments/defensivetoken_defense_notebook.ipynb`. Tokens are per-model and do not
+  transfer; only the four models in `SUPPORTED_MODELS` have released weights.
 
 ## Current work
 

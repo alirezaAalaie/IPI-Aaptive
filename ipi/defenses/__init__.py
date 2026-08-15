@@ -15,6 +15,12 @@ from .in_context import (
     SpotlightDefense,
     CompositeDefense,
 )
+from .defensive_token import (
+    DEFENSIVE_TOKEN_NAMES,
+    DefensiveTokenDefense,
+    apply_defensive_tokens,
+    build_defensive_token_model,
+)
 from .secalign import (
     SecAlignDefense,
     generate_secalign_preference_data,
@@ -40,6 +46,10 @@ __all__ = [
     "SandwichDefense",
     "SpotlightDefense",
     "CompositeDefense",
+    "DefensiveTokenDefense",
+    "apply_defensive_tokens",
+    "build_defensive_token_model",
+    "DEFENSIVE_TOKEN_NAMES",
     "SecAlignDefense",
     "generate_secalign_preference_data",
     "train_secalign",
