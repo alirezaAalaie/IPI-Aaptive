@@ -73,7 +73,7 @@ from ..attacker import AdaptiveAttacker
 from ..evaluator import check_ipi_success
 from ..judges import Judge
 from ..victim import Victim
-from .ipi_seeds import IPI_SEED_TEMPLATES, sample_seed_population
+from .seeds import SeedTemplate, sample_population
 
 log = logging.getLogger(__name__)
 
@@ -82,13 +82,15 @@ log = logging.getLogger(__name__)
 # IPI seed templates
 # ---------------------------------------------------------------------------
 
-# The initial GA population is drawn from the shared, diverse IPI seed pool in
-# ``ipi_seeds.py`` (~40 distinct templates across 9 strategy families). This
-# replaces the original ``assets/prompt_group.pth`` so the package needs no
-# external data files, while giving the genetic algorithm enough genetic
-# diversity at generation 0 for crossover and the momentum word-dictionary to
-# actually do work. Exposed here under the old name for backward compatibility.
-_IPI_SEED_TEMPLATES: list[str] = IPI_SEED_TEMPLATES
+# The initial GA population is drawn from the shared IPI seed pool in the seed
+# registry (``seeds.py`` / ``seed_templates.json`` → ipi/IPI: ~40 distinct
+# templates across 9 strategy families). This replaces the original
+# ``assets/prompt_group.pth`` so the package needs no external data files, while
+# giving the genetic algorithm enough genetic diversity at generation 0 for
+# crossover and the momentum word-dictionary to actually do work.
+_IPI_SEED_TEMPLATES: list[str] = SeedTemplate().new_seeds(
+    method_list=["IPI"], prompt_usage="ipi"
+)
 
 
 def _make_seed_population(
@@ -97,14 +99,15 @@ def _make_seed_population(
     extra_seeds: Optional[list[str]] = None,
 ) -> list[str]:
     """
-    Build the initial population from the diverse IPI seed pool.
+    Build the initial population from the shared IPI seed pool.
 
     Draws distinct templates without replacement while the pool is large enough
     (only repeating if ``batch_size`` exceeds the number of templates), after
     substituting the goal for each template's placeholder. ``extra_seeds`` are
     placed first.
     """
-    return sample_seed_population(goal, batch_size, extra_seeds=extra_seeds)
+    return sample_population(goal, batch_size, prompt_usage="ipi",
+                             method_list=["IPI"], extra_seeds=extra_seeds)
 
 
 # ---------------------------------------------------------------------------

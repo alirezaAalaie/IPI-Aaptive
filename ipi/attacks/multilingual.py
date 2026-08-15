@@ -155,7 +155,7 @@ def run_multilingual(
     languages: Optional[dict[str, str]] = None,
     translator: Optional[Callable[[str, str], str]] = None,
     translator_llm: Optional[Union[str, UnifiedLLM]] = None,
-    eval_mode: str = "function_name",
+    eval_mode: str = "contains",
     target_str: str = "",
     stop_on_success: bool = True,
 ) -> MultilingualResult:
@@ -247,7 +247,8 @@ class MultilingualAttacker(StaticAttacker):
         translator_llm: Optional LLM (or model string) translator, used if ``translator``
                         is not provided. If neither is set, a keyless Google endpoint is
                         used (requires network).
-        eval_mode:      check_ipi_success mode. Default "function_name".
+        eval_mode:      check_ipi_success mode. Default None → auto-detect from the
+                        scenario's ``attack_eval_mode``.
         stop_on_success: Stop at the first successful language. Default True.
     """
 
@@ -259,7 +260,7 @@ class MultilingualAttacker(StaticAttacker):
         languages: Optional[dict[str, str]] = None,
         translator: Optional[Callable[[str, str], str]] = None,
         translator_llm: Optional[Union[str, UnifiedLLM]] = None,
-        eval_mode: str = "function_name",
+        eval_mode: Optional[str] = None,
         stop_on_success: bool = True,
     ):
         super().__init__(judge)
@@ -274,8 +275,9 @@ class MultilingualAttacker(StaticAttacker):
         return False
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult, make_scenario_target_fn
+        from ..evaluator import ScenarioResult, make_scenario_target_fn, resolve_attack_target
         target_fn = make_scenario_target_fn(scenario, target)
+        target_str, eval_mode = resolve_attack_target(scenario, self.eval_mode)
 
         r = run_multilingual(
             goal=scenario.injection_goal,
@@ -284,8 +286,8 @@ class MultilingualAttacker(StaticAttacker):
             languages=self.languages,
             translator=self.translator,
             translator_llm=self.translator_llm,
-            eval_mode=self.eval_mode,
-            target_str=getattr(scenario, "target_tool_calls", "") or scenario.injection_goal,
+            eval_mode=eval_mode,
+            target_str=target_str,
             stop_on_success=self.stop_on_success,
         )
 

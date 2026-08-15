@@ -288,6 +288,35 @@ def check_user_utility(response: str, user_target: str, mode: str = "contains") 
 
 
 
+def resolve_attack_target(scenario: IPIScenario, eval_mode: Optional[str] = None) -> tuple[str, str]:
+    """
+    Resolve the (target_str, eval_mode) an attack should optimize against for a scenario.
+
+    Attacks call this from ``run_scenario`` so their internal success signal (early
+    stopping, best-candidate selection) matches how the AttackEvaluator will finally
+    judge the run — instead of hard-coding ``eval_mode="function_name"``, which is
+    wrong for datasets like DualVerifiableDataset whose goals are literal strings
+    ("Print only HACKED") scored with ``startswith`` / ``contains``.
+
+    Precedence:
+      target_str  — scenario.target_output (a.k.a. target_tool_calls) else injection_goal.
+      eval_mode   — explicit ``eval_mode`` arg if given; else the scenario's
+                    metadata["attack_eval_mode"]; else "contains".
+
+    Args:
+        scenario:  The IPIScenario being attacked.
+        eval_mode: Optional override. None means "auto-detect from the scenario".
+
+    Returns:
+        (target_str, eval_mode)
+    """
+    target_str = getattr(scenario, "target_output", "") or scenario.injection_goal
+    if eval_mode is None:
+        meta = getattr(scenario, "metadata", None) or {}
+        eval_mode = meta.get("attack_eval_mode", "contains")
+    return target_str, eval_mode
+
+
 def get_target_token(target_str: str, tokenizer=None) -> str:
     """
     First meaningful token of `target_str` for RS optimization.

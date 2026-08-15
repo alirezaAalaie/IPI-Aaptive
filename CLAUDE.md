@@ -22,7 +22,8 @@ ipi/                    ← the package (this is the product; pip-installed on K
   config.py             shared hyperparameter defaults
   attacks/              tap · pair · adaptive(RS/Beam-RS) · beast · autodan · gcg · static_injection
                         · deepinception · ica · multilingual · renellm · gptfuzzer
-                        · ipi_seeds (shared seed pool for AutoDAN + GPTFuzzer)
+                        · seeds (SeedTemplate registry) + seed_templates.json
+                        · mutations (MutationBase ops, shared by GPTFuzzer + ReNeLLM)
   defenses/             base(DefendedVictim) · channels · in_context · secalign/ · struq/
                         · defensive_token/ · pisanitizer/
 
@@ -109,6 +110,20 @@ use both entry points.
   fixed (`keep_last_n`, default 3), but the default `on_topic_prune=False`, `width=5`,
   `branching=2` is *not* paper-TAP. For a row labelled "TAP" set `on_topic_prune=True`,
   `width=10`, `branching=4`. See `docs/easyjailbreak-audit.md`.
+- **EasyJailbreak-ported attacks auto-resolve their eval mode** (`deepinception`, `ica`,
+  `multilingual`, `renellm`, `gptfuzzer`). Their `eval_mode` defaults to `None`, meaning
+  "read `scenario.metadata['attack_eval_mode']`" via `evaluator.resolve_attack_target`. Don't
+  hard-code `eval_mode='function_name'` for these — that's the AgentDojo convention and never
+  matches `DualVerifiableDataset`'s literal-string goals (`startswith`/`contains`). The final ASR
+  is recomputed by `AttackEvaluator` from the same metadata regardless; the attacker's mode only
+  steers its own early-stop / best-candidate choice.
+- **Seed templates and mutation ops are shared, registry-backed.** `attacks/seeds.py`
+  (`SeedTemplate`) reads `attacks/seed_templates.json`: `original/` holds verbatim upstream
+  templates (GPTFuzzer 77, ICA, DeepInception, ReNeLLM 3), `ipi/` the 41-template IPI pool,
+  `advbench/` the ICA demo pairs. `attacks/mutations.py` (`MutationBase`) holds the GPTFuzzer +
+  ReNeLLM operators with verbatim prompts. The JSON must ship in the wheel — it's declared in
+  `[tool.setuptools.package-data]`; don't drop that or Kaggle installs break at import of any
+  seed-based attack.
 - **PAIR has no JSON prefill.** The reference implementation prefills the attacker's reply with
   `{"improvement": "", "prompt": "` for local HF attacker models. Without it, local attacker
   models fail JSON parsing often. Fine for API attackers.

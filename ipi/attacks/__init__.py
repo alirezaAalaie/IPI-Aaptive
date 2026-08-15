@@ -34,6 +34,17 @@ from .static_injection import (
     build_naive_injection, build_escape_injection, build_ignore_injection,
     build_fake_completion_injection, build_combined_injection,
 )
+# Shared building blocks (EasyJailbreak-style seed registry + mutation operators)
+from .seeds import (
+    SeedBase, SeedTemplate, PLACEHOLDER,
+    load_seed_templates, render, sample_population, advbench_pairs,
+)
+from .mutations import (
+    MutationBase, GPTFUZZER_MUTATORS, RENELLM_MUTATORS,
+    Expand, Shorten, Rephrase, GenerateSimilar, CrossOver,
+    AlterSentenceStructure, ChangeStyle, InsertMeaninglessCharacters,
+    MisspellSensitiveWords, Translation,
+)
 # Template / static attacks ported from EasyJailbreak (API-compatible, no torch)
 from .deepinception import DeepInceptionAttacker, DeepInceptionResult, run_deepinception
 from .ica          import ICAAttacker,          ICAResult,          run_ica
@@ -77,6 +88,10 @@ __all__ = [
     "StaticInjectionResult", "run_static_injection", "create_static_attacker",
     "build_naive_injection", "build_escape_injection", "build_ignore_injection",
     "build_fake_completion_injection", "build_combined_injection",
+    # Shared building blocks
+    "SeedBase", "SeedTemplate", "PLACEHOLDER",
+    "load_seed_templates", "render", "sample_population", "advbench_pairs",
+    "MutationBase", "GPTFUZZER_MUTATORS", "RENELLM_MUTATORS",
     # Template / static attacks (EasyJailbreak ports)
     "DeepInceptionAttacker", "DeepInceptionResult", "run_deepinception",
     "ICAAttacker", "ICAResult", "run_ica",
