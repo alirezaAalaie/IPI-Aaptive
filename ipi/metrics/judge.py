@@ -29,7 +29,7 @@ from typing import Optional
 
 from ..datasets import Instance
 from .base import Evaluator
-from .checks import check_ipi_success, check_user_utility
+from .checks import check_ipi_success, check_user_utility, resolve_attack_target
 
 log = logging.getLogger(__name__)
 
@@ -76,22 +76,12 @@ class EvaluatorIPISuccess(Evaluator):
         """
         The (target_str, eval_mode) this instance is scored against.
 
-        The ``Instance`` twin of ``checks.resolve_attack_target``. Precedence:
-        explicit argument, then the evaluator's own ``mode``, then the instance's
-        ``attack_eval_mode``, then ``"contains"``.
+        Delegates to ``checks.resolve_attack_target`` so the attack's own early-stop
+        signal and the reported ASR resolve identically. Precedence: explicit argument,
+        then the evaluator's own ``mode``, then the instance's ``attack_eval_mode``,
+        then ``"contains"``.
         """
-        target_str = (
-            instance.attack_attrs.get("target_str")
-            or (instance.reference_responses[-1] if instance.reference_responses else "")
-            or (instance.query or "")
-        )
-        eval_mode = (
-            mode
-            or self.mode
-            or instance.attack_attrs.get("attack_eval_mode")
-            or "contains"
-        )
-        return target_str, eval_mode
+        return resolve_attack_target(instance, mode or self.mode)
 
     def check(self, response: str, target_str: str, mode: Optional[str] = None) -> bool:
         """Score one response directly — the entry point ``AttackEvaluator`` uses."""

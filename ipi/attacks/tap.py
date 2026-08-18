@@ -548,12 +548,12 @@ class TAPAttacker(JudgeGuidedAttacker):
         self.on_topic_model   = on_topic_model
         self.keep_last_n      = keep_last_n
 
-    def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import make_scenario_target_fn
+    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+        from ..harness import attack_context, make_target_fn
         from ..metrics import ScenarioResult
-        target_fn = make_scenario_target_fn(scenario, target)
+        target_fn = make_target_fn(instance, target)
         r = run_tap(
-            goal=scenario.injection_goal,
+            goal=instance.query,
             target_fn=target_fn,
             attacker_model=self.attacker_llm,
             judge=self.judge,
@@ -561,15 +561,15 @@ class TAPAttacker(JudgeGuidedAttacker):
             width=self.width,
             branching_factor=self.branching_factor,
             prompt_mode=self.prompt_mode,
-            context=scenario.to_attack_context(),
+            context=attack_context(instance),
             on_topic_prune=self.on_topic_prune,
             on_topic_model=self.on_topic_model,
             keep_last_n=self.keep_last_n,
             verbose=verbose,
         )
         return ScenarioResult(
-            scenario_id=scenario.id,
-            goal=scenario.injection_goal,
+            scenario_id=instance.id,
+            goal=instance.query,
             success=r.success,
             score=r.score,
             injection=r.injection,

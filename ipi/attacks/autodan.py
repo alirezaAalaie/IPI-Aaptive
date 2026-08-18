@@ -75,6 +75,7 @@ import torch
 import torch.nn as nn
 
 from ..attacker import AdaptiveAttacker
+from ..datasets import Instance
 from ..metrics import Evaluator, check_ipi_success
 from ..victim import Victim
 from ..seed import sample_population
@@ -1040,14 +1041,15 @@ class AutoDANAttacker(AdaptiveAttacker):
     def requires_local_target(cls) -> bool:
         return True
 
-    def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import make_scenario_target_fn
-        from ..metrics import ScenarioResult
-        target_fn = make_scenario_target_fn(scenario, target)
+    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+        from ..harness import make_target_fn
+        from ..metrics import ScenarioResult, resolve_attack_target
+        target_fn = make_target_fn(instance, target)
+        target_str, _ = resolve_attack_target(instance)
 
         common_kwargs = dict(
-            goal=scenario.injection_goal,
-            target_str=scenario.target_tool_calls or scenario.injection_goal,
+            goal=instance.query,
+            target_str=target_str,
             target_llm=target,
             eval_target_fn=target_fn,
             eval_mode=self.eval_mode,
@@ -1071,8 +1073,8 @@ class AutoDANAttacker(AdaptiveAttacker):
             r = run_autodan_hga(**common_kwargs, hga_period=self.hga_period)
 
         return ScenarioResult(
-            scenario_id=scenario.id,
-            goal=scenario.injection_goal,
+            scenario_id=instance.id,
+            goal=instance.query,
             success=r.success,
             score=max(0, int(10 - r.best_loss)),   # rough 0-10 scale from loss
             injection=r.injection,

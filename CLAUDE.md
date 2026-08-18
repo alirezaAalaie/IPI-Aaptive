@@ -17,9 +17,10 @@ ipi/                    ← the package (this is the product; pip-installed on K
   seed/                 SeedTemplate registry + seed_templates.json — payloads, attacker /
                         judge / constraint system prompts, ICA demos. Replaces prompts.py
   datasets/             Instance (the carrier) · AttackDataset · DualVerifiableDataset
-  dataset.py            LEGACY IPIScenario · DualVerifiableDataset (deleted in Phase H)
-  evaluator.py          harness helpers only: make_scenario_target_fn · RS early stop
-  runner.py             run_attack / run_experiment (scenario-level convenience API)
+  harness.py            Instance→Victim plumbing: make_target_fn (the one place the IPI
+                        prompt shape is defined) · attack_context · resolve_optimization_target
+  runner.py             run_attack / run_experiment — target_fn-level API, NOT the
+                        benchmark path (that is AttackEvaluator over an AttackDataset)
   target.py             TargetLLM (Victim wrapping UnifiedLLM) + make_target
   config.py             shared hyperparameter defaults
   mutation/             MutationBase ops — generation.py (LLM-driven: GPTFuzzer 5,
@@ -85,13 +86,16 @@ attacks (GCG, AutoDAN, BEAST) additionally need `hf_model` + `tokenizer` exposed
 **An attack is a `BaseAttacker`.** The single method that matters:
 
 ```python
-def run_scenario(self, target: Victim, scenario: IPIScenario, verbose=False) -> ScenarioResult
+def run_scenario(self, target: Victim, instance: Instance, verbose=False) -> ScenarioResult
 ```
 
 Every attack module also exports a bare `run_*()` function (the algorithm, no class ceremony)
 plus a `*Result` dataclass. `run_scenario` is a thin adapter over it via
-`make_scenario_target_fn(scenario, target)`. Follow this shape for new attacks — the notebooks
-use both entry points.
+`harness.make_target_fn(instance, target)`. Follow this shape for new attacks — the notebooks
+use both entry points. `instance.query` is the attacker's goal; everything IPI-specific
+(`user_task`, `tool_schema`, `pipeline_context`, `target_str`, `optimization_target`) is in
+`instance.attack_attrs` and is read through `harness` / `metrics.resolve_attack_target`, never
+by hand — `attack_attrs.get` returns `None` on a typo where an attribute would have raised.
 
 **Attack taxonomy** (drives which attacks can run against which target):
 
@@ -227,6 +231,14 @@ use both entry points.
   `scripts/check_defensivetoken_fidelity.py` asserts byte-equality against the vendored upstream.
   Notebook: `experiments/defensivetoken_defense_notebook.ipynb`. Tokens are per-model and do not
   transfer; only the four models in `SUPPORTED_MODELS` have released weights.
+- **Seven attackers still default to `eval_mode="function_name"`, which no scenario uses.**
+  The benchmark is 180 `startswith` + 180 `contains`; `function_name` is the AgentDojo
+  convention. The four OPI static one-shots are unaffected in practice — one query, and
+  `AttackEvaluator` overwrites their verdict — but `beast`, `autodan` and `gcg` feed
+  `eval_mode` into their *early stopping* and best-candidate choice, so they run against a
+  criterion the dataset never satisfies. Switch them to `metrics.resolve_attack_target` when
+  migrating them (handoff §6a); it moves their query counts, so it is a measured change, not
+  a drive-by fix.
 - **PISanitizer is the closest published peer to our own defense** — attention-based, and
   prevention rather than detection. It is the only baseline that also defends an *API* victim,
   since only the sanitizer needs local weights. `PISanitizerDefense` subclasses `DefendedVictim`
@@ -244,13 +256,12 @@ use both entry points.
 
 ## Current work
 
-**An architecture refactor is in flight, and is not committed** — the whole thing is staged in
-the working tree of `main`. `ipi/` has been moved onto EasyJailbreak's component families
-(carrier object + `seed/ mutation/ selector/ constraint/ metrics/`). Phases A–G are shipped;
-Phase H (recipes composing the components) is 5 of 15 done with 3 torch-gated recipes left, and
-Phase I (cleanup) is untouched. Design doc: `docs/ipi-refactor-plan.md`. **Current state of the
-tree and what to do next: `docs/refactor-handoff.md` — read it before touching `ipi/`, and
-start at its §0.** Green check:
+The architecture refactor onto EasyJailbreak's component families (carrier object +
+`seed/ mutation/ selector/ constraint/ metrics/`) is **committed**. Phases A–G and I are
+shipped; **Phase H has 3 recipes left** — `autodan`, `beast` and `gcg`, all torch-gated, all
+needing a GPU machine to migrate safely. Design doc: `docs/ipi-refactor-plan.md`. **What is
+done, what is left and the traps: `docs/refactor-handoff.md` — read it before touching `ipi/`,
+and start at its §0.** Green check:
 `python3 scripts/smoke_check.py`, `python3 scripts/check_seed_fidelity.py` and
 `python3 scripts/check_metrics_fidelity.py`.
 

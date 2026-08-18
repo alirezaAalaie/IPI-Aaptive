@@ -7,5 +7,5 @@ via ``pip install git+...``, which drops non-``.py`` files otherwise).
 
 Contents:
   dual_verifiable_dataset.json — built by ``scripts/build_dual_verifiable_dataset.py``,
-                                 loaded by ``ipi.dataset.DualVerifiableDataset``.
+                                 loaded by ``ipi.datasets.DualVerifiableDataset``.
 """

@@ -11,7 +11,7 @@ plus our benchmark:
 
     DualVerifiableDataset / load_dual_verifiable
 
-This replaces the old ``ipi/dataset.py``, whose ``IPIScenario`` was an immutable input
+This replaced the old ``ipi/dataset.py``, whose ``IPIScenario`` was an immutable input
 record with no room for search state, and whose five other loaders (Manual, AgentDojo,
 Bipia, Hijack) were removed — DualVerifiable is the benchmark we run.
 """

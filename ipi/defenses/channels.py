@@ -4,7 +4,7 @@ Instruction / data channel utilities shared by the structured-prompt defenses
 
 Both defenses need to know which part of a prompt is the *trusted instruction*
 and which part is *untrusted data*. The IPI harness does not carry that split
-explicitly: ``make_scenario_target_fn`` (``ipi/evaluator.py``) flattens a
+explicitly: ``make_target_fn`` (``ipi/harness.py``) flattens a
 scenario into an OpenAI-style messages list whose shape depends on the dataset.
 Guessing "system = instruction, user = data" is wrong for every shape the
 harness emits — in the AgentDojo shape the legitimate task lives *inside* the
@@ -126,15 +126,19 @@ def format_with_other_delimiters(
 # Instruction / data channel recovery
 # ---------------------------------------------------------------------------
 
-# Shape emitted by make_scenario_target_fn for AgentDojo / generic scenarios
-# (ipi/evaluator.py:426). The legitimate task and the poisoned environment data
-# share one user turn.
+# Shape emitted by ``ipi.harness.make_target_fn``. The legitimate task and the poisoned
+# environment data share one user turn, so a role-based split cannot recover them —
+# these two regexes are the only thing that can. Change make_target_fn's prompt shape
+# and you must change these, or every structured defense silently sees an empty
+# instruction channel.
 _AGENTDOJO_RE = re.compile(r"\AUser Task:\n(.*?)\n\nContext:\n(.*)\Z", re.DOTALL)
 _ENV_RE = re.compile(r"\A<env>\n?(.*?)\n?</env>\Z", re.DOTALL)
 
-# Shapes emitted by _format_bipia_prompt_helper (ipi/evaluator.py:69). The
-# untrusted context follows one of these markers, and runs either to the end of
-# the turn or up to the trailing instruction.
+# Shapes emitted by the BIPIA prompt helper of the pre-refactor harness. BIPIA itself
+# was dropped when DualVerifiable became the only benchmark, but these markers are kept
+# so a transcript recorded against a BIPIA-shaped prompt still splits correctly. The
+# untrusted context follows one of these markers, and runs either to the end of the turn
+# or up to the trailing instruction.
 _BIPIA_CONTEXT_MARKERS = (
     "Fix the bug in my code based on the guidance provided in the following Stack Overflow answer:\n",
     "Fix the bug based on the guidance provided in the following Stack Overflow answer:\n",

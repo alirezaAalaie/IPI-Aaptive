@@ -17,9 +17,10 @@ python3 -m compileall -q ipi              # torch-gated modules only parse-check
 
 All three pass right now. Run them before and after anything.
 
-**Nothing is committed.** The entire refactor is staged in the working tree of `main`
-(`git status` shows ~63 paths). Commit it as one or more commits before doing new work — a
-`git stash` or a bad merge loses everything.
+**The refactor is committed.** Phases A–G landed as
+`refactor(ipi): restructure onto EasyJailbreak component families`, the docs as the commit after
+it, and Phase I as `refactor(ipi): make Instance the seam (Phase I)`. Only Phase H's last three
+recipes remain.
 
 Read order for a cold start: this file → `docs/ipi-refactor-plan.md` (§"What upstream actually
 does" is the rationale) → `CLAUDE.md` "Known gotchas" → the module docstring of whichever
@@ -36,9 +37,10 @@ verified — see §7 and trap 17.
 `ipi/` is being restructured onto EasyJailbreak's component architecture: a carrier object
 (`Instance`/`AttackDataset`) that every component family speaks, plus `seed/ mutation/ selector/
 constraint/ metrics/` packages, so attack recipes become pure wiring instead of self-contained
-scripts. **Phases A–G are shipped — every component family exists and is verified.** Phase H
-(making the recipes compose them) is 5 of 15 done, 4 more confirmed to need nothing, 3 left.
-Phase I (cleanup) is untouched.
+scripts. **Phases A–G and I are shipped.** `Instance` is now the seam end to end: every
+`run_scenario` takes one, the legacy `IPIScenario`/`ipi/dataset.py`/`ipi/evaluator.py` are gone,
+and the prompt-building plumbing lives in `ipi/harness.py`. Phase H (making the recipes *compose*
+the components) is 5 of 15 done, 4 more confirmed to need nothing, **3 left** — all torch-gated.
 
 ---
 
@@ -53,8 +55,8 @@ Phase I (cleanup) is untouched.
 | E | `mutation/` — 31 operators, generation + rule | ✅ green |
 | F | `selector/` — 7 policies including real MCTS | ✅ green |
 | G | `constraint/` — `DeleteOffTopic` · `DeleteHarmLess` · `PerplexityConstraint` | ✅ green |
-| H | migrate the recipes | 🟡 5 done · 4 no-op · **3 left** |
-| I | cleanup: delete `dataset.py` / `evaluator.py`, rewrite `__init__.py`, notebooks | ⬜ not started |
+| H | migrate the recipes onto the components | 🟡 5 done · 4 no-op · **3 left** (torch-gated) |
+| I | the seam: `Instance` into `run_scenario`, delete the legacy modules, notebooks | ✅ green |
 
 ---
 
@@ -86,14 +88,15 @@ ipi/
   attacks/      the 15 recipes                                           [H]
   data/         dual_verifiable_dataset.json (packaged)                  [A]
 
-  dataset.py    LEGACY IPIScenario (291 lines) — dies in Phase I
-  evaluator.py  harness helpers only (151 lines) — dies in Phase I
+  harness.py    make_target_fn · attack_context · resolve_optimization_target   [I]
+
   victim.py target.py llm_unified.py config.py runner.py attacker.py defenses/   untouched
 ```
 
 **Deleted:** `ipi/evaluators/`, `ipi/targets/`, `ipi/prompts.py`, `ipi/judges.py`,
 `ipi/scoring.py`, `ipi/attacks/seeds.py`, `ipi/attacks/seed_templates.json`,
-`ipi/attacks/mutations.py`.
+`ipi/attacks/mutations.py`, and in Phase I `ipi/dataset.py` (291 lines) and
+`ipi/evaluator.py` (151 lines).
 
 **Renames, clean break, no shims:**
 
@@ -109,6 +112,13 @@ ipi/
 | `attacks.seeds.SeedTemplate` | `seed.SeedTemplate` |
 | `attacks.seeds.advbench_pairs()` | `seed.ica_demos(variant=...)` |
 | `attacks.mutations.*` | `mutation.*` (model now bound at construction) |
+| `dataset.IPIScenario` | `datasets.Instance` (a carrier, not an immutable record) |
+| `dataset.IPIDataset` | `datasets.AttackDataset` |
+| `evaluator.make_scenario_target_fn` | `harness.make_target_fn` (takes an `Instance`) |
+| `IPIScenario.to_attack_context()` | `harness.attack_context(instance)` |
+| `scenario.optimization_target or …` | `harness.resolve_optimization_target(instance)` |
+| `evaluator.get_target_token` | `attacks.adaptive.get_target_token` (its only caller) |
+| `evaluator.ipi_early_stopping_condition` | `attacks.adaptive.ipi_early_stopping_condition` |
 
 The `judge=` **parameter** name is unchanged on every recipe — renaming it would break notebook
 kwargs for no gain.
@@ -237,14 +247,42 @@ rather than edited blind. Do them on a machine with torch and a GPU. Concretely:
    `selector.ReferenceLossSelector`.
 4. **Re-check trap 5 for these three** before deleting any `judge=` parameter — it turned out to
    be only half true for `adaptive` (see the trap).
+5. **Switch their `eval_mode` default from `"function_name"` to auto** via
+   `metrics.resolve_attack_target(instance)`, as the five EasyJailbreak ports already do. No
+   scenario in the benchmark is scored with `function_name`, so today these three early-stop and
+   pick their best candidate against a criterion that never fires (trap 19). This changes their
+   query counts, so measure it rather than folding it in silently.
 
-### 6b. Phase I
+### 6b. Phase I — done
 
-Delete `ipi/dataset.py` (291 lines) and `ipi/evaluator.py` (151 lines); make `run_scenario` take
-an `Instance` instead of an `IPIScenario`; move `get_target_token` /
-`ipi_early_stopping_condition` into `attacks/adaptive.py` where they belong; rewrite
-`ipi/__init__.py`'s public surface; update `experiments/*.ipynb`; refresh the "IPI adaptations vs
-original" docstring sections and `docs/easyjailbreak-audit.md`.
+`Instance` is the seam end to end. What changed:
+
+- **`run_scenario(target, instance, verbose)`** on all 12 recipe classes and on the
+  `BaseAttacker` ABC. The bodies are unchanged apart from the field reads.
+- **`ipi/harness.py`** is the new home of the plumbing `evaluator.py` used to hold — the half an
+  attack needs to *run*, symmetric with `metrics/`, which is the half it needs to be *judged*.
+  Three functions: `make_target_fn` (the one place the IPI prompt shape is defined),
+  `attack_context` (replaces `IPIScenario.to_attack_context`) and `resolve_optimization_target`
+  (the `optimization_target → target_str → query` precedence that RS/Beam-RS/GCG each inlined).
+- **One target resolution.** `metrics.resolve_attack_target` now takes an `Instance`, and
+  `EvaluatorIPISuccess.resolve` delegates to it instead of reimplementing the precedence. An
+  attack's early-stop signal and the reported ASR can no longer disagree about which string they
+  are looking for. Pinned by four precedence cases in `check_metrics_fidelity.py`.
+- **`get_target_token` / `ipi_early_stopping_condition`** moved into `attacks/adaptive.py`, their
+  only caller.
+- **`ipi/dataset.py` and `ipi/evaluator.py` deleted**; `ipi/__init__.py`'s surface rewritten
+  (117 exports, no legacy names).
+- **Notebooks updated.** The four defense notebooks needed import renames. `ipi_attack_benchmark`
+  needed more: its dataset cell still offered BIPIA / Hijack / AgentDojo / manual loaders removed
+  back in Phase A, and its judge cell still imported `ipi.judges`. Header, dataset cell and judge
+  cell rewritten; GPTFuzzer's cell text corrected to MCTS + binary reward (§7).
+- **Verified:** 22 smoke checks (up from 21 — `make_target_fn`'s prompt shape is now covered, and
+  the dual-verifiable loader is checked against the JSON on disk rather than against the deleted
+  legacy loader), plus a check that `ipi.dataset` / `ipi.evaluator` are *not* importable, so a
+  stale Kaggle install shadowing `ipi/` fails loudly instead of serving the old type.
+
+**Behaviour is unchanged.** The `pipeline_context` the new loader injects is byte-identical to the
+`clean_context` the old one did, for all 360 records — checked, not assumed.
 
 ---
 
@@ -271,6 +309,11 @@ that compares against a pre-refactor run.
    evaluator only gates early stopping, so it changes query counts, not verdicts.
 
 **ICA's default demonstrations changed** (§9) — that moves ICA's ASR by construction.
+
+**Phase I adds nothing to this list.** It moved the seam, not the arithmetic: the prompt the
+victim sees is byte-identical (the new loader's `pipeline_context` equals the old one's
+`clean_context` on all 360 records — checked), and `resolve_attack_target` resolves to the same
+`(target_str, eval_mode)` the `AttackEvaluator` used to compute inline.
 
 ---
 
@@ -341,10 +384,11 @@ with `prompt_num=5` is the paper-reproduction row.
    `*GetScore` with `SelectBasedOnScores`, as upstream's TAP does.
 7. **`AttackDataset` cannot subclass `torch.utils.data.Dataset`** (upstream does) and cannot
    import HF `datasets` — `import ipi` must work without torch. Same reason recipes lazily import.
-8. **`ipi/dataset.py` cannot be deleted before Phase I.** `evaluator.py`, `attacker.py`,
-   `runner.py` and all 15 recipes still take `IPIScenario`. It is marked legacy;
-   `ipi.DualVerifiableDataset` is the carrier version and `ipi.LegacyDualVerifiableDataset` the
-   old one, so they never collide.
+8. **~~`ipi/dataset.py` cannot be deleted before Phase I`~~ — done, and the ordering held.**
+   The delete only worked because `run_scenario` moved to `Instance` first; `runner.py` turned
+   out never to have touched `IPIScenario` at all (it speaks dicts and a bare `target_fn`), so it
+   needed no migration. If you delete a type this widely held again, migrate every `run_scenario`
+   in one pass — a half-migrated tree still imports, and the failure mode is a wrong ASR.
 9. **`_split_bipia` in `defenses/channels.py` was kept on purpose.** It parses a *messages list*,
    not a dataset, and CLAUDE.md flags channel recovery as load-bearing and fragile.
 10. **`variant` was already taken on `AutoDANAttacker`** — it means `"ga"`/`"hga"` there. The seed
@@ -380,6 +424,22 @@ with `prompt_num=5` is the paper-reproduction row.
     its own JSON format, the filter cannot parse `[[YES]]`/`[[NO]]`, and an unparseable answer
     keeps the candidate. `run_tap(on_topic_model=...)` now accepts a `UnifiedLLM` as well as a
     model string so a real judge can be passed.
+19. **Seven attackers default to `eval_mode="function_name"`, which no scenario in the benchmark
+    uses.** The dual-verifiable suite is 180 `startswith` + 180 `contains`; `function_name` is the
+    AgentDojo convention. The five EasyJailbreak ports auto-resolve, and the four OPI static
+    one-shots are unaffected in practice (one query, and `AttackEvaluator` overwrites their
+    verdict). **`beast`, `autodan` and `gcg` are not** — they feed `eval_mode` into their early
+    stopping and best-candidate choice, so they search against a criterion the benchmark never
+    satisfies. Left alone deliberately: fixing it changes their query counts, and they are the
+    three recipes that cannot be run here. Do it as part of §6a.
+20. **`ipi/attack_attrs` reads are `.get()`, not attribute access, and that is a hazard.**
+    `Instance.__getattr__` raises on an unknown name, but `attack_attrs.get("user_taks")` returns
+    `None` and the prompt comes out with an empty user task — a silently weaker attack, not a
+    traceback. This is why `harness.py` and `metrics.resolve_attack_target` exist rather than
+    each recipe reading the dict: the key names are typed once. Don't inline them back.
+21. **`scripts/smoke_check.py` runs each check at import**, inside the `@check` decorator. A
+    helper used by a check must be *defined above it in the file*, not merely somewhere in it —
+    the ordinary "helpers at the bottom" habit gives a `NameError` at collection time.
 
 ---
 

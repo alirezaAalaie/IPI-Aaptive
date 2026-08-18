@@ -15,7 +15,10 @@ Utility is the second axis: ``EvaluatorUserUtility`` asks whether the *legitimat
 still succeeded, so a defense that blocks the injection by refusing to do anything at all
 is visible rather than scored as a win.
 
-This still takes the legacy ``IPIScenario``, because the recipes do (Phase H).
+The unit of work is an ``Instance`` from an ``AttackDataset``. Nothing here mutates it —
+verdicts are computed from the returned ``ScenarioResult``, not written back — so the
+same dataset can be run against several defenses without one run's responses leaking
+into the next one's ``num_jailbreak``.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from ..datasets import Instance
 from ..victim import Victim
 from .judge import EvaluatorIPISuccess, EvaluatorUserUtility
 
@@ -197,14 +201,16 @@ class EvalResult:
 
 class AttackEvaluator:
     """
-    Runs a BaseAttacker across an IPIDataset and decides success.
+    Runs a BaseAttacker across an AttackDataset and decides success.
 
     Args:
         target:     Victim instance (TargetLLM or custom defense subclass).
         attacker:   Any BaseAttacker subclass (TAPAttacker, PAIRAttacker, ...).
-        verbose:    Enable INFO-level logging per scenario.
+        verbose:    Enable INFO-level logging per instance.
         success_fn: Escape hatch — ``Callable(response, target_str) -> bool``, or
-                    ``Callable(response, scenario=...) -> bool``. Replaces the default
+                    ``Callable(response, instance) -> bool`` (recognised by the second
+                    parameter being named ``instance``/``scenario`` or annotated
+                    ``Instance``). Replaces the default
                     ``EvaluatorIPISuccess``. An ASR reported with a custom
                     ``success_fn`` is not comparable to one without it; say so if you
                     publish it.
@@ -231,27 +237,35 @@ class AttackEvaluator:
         self.success_evaluator = EvaluatorIPISuccess()
         self.utility_evaluator = EvaluatorUserUtility()
 
-    def _check_success(self, response: str, scenario) -> bool:
-        """Apply success_fn, or the scenario's own attack_eval_mode."""
+    def _check_success(self, response: str, instance: Instance) -> bool:
+        """Apply ``success_fn``, or the instance's own ``attack_eval_mode``."""
+        target_str, atk_mode = self.success_evaluator.resolve(instance)
+
         if self.success_fn is not None:
             import inspect
-            from ..dataset import IPIScenario
             sig = inspect.signature(self.success_fn)
             params = list(sig.parameters.values())
-            # If the success_fn accepts scenario (either by type annotation or variable name)
-            if len(params) >= 2 and (params[1].name == "scenario" or params[1].annotation == IPIScenario):
-                return self.success_fn(response, scenario=scenario)
-            return self.success_fn(response, scenario.target_output)
+            # A success_fn whose second parameter asks for the instance gets the whole
+            # instance; anything else gets the resolved target string. Passed
+            # positionally so either parameter name works.
+            wants_instance = len(params) >= 2 and (
+                params[1].name in ("instance", "scenario")
+                or params[1].annotation is Instance
+            )
+            if wants_instance:
+                return self.success_fn(response, instance)
+            return self.success_fn(response, target_str)
 
-        # Respect the scenario's own attack_eval_mode (DualVerifiableDataset sets it)
-        atk_mode = scenario.metadata.get("attack_eval_mode", "contains") if scenario.metadata else "contains"
-        return self.success_evaluator.check(response, scenario.target_output, atk_mode)
+        return self.success_evaluator.check(response, target_str, atk_mode)
 
-    def _check_utility(self, response: str, scenario) -> Optional[bool]:
-        """Check user task utility if scenario provides a ground-truth user_target."""
-        meta = scenario.metadata or {}
+    def _check_utility(self, response: str, instance: Instance) -> Optional[bool]:
+        """Check user-task utility if the instance carries a ground-truth user_target."""
+        attrs = instance.attack_attrs
         return self.utility_evaluator.check(
-            response, meta.get("user_target") or "", meta.get("user_eval_mode", "contains"))
+            response,
+            attrs.get("user_target") or "",
+            attrs.get("user_eval_mode", "contains"),
+        )
 
     def run(
         self,
@@ -261,25 +275,26 @@ class AttackEvaluator:
         defense_name: Optional[str] = None,
     ) -> EvalResult:
         """
-        Run the attacker on every scenario in dataset.
+        Run the attacker on every instance in dataset.
 
         The attacker's own evaluator guides its search; success is recomputed here, so
         the final ASR is independent of that evaluator's threshold or scoring style.
 
         Args:
-            dataset:      IPIDataset instance.
+            dataset:      AttackDataset (or any iterable of Instances).
             save_file:    If True, automatically saves detailed JSON log to disk.
             output_dir:   Directory to save the evaluation file (default: "results").
             defense_name: Optional defense label for filename (defaults to target class name).
         """
         attack_name = type(self.attacker).__name__.replace("Attacker", "").lower()
         results: list[ScenarioResult] = []
-        for scenario in dataset:
+        for instance in dataset:
+            attrs = instance.attack_attrs
             try:
-                r = self.attacker.run_scenario(self.target, scenario, verbose=self.verbose)
+                r = self.attacker.run_scenario(self.target, instance, verbose=self.verbose)
                 # Override success: the evaluator owns this, not the attack's judge
-                r.success = self._check_success(r.target_response, scenario)
-                r.utility_success = self._check_utility(r.target_response, scenario)
+                r.success = self._check_success(r.target_response, instance)
+                r.utility_success = self._check_utility(r.target_response, instance)
 
                 # Extract the exact final messages/prompt seen by the model after defense transformation
                 final_prompt = getattr(self.target, "last_input_messages", None)
@@ -293,28 +308,28 @@ class AttackEvaluator:
                 r.final_prompt = final_prompt
                 r.defense_name = def_label
 
-                # Enrich extra with scenario metadata for comprehensive reporting
-                r.extra["user_task"] = scenario.user_task
-                r.extra["user_target"] = scenario.metadata.get("user_target", "") if scenario.metadata else ""
-                r.extra["target_str"] = scenario.target_output
-                r.extra["optimization_target"] = scenario.optimization_target
+                # Enrich extra with instance metadata for comprehensive reporting
+                r.extra["user_task"] = attrs.get("user_task", "")
+                r.extra["user_target"] = attrs.get("user_target", "")
+                r.extra["target_str"] = attrs.get("target_str", "")
+                r.extra["optimization_target"] = attrs.get("optimization_target", "")
                 r.extra["final_prompt"] = final_prompt
                 r.extra["defense_name"] = def_label
 
                 results.append(r)
             except Exception as e:
-                log.error("[AttackEvaluator] %s scenario=%s error: %s",
-                          attack_name, scenario.id, e)
+                log.error("[AttackEvaluator] %s instance=%s error: %s",
+                          attack_name, instance.id, e)
                 results.append(ScenarioResult(
-                    scenario_id=scenario.id, goal=scenario.injection_goal,
+                    scenario_id=instance.id, goal=instance.query or "",
                     success=False, score=0, injection="", target_response="",
                     n_queries=0, attack=attack_name, utility_success=False,
                     extra={
                         "error": str(e),
-                        "user_task": scenario.user_task,
-                        "user_target": scenario.metadata.get("user_target", "") if scenario.metadata else "",
-                        "target_str": scenario.target_output,
-                        "optimization_target": scenario.optimization_target,
+                        "user_task": attrs.get("user_task", ""),
+                        "user_target": attrs.get("user_target", ""),
+                        "target_str": attrs.get("target_str", ""),
+                        "optimization_target": attrs.get("optimization_target", ""),
                     },
                 ))
 

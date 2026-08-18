@@ -348,24 +348,24 @@ class PAIRAttacker(JudgeGuidedAttacker):
         self.n_iterations = n_iterations
         self.prompt_mode  = prompt_mode
 
-    def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import make_scenario_target_fn
+    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+        from ..harness import attack_context, make_target_fn
         from ..metrics import ScenarioResult
-        target_fn = make_scenario_target_fn(scenario, target)
+        target_fn = make_target_fn(instance, target)
         r = run_pair(
-            goal=scenario.injection_goal,
+            goal=instance.query,
             target_fn=target_fn,
             attacker_model=self.attacker_llm,
             judge=self.judge,
             n_streams=self.n_streams,
             n_iterations=self.n_iterations,
             prompt_mode=self.prompt_mode,
-            context=scenario.to_attack_context(),
+            context=attack_context(instance),
             verbose=verbose,
         )
         return ScenarioResult(
-            scenario_id=scenario.id,
-            goal=scenario.injection_goal,
+            scenario_id=instance.id,
+            goal=instance.query,
             success=r.success,
             score=r.score,
             injection=r.injection,

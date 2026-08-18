@@ -24,7 +24,7 @@ IPI adaptation vs original
 --------------------------
   {query}:   the attacker's embedded instruction / injection goal (not a harmful request).
   delivery:  the filled template is injected through the data channel via
-             ``make_scenario_target_fn`` (untrusted document), not sent as a user turn.
+             ``harness.make_target_fn`` (untrusted document), not sent as a user turn.
   success:   resolved from the scenario (``resolve_attack_target``) to match the dataset's
              own ``attack_eval_mode``.
 """
@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from ..attacker import StaticAttacker
+from ..datasets import Instance
 from ..metrics import Evaluator, check_ipi_success
 from ..victim import Victim
 from ..seed import SeedTemplate, render
@@ -182,14 +183,14 @@ class DeepInceptionAttacker(StaticAttacker):
     def requires_local_target(cls) -> bool:
         return False
 
-    def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import make_scenario_target_fn
+    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+        from ..harness import make_target_fn
         from ..metrics import ScenarioResult, resolve_attack_target
-        target_fn = make_scenario_target_fn(scenario, target)
-        target_str, eval_mode = resolve_attack_target(scenario, self.eval_mode)
+        target_fn = make_target_fn(instance, target)
+        target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
 
         r = run_deepinception(
-            goal=scenario.injection_goal,
+            goal=instance.query,
             target_fn=target_fn,
             judge=self.judge,
             scene=self.scene,
@@ -201,11 +202,11 @@ class DeepInceptionAttacker(StaticAttacker):
 
         if verbose:
             log.info("[deepinception] scenario=%s success=%s score=%d",
-                     scenario.id, r.success, r.score)
+                     instance.id, r.success, r.score)
 
         return ScenarioResult(
-            scenario_id=scenario.id,
-            goal=scenario.injection_goal,
+            scenario_id=instance.id,
+            goal=instance.query,
             success=r.success,
             score=r.score,
             injection=r.injection,

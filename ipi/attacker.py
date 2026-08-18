@@ -4,7 +4,7 @@ BaseAttacker — abstract base class for all IPI attack implementations.
 Every attack (TAP, PAIR, RS, Beam-RS, BEAST) subclasses BaseAttacker and:
   1. Takes its guidance evaluator as a constructor argument (owns it).
   2. Sets all attack hyperparameters at construction time.
-  3. Implements run_scenario(target, scenario, verbose) → ScenarioResult.
+  3. Implements run_scenario(target, instance, verbose) → ScenarioResult.
 
 Usage
 -----
@@ -33,21 +33,18 @@ Hierarchy
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
-from .dataset import IPIScenario
-from .metrics import Evaluator
-
-if TYPE_CHECKING:
-    from .metrics import ScenarioResult
-    from .victim import Victim
+from .datasets import Instance
+from .metrics import Evaluator, ScenarioResult
+from .victim import Victim
 
 
 class BaseAttacker(ABC):
     """
     Abstract base class for all IPI attackers.
 
-    Subclasses implement ``run_scenario(target, scenario, verbose) -> ScenarioResult``.
+    Subclasses implement ``run_scenario(target, instance, verbose) -> ScenarioResult``.
     """
 
     def __init__(self, judge: Optional[Evaluator] = None):
@@ -70,20 +67,28 @@ class BaseAttacker(ABC):
     @abstractmethod
     def run_scenario(
         self,
-        target: "Victim",
-        scenario: IPIScenario,
+        target: Victim,
+        instance: Instance,
         verbose: bool = False,
-    ) -> "ScenarioResult":
+    ) -> ScenarioResult:
         """
-        Run the attack on a single IPI scenario.
+        Run the attack against a single benchmark instance.
 
         Args:
             target:   Victim instance (TargetLLM or custom defense subclass).
-            scenario: The IPI scenario with goal, user_task, tool_schema, etc.
+            instance: The ``Instance`` to attack. ``instance.query`` is the attacker's
+                      goal; the IPI-specific context (user_task, tool_schema,
+                      pipeline_context, target_str) is in ``instance.attack_attrs`` and
+                      should be read through ``ipi.harness`` / ``metrics``
+                      ``resolve_attack_target`` rather than by hand.
             verbose:  Enable INFO-level logging.
 
         Returns:
             ScenarioResult with success flag, score, injection string, and metadata.
+
+        Note:
+            The ``success`` field returned here is the attack's *own* verdict, used for
+            its early stopping. ``AttackEvaluator`` overwrites it — never report it.
         """
 
     def __repr__(self) -> str:

@@ -23,7 +23,7 @@ IPI adaptation vs original
   to a raw chat model — a *direct* prompt-injection setting. For **indirect** prompt
   injection the payload must travel through the data channel, so the whole transcript
   (demos + goal) is emitted as one injected-document string and delivered by
-  ``make_scenario_target_fn`` as untrusted content.
+  ``harness.make_target_fn`` as untrusted content.
 
   Demonstrations: ``variant="ipi"`` (default) uses ``demo.ICA.ipi`` — 10 authored pairs in
   which the assistant *actually carries out* an injected instruction (print a canary,
@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from ..attacker import StaticAttacker
+from ..datasets import Instance
 from ..metrics import Evaluator, check_ipi_success
 from ..victim import Victim
 from ..seed import ica_demos
@@ -205,14 +206,14 @@ class ICAAttacker(StaticAttacker):
     def requires_local_target(cls) -> bool:
         return False
 
-    def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import make_scenario_target_fn
+    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+        from ..harness import make_target_fn
         from ..metrics import ScenarioResult, resolve_attack_target
-        target_fn = make_scenario_target_fn(scenario, target)
-        target_str, eval_mode = resolve_attack_target(scenario, self.eval_mode)
+        target_fn = make_target_fn(instance, target)
+        target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
 
         r = run_ica(
-            goal=scenario.injection_goal,
+            goal=instance.query,
             target_fn=target_fn,
             judge=self.judge,
             prompt_num=self.prompt_num,
@@ -224,11 +225,11 @@ class ICAAttacker(StaticAttacker):
 
         if verbose:
             log.info("[ica] scenario=%s success=%s score=%d",
-                     scenario.id, r.success, r.score)
+                     instance.id, r.success, r.score)
 
         return ScenarioResult(
-            scenario_id=scenario.id,
-            goal=scenario.injection_goal,
+            scenario_id=instance.id,
+            goal=instance.query,
             success=r.success,
             score=r.score,
             injection=r.injection,

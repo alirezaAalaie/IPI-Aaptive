@@ -22,7 +22,7 @@ search itself, but a translator is needed.
 IPI adaptation vs original
 --------------------------
   delivery: the translated instruction is injected through the data channel via
-            ``make_scenario_target_fn`` (untrusted document), not sent as a user turn.
+            ``harness.make_target_fn`` (untrusted document), not sent as a user turn.
   success:  ``check_ipi_success`` is run on the response **in whatever language it comes
             back**. Because the success check looks for the target tool-call / action
             string (e.g. ``send_email(...)``), which is code-like and language-agnostic,
@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 from ..attacker import StaticAttacker
+from ..datasets import Instance
 from ..metrics import Evaluator, check_ipi_success
 from ..llm_unified import APILLM, UnifiedLLM
 from ..victim import Victim
@@ -273,14 +274,14 @@ class MultilingualAttacker(StaticAttacker):
     def requires_local_target(cls) -> bool:
         return False
 
-    def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import make_scenario_target_fn
+    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+        from ..harness import make_target_fn
         from ..metrics import ScenarioResult, resolve_attack_target
-        target_fn = make_scenario_target_fn(scenario, target)
-        target_str, eval_mode = resolve_attack_target(scenario, self.eval_mode)
+        target_fn = make_target_fn(instance, target)
+        target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
 
         r = run_multilingual(
-            goal=scenario.injection_goal,
+            goal=instance.query,
             target_fn=target_fn,
             judge=self.judge,
             languages=self.languages,
@@ -293,11 +294,11 @@ class MultilingualAttacker(StaticAttacker):
 
         if verbose:
             log.info("[multilingual] scenario=%s success=%s best_lang=%s n_queries=%d",
-                     scenario.id, r.success, r.best_language, r.n_queries)
+                     instance.id, r.success, r.best_language, r.n_queries)
 
         return ScenarioResult(
-            scenario_id=scenario.id,
-            goal=scenario.injection_goal,
+            scenario_id=instance.id,
+            goal=instance.query,
             success=r.success,
             score=r.score,
             injection=r.injection,

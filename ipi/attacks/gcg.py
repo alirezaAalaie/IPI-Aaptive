@@ -72,6 +72,7 @@ import torch
 import torch.nn.functional as F
 
 from ..attacker import AdaptiveAttacker
+from ..datasets import Instance
 from ..metrics import Evaluator, check_ipi_success
 from ..victim import Victim
 
@@ -665,19 +666,15 @@ class GCGAttacker(AdaptiveAttacker):
     def requires_local_target(cls) -> bool:
         return True
 
-    def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import make_scenario_target_fn
+    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+        from ..harness import make_target_fn, resolve_optimization_target
         from ..metrics import ScenarioResult
-        target_fn = make_scenario_target_fn(scenario, target)
+        target_fn = make_target_fn(instance, target)
         r = run_gcg(
             adv_prefix=self.adv_prefix,
             # optimization_target: tokenized as the full CE-loss target sequence.
             # Must be a real string — never a sentinel like __base64__.
-            target_str=(
-                scenario.optimization_target
-                or scenario.target_output
-                or scenario.injection_goal
-            ),
+            target_str=resolve_optimization_target(instance),
             target_llm=target,
             eval_target_fn=target_fn,
             eval_mode=self.eval_mode,
@@ -693,8 +690,8 @@ class GCGAttacker(AdaptiveAttacker):
             verbose=verbose,
         )
         return ScenarioResult(
-            scenario_id=scenario.id,
-            goal=scenario.injection_goal,
+            scenario_id=instance.id,
+            goal=instance.query,
             success=r.success,
             score=max(0, int(10 - r.best_loss)),   # rough 0-10 scale from loss
             injection=r.injection,

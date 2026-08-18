@@ -17,8 +17,8 @@ Example::
         APILLM("gpt-4o-mini", temperature=0.0),
         system_prompt_template=TargetLLM.AGENTDOJO_SYSTEM_PROMPT_TEMPLATE,
     )
-    # make_scenario_target_fn reads target.system_prompt_template and fills
-    # in {tool_schema} from each IPIScenario automatically.
+    # make_target_fn reads target.system_prompt_template and fills
+    # in {tool_schema} from each Instance automatically.
 
 Use TargetLLM to turn an APILLM or LocalLLM into a Victim that can be
 passed to AttackEvaluator. All Victim interface methods delegate to the
@@ -59,7 +59,7 @@ class TargetLLM(Victim):
         llm:                    Any UnifiedLLM instance (APILLM or LocalLLM).
         system_prompt_template: Optional template string with {tool_schema}
                                 and/or {user_task} placeholders. When set,
-                                make_scenario_target_fn fills it in per
+                                make_target_fn fills it in per
                                 scenario instead of using the static
                                 llm.system_prompt. Use AGENTDOJO_SYSTEM_PROMPT_TEMPLATE
                                 for the standard AgentDojo evaluation setup.
@@ -89,7 +89,7 @@ class TargetLLM(Victim):
 
     # Per-scenario template: tool schema listed in system prompt.
     # {user_task} is available but kept out of the system prompt intentionally —
-    # the user task is sent as the first user message in make_scenario_target_fn,
+    # the user task is sent as the first user message in make_target_fn,
     # which is the correct IPI pipeline structure (system sets agent role/tools,
     # user message carries the legitimate task, tool output carries the injection).
     AGENTDOJO_SYSTEM_PROMPT_TEMPLATE: str = (

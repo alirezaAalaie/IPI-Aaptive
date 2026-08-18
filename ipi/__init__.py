@@ -32,11 +32,13 @@ File layout
     autodan.py    — AutoDAN GA/HGA + AutoDANAttacker  (local-only)
     gcg.py        — GCG + GCGAttacker  (local-only)
     static_injection.py — Naive, Escape, Ignore, FakeCompletion, Combined (OPI, API-compatible)
+    deepinception.py · ica.py · multilingual.py · renellm.py · gptfuzzer.py
+                  — EasyJailbreak ports
   datasets/       — Instance (the carrier every component speaks) · AttackDataset
                     · DualVerifiableDataset
-  dataset.py      — LEGACY IPIScenario / IPIDataset; deleted once recipes migrate
-  evaluator.py    — harness helpers (make_scenario_target_fn, RS early stop)
-  runner.py       — run_attack / run_experiment (simple scenario-level API)
+  harness.py      — the Instance-to-Victim plumbing: make_target_fn · attack_context
+                    · resolve_optimization_target
+  runner.py       — run_attack / run_experiment (target_fn-level convenience API)
   target.py       — TargetLLM (Victim wrapping UnifiedLLM) + make_target factory
 
 Quick start
@@ -51,7 +53,7 @@ Quick start
     attacker = TAPAttacker(judge=judge, attacker_llm=APILLM("gpt-4o"), depth=10)
 
     evaluator = AttackEvaluator(target=target, attacker=attacker)
-    result    = evaluator.run(dataset)
+    result    = evaluator.run(DualVerifiableDataset())
     print(result.summary())
 
 Custom defense
@@ -140,14 +142,9 @@ from .attacks import (
     GPTFuzzerAttacker, GPTFuzzerResult, run_gptfuzzer,
 )
 
-# ---- Dataset ----
-# The carrier (Instance / AttackDataset) is the new seam; ipi.dataset's IPIScenario
-# is legacy and disappears once the recipes migrate. Both are exported during the
-# transition, under distinct names so nothing is ambiguous.
+# ---- Dataset (the carrier) ----
 from .datasets import Instance, AttackDataset
 from .datasets import DualVerifiableDataset, load_dual_verifiable
-from .dataset import IPIScenario, IPIDataset
-from .dataset import DualVerifiableDataset as LegacyDualVerifiableDataset
 
 # ---- Metrics (success + guidance) ----
 from .metrics import (
@@ -171,12 +168,8 @@ from .metrics import (
     AttackEvaluator,
 )
 
-# ---- Harness helpers ----
-from .evaluator import (
-    get_target_token,
-    ipi_early_stopping_condition,
-    make_scenario_target_fn,
-)
+# ---- Harness helpers (Instance -> Victim plumbing) ----
+from .harness import make_target_fn, attack_context, resolve_optimization_target
 
 # ---- Defenses ----
 from .defenses import (
@@ -247,10 +240,8 @@ __all__ = [
     "run_static_injection", "StaticInjectionResult", "create_static_attacker",
     "build_naive_injection", "build_escape_injection", "build_ignore_injection",
     "build_fake_completion_injection", "build_combined_injection",
-    # Dataset — carrier
+    # Dataset — the carrier
     "Instance", "AttackDataset", "DualVerifiableDataset", "load_dual_verifiable",
-    # Dataset — legacy (removed once recipes migrate)
-    "IPIScenario", "IPIDataset", "LegacyDualVerifiableDataset",
     # Metrics — primitives
     "Evaluator",
     "check_function_name", "check_exact_function_call", "check_ipi_success",
@@ -263,7 +254,7 @@ __all__ = [
     # Metrics — runner
     "ScenarioResult", "EvalResult", "AttackEvaluator",
     # Harness helpers
-    "get_target_token", "ipi_early_stopping_condition", "make_scenario_target_fn",
+    "make_target_fn", "attack_context", "resolve_optimization_target",
     # Simple API
     "run_attack", "run_experiment", "ExperimentResult",
 ]

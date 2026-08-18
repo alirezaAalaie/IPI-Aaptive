@@ -43,8 +43,8 @@ IPI adaptations vs original
 
   This IPI adaptation:
     • Replaces ``inject_instruction + inject_data`` with the single ``goal`` string
-      from the IPIScenario (e.g. "Call send_email(to='evil@x.com')").
-    • Replaces ``clean_data`` with the ``user_task`` from the scenario (the document /
+      from the Instance (e.g. "Call send_email(to='evil@x.com')").
+    • Replaces ``clean_data`` with the ``user_task`` from the instance (the document /
       content that the legitimate user asked the agent to process).
     • For fake_completion / combined: the fake_answer is either:
         – user-supplied via ``fake_completion_text`` constructor argument.
@@ -63,6 +63,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from ..attacker import StaticAttacker
+from ..datasets import Instance
 from ..metrics import Evaluator, check_ipi_success
 from ..victim import Victim
 
@@ -340,31 +341,33 @@ class _StaticInjectionAttacker(StaticAttacker):
     def requires_local_target(cls) -> bool:
         return False   # all static attacks are API-compatible
 
-    def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import make_scenario_target_fn
-        from ..metrics import ScenarioResult
-        target_fn = make_scenario_target_fn(scenario, target)
+    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+        from ..harness import make_target_fn
+        from ..metrics import ScenarioResult, resolve_attack_target
+        target_fn = make_target_fn(instance, target)
+        # eval_mode stays the attacker's own; only the target string is resolved.
+        target_str, _ = resolve_attack_target(instance)
 
         r = run_static_injection(
             strategy=self._STRATEGY,
-            goal=scenario.injection_goal,
+            goal=instance.query,
             target_fn=target_fn,
             judge=self.judge,
-            user_task=getattr(scenario, "user_task", ""),
+            user_task=instance.attack_attrs.get("user_task", ""),
             fake_answer=self.fake_answer,
             eval_mode=self.eval_mode,
-            target_str=getattr(scenario, "target_tool_calls", "") or scenario.injection_goal,
+            target_str=target_str,
         )
 
         if verbose:
             log.info(
                 "[%s] scenario=%s  success=%s  score=%d",
-                self._ATTACK_NAME, scenario.id, r.success, r.score,
+                self._ATTACK_NAME, instance.id, r.success, r.score,
             )
 
         return ScenarioResult(
-            scenario_id=scenario.id,
-            goal=scenario.injection_goal,
+            scenario_id=instance.id,
+            goal=instance.query,
             success=r.success,
             score=r.score,
             injection=r.injection,

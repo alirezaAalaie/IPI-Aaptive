@@ -34,7 +34,7 @@ Fidelity
               ground truth (``EvaluatorIPISuccess``), which is stronger than a classifier:
               dual-verifiable scenarios know exactly what success looks like.
   delivery:   the rendered template is injected through the data channel via
-              ``make_scenario_target_fn`` (untrusted content), not a user turn.
+              ``harness.make_target_fn`` (untrusted content), not a user turn.
   success:    resolved from the scenario (``resolve_attack_target``) to match the dataset's
               own ``attack_eval_mode``.
 
@@ -279,14 +279,14 @@ class GPTFuzzerAttacker(AdaptiveAttacker):
     def requires_local_target(cls) -> bool:
         return False
 
-    def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import make_scenario_target_fn
+    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+        from ..harness import make_target_fn
         from ..metrics import ScenarioResult, resolve_attack_target
-        target_fn = make_scenario_target_fn(scenario, target)
-        target_str, eval_mode = resolve_attack_target(scenario, self.eval_mode)
+        target_fn = make_target_fn(instance, target)
+        target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
 
         r = run_gptfuzzer(
-            goal=scenario.injection_goal,
+            goal=instance.query,
             target_fn=target_fn,
             attacker_model=self.attacker_llm,
             judge=self.judge,
@@ -299,11 +299,11 @@ class GPTFuzzerAttacker(AdaptiveAttacker):
 
         if verbose:
             log.info("[gptfuzzer] scenario=%s success=%s score=%d n_queries=%d",
-                     scenario.id, r.success, r.score, r.n_queries)
+                     instance.id, r.success, r.score, r.n_queries)
 
         return ScenarioResult(
-            scenario_id=scenario.id,
-            goal=scenario.injection_goal,
+            scenario_id=instance.id,
+            goal=instance.query,
             success=r.success,
             score=r.score,
             injection=r.injection,

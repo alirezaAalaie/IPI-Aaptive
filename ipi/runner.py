@@ -1,8 +1,17 @@
 """
-High-level interface: run_attack and run_experiment.
+The target_fn-level convenience API: run_attack and run_experiment.
 
-run_attack   — single attack on one scenario.
-run_experiment — batch evaluation across a dataset of scenarios, with ASR reporting.
+run_attack     — one TAP/PAIR run against a ``target_fn`` you supply.
+run_experiment — the same across a list of hand-written scenario dicts, with ASR.
+
+**This is not the benchmark path.** It predates the carrier and speaks plain dicts and a
+bare ``target_fn``, which is what you want when the victim is your own pipeline rather
+than a ``Victim``. To run the dual-verifiable benchmark, use ``AttackEvaluator`` over an
+``AttackDataset`` instead — only that path recomputes ASR from ground truth and reports
+utility alongside it. The bridge that used to build these dicts from a dataset
+(``IPIScenario.to_experiment_scenario``) went away with the legacy dataset module;
+``ipi.harness.attack_context`` builds the per-scenario ``context`` dict from an
+``Instance`` if you want to feed one in by hand.
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed

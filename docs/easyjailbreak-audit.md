@@ -270,18 +270,35 @@ call (the live dataset is `DualVerifiableDataset`, whose goals are literal strin
   and ReNeLLM's six (`AlterSentenceStructure`, `ChangeStyle`, `Rephrase`,
   `InsertMeaninglessCharacters`, `MisspellSensitiveWords`, `Translation`). Each takes an explicit
   `llm(str)->str` callable instead of a bound `self.model`, so they compose with our `UnifiedLLM`.
-- **Evaluator:** *not* re-implemented. The repo already has the evaluator layer EasyJailbreak's
-  `Evaluator` would duplicate — `judges.py` (`Judge` ABC: `score` / `is_success`) plus
-  `evaluator.check_ipi_success`. The refactor instead makes every ported attack call the new
-  `evaluator.resolve_attack_target(scenario, override)` so its internal success signal matches the
-  dataset's own `attack_eval_mode` (see below), keeping one source of truth.
+
+  > **Superseded by the refactor.** The operators moved to **`ipi/mutation/`**, split
+  > `generation.py` (LLM-driven, model bound at construction as upstream does) /
+  > `rule.py` (deterministic), and grew to 31. `ipi/attacks/mutations.py` is deleted.
+- **Evaluator:** *not* re-implemented at the time of this audit. The repo already had the layer
+  EasyJailbreak's `Evaluator` would duplicate — `judges.py` (`Judge` ABC: `score` /
+  `is_success`) plus `evaluator.check_ipi_success`.
+
+  > **Superseded by the refactor.** It *was* re-implemented, because the old `Judge` conflated
+  > two things: guidance (an int 1-10 that steers a search) and success (a bool). Upstream's
+  > naming separates them and ours now follows it — **`ipi/metrics/`** holds `*GetScore`
+  > guidance beside `*Judge`/`*Match` success, over the `checks.py` primitives. `judges.py` is
+  > deleted and the name `Judge` no longer means guidance anywhere.
 
 ### Report of differences from the reference (per attack)
 
 Common to all five: payload is delivered through the **data channel** via
-`make_scenario_target_fn` (untrusted document content), not a user turn; and `eval_mode` now
-defaults to **auto** — resolved from the scenario's `attack_eval_mode` rather than hard-coded to
-`function_name` (which never matched `DualVerifiableDataset`'s `startswith`/`contains` goals).
+`harness.make_target_fn` (untrusted document content), not a user turn; and `eval_mode` now
+defaults to **auto** — resolved from the instance's `attack_eval_mode` by
+`metrics.resolve_attack_target` rather than hard-coded to `function_name` (which never matched
+`DualVerifiableDataset`'s `startswith`/`contains` goals; no scenario in the benchmark uses it).
+
+> **Note after Phase I.** The five ported attacks auto-resolve. The four OPI static one-shots
+> and the three white-box attacks (BEAST, AutoDAN, GCG) still default to
+> `eval_mode="function_name"`. For the one-shots that is cosmetic — `AttackEvaluator`
+> overwrites their verdict — but for the white-box three it gates early stopping and
+> best-candidate selection against a mode the benchmark never uses. Switching them to auto is
+> tracked in `docs/refactor-handoff.md` §6a as part of their migration, since it moves their
+> query counts.
 
 - **DeepInception** — template is loaded verbatim from `original/DeepInception`. Knobs applied by
   `str.replace` as upstream (`science fiction`→scene, `4`→characters, `5`→layers), **but** on the

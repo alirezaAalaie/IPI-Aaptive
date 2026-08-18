@@ -35,7 +35,7 @@ IPI adaptation vs original
               available as ``constraint.DeleteHarmLess`` for a paper-faithful row. An
               optional guidance evaluator still scores for the trace.
   delivery:   the nested prompt is injected through the data channel via
-              ``make_scenario_target_fn``.
+              ``harness.make_target_fn``.
 
 Composition
 -----------
@@ -241,14 +241,14 @@ class ReNeLLMAttacker(AdaptiveAttacker):
     def requires_local_target(cls) -> bool:
         return False
 
-    def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import make_scenario_target_fn
+    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+        from ..harness import make_target_fn
         from ..metrics import ScenarioResult, resolve_attack_target
-        target_fn = make_scenario_target_fn(scenario, target)
-        target_str, eval_mode = resolve_attack_target(scenario, self.eval_mode)
+        target_fn = make_target_fn(instance, target)
+        target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
 
         r = run_renellm(
-            goal=scenario.injection_goal,
+            goal=instance.query,
             target_fn=target_fn,
             attacker_model=self.attacker_llm,
             judge=self.judge,
@@ -260,11 +260,11 @@ class ReNeLLMAttacker(AdaptiveAttacker):
 
         if verbose:
             log.info("[renellm] scenario=%s success=%s score=%d iters=%d",
-                     scenario.id, r.success, r.score, r.iterations)
+                     instance.id, r.success, r.score, r.iterations)
 
         return ScenarioResult(
-            scenario_id=scenario.id,
-            goal=scenario.injection_goal,
+            scenario_id=instance.id,
+            goal=instance.query,
             success=r.success,
             score=r.score,
             injection=r.injection,
