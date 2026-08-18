@@ -1,4 +1,4 @@
-# Refactor handoff — state of the working tree
+# Refactor handoff — state of `ipi/`
 
 Companion to **`docs/ipi-refactor-plan.md`** (the design doc: why, target layout, locked
 decisions). This file is the operational picture: what is done, what remains, and the traps
@@ -9,18 +9,33 @@ found along the way. **Read this before touching `ipi/`.**
 ## 0. Start here
 
 ```bash
-python3 scripts/smoke_check.py            # network-free, no model loads — 21 checks
-python3 scripts/check_seed_fidelity.py    # 224 templates byte-identical to vendored upstream
+python3 scripts/smoke_check.py            # network-free, no model loads — 24 checks
+python3 scripts/check_seed_fidelity.py    # 224 of 257 `original` templates vs vendored upstream
 python3 scripts/check_metrics_fidelity.py # success checks pinned to a golden table
 python3 -m compileall -q ipi              # torch-gated modules only parse-check here
 ```
 
-All three pass right now. Run them before and after anything.
+All four pass right now. Run them before and after anything.
 
-**The refactor is committed.** Phases A–G landed as
-`refactor(ipi): restructure onto EasyJailbreak component families`, the docs as the commit after
-it, and Phase I as `refactor(ipi): make Instance the seam (Phase I)`. Only Phase H's last three
-recipes remain.
+**The refactor is committed and the tree is clean**, on `main`:
+
+```
+89b91e0  fix(packaging): remove the empty ipi/evaluators and ipi/targets directories
+8ef4bd7  fix(selector): make ReferenceLossSelector actually batch
+e46e643  fix(attacks): repair four defects in the white-box recipes
+c122252  docs: record the Phase H audit of autodan/beast/gcg
+f568e3e  refactor(mutation): extract the GCG token-gradient step into mutation/gradient.py
+52ec884  fix(attacks): let the data own eval_mode, not the attacker
+60d583f  refactor(ipi): make Instance the seam end to end (Phase I)
+f8c7b14  docs: add refactor design doc and handoff; update repo guide
+343d626  refactor(ipi): restructure onto EasyJailbreak component families   [A–G]
+```
+
+(Commits touching only this file after the last entry are not listed; `git log --oneline` is
+the authority. Every hash above was verified to exist when this section was written.)
+
+**Nothing is pushed.** Kaggle installs from GitHub, so no notebook can see any of this until
+`git push` — that is the first thing to do if a run is expected.
 
 Read order for a cold start: this file → `docs/ipi-refactor-plan.md` (§"What upstream actually
 does" is the rationale) → `CLAUDE.md` "Known gotchas" → the module docstring of whichever
@@ -37,10 +52,13 @@ verified — see §7 and trap 17.
 `ipi/` is being restructured onto EasyJailbreak's component architecture: a carrier object
 (`Instance`/`AttackDataset`) that every component family speaks, plus `seed/ mutation/ selector/
 constraint/ metrics/` packages, so attack recipes become pure wiring instead of self-contained
-scripts. **Phases A–G and I are shipped.** `Instance` is now the seam end to end: every
-`run_scenario` takes one, the legacy `IPIScenario`/`ipi/dataset.py`/`ipi/evaluator.py` are gone,
-and the prompt-building plumbing lives in `ipi/harness.py`. Phase H (making the recipes *compose*
-the components) is 5 of 15 done, 4 more confirmed to need nothing, **3 left** — all torch-gated.
+scripts. **All phases are shipped.** `Instance` is the seam end to end: every `run_scenario`
+takes one, the legacy `IPIScenario`/`ipi/dataset.py`/`ipi/evaluator.py` are gone, and the
+prompt-building plumbing lives in `ipi/harness.py`. Phase H's arithmetic: of the 12 recipe
+modules, **5 compose the components**, **4 need nothing** (single-query one-shots), and the **3
+torch-gated ones** were audited by reading — six defects found and fixed, the structural swap
+declined with reasons (§6a). That last decision is the one thing here that is a judgement call
+rather than a fact.
 
 ---
 
@@ -52,7 +70,7 @@ the components) is 5 of 15 done, 4 more confirmed to need nothing, **3 left** �
 | B | the carrier — `Instance` · `AttackDataset` · `DualVerifiableDataset` | ✅ green |
 | C | `seed/` — the prompt registry; every recipe reads from it | ✅ green |
 | D | `metrics/` — `*GetScore` guidance beside `*Judge`/`*Match` success | ✅ green |
-| E | `mutation/` — 31 operators, generation + rule | ✅ green |
+| E | `mutation/` — 30 operators (17 rule + 13 generation) + `gradient.py` | ✅ green |
 | F | `selector/` — 7 policies including real MCTS | ✅ green |
 | G | `constraint/` — `DeleteOffTopic` · `DeleteHarmLess` · `PerplexityConstraint` | ✅ green |
 | H | migrate the recipes onto the components | ✅ 5 composed · 4 no-op · 3 audited + defects fixed; structural swap declined with reasons (§6a) |
@@ -82,10 +100,10 @@ ipi/
   datasets/     instance.py · attack_dataset.py · dual_verifiable.py     [B]
   seed/         base.py · template.py · seed_templates.json (620 KB)     [C]
   metrics/      base · checks · get_score · judge · attack_evaluator     [D]
-  mutation/     base · generation · rule                                 [E]
+  mutation/     base · generation · rule · gradient (torch-gated)         [E]
   selector/     base · policies · reference_loss                         [F]
   constraint/   base · filters · perplexity                              [G]
-  attacks/      the 15 recipes                                           [H]
+  attacks/      12 recipe modules, 13 `run_scenario` classes              [H]
   data/         dual_verifiable_dataset.json (packaged)                  [A]
 
   harness.py    make_target_fn · attack_context · resolve_optimization_target   [I]
@@ -93,7 +111,9 @@ ipi/
   victim.py target.py llm_unified.py config.py runner.py attacker.py defenses/   untouched
 ```
 
-**Deleted:** `ipi/evaluators/`, `ipi/targets/`, `ipi/prompts.py`, `ipi/judges.py`,
+**Deleted:** `ipi/evaluators/`, `ipi/targets/` (their *directories* too — git does not
+track empty ones, so they lingered in every checkout and imported as empty namespace
+packages), `ipi/prompts.py`, `ipi/judges.py`,
 `ipi/scoring.py`, `ipi/attacks/seeds.py`, `ipi/attacks/seed_templates.json`,
 `ipi/attacks/mutations.py`, and in Phase I `ipi/dataset.py` (291 lines) and
 `ipi/evaluator.py` (151 lines).
@@ -138,14 +158,20 @@ attack      ICA            original=1           judge       IPI    ipi=1
 attack      DeepInception  original=1           constraint  DeleteOffTopic  original=1 ipi=1
 attack      ReNeLLM        original=3           constraint  DeleteHarmLess  original=1
 attack      IPI            ipi=41               demo        ICA    original=30 ipi=10
-mutation    12 wrapper prompts + CodeChameleon's 4 decryption-function sources
+mutation    12 entries — 8 wrapper prompts + CodeChameleon's 4 decryption sources
 ```
 
 `usage` ∈ `attack | mutation | judge | constraint | demo`; `variant` is `original` (verbatim
 from the paper's code) or `ipi` (ours), plus `ipi_universal` where a method genuinely has two
-IPI reframings. `check_seed_fidelity.py` proves all 224 `original` entries byte-identical to the
+IPI reframings.
+
+`check_seed_fidelity.py` checks **224 of the 257 `original` entries** byte-identical against
 vendored upstream — the `mutation` and `constraint` ones by AST extraction, since upstream
-inlines those strings in Python rather than in its seed file.
+inlines those strings in Python rather than in its seed file. It **skips four pools, and prints
+that it does**: `attack.TAP.original`, `attack.PAIR.original` and `judge.PAIR.original` are
+reworded here (upstream's are two-part variants), and `demo.ICA.original` is an AdvBench sample
+that was never in upstream's seed file. So "verbatim" is a claim about 224 templates, not all
+257 — don't quote it as full coverage.
 
 **The JSON must ship in the wheel**: `[tool.setuptools.package-data]` declares `"ipi.seed"`.
 Drop that and Kaggle installs break at import of any seed-based attack.
@@ -178,9 +204,17 @@ Not ported: upstream's `metrics/Metric/` (`AttackSuccessRate`, perplexity). `Eva
 aggregates ASR/utility/queries; a second aggregation path is one more place to diverge.
 
 ### E — `mutation/`
-31 operators. `generation.py` needs a model (bound at construction — `Expand(llm)`, then
+30 operators — 17 in `rule.py`, 13 in `generation.py`. `generation.py` needs a model (bound at construction — `Expand(llm)`, then
 `op.mutate(text)`); `rule.py` is deterministic. Every instruction prompt is verbatim upstream;
 the wrapper prompts live in the registry under `mutation.<Name>`.
+
+`gradient.py` is the third family and is **not** re-exported by `mutation/__init__.py`: it
+imports torch at module load, and `import ipi` must work without it. It holds the GCG
+token-gradient step (`build_input_ids` · `compute_loss_and_grads` · `get_embedding_matrix` ·
+`score_candidates` · `sample_candidates` · `build_not_allowed_ids`), extracted from *our*
+`attacks/gcg.py` rather than ported — upstream's `MutationTokenGradient` is written against its
+`WhiteBoxModelBase` stack. It exposes functions, not a `MutationBase` subclass; that module's
+docstring says why.
 
 Two guards in `MutationBase` are load-bearing: an operator rewriting a *template* falls back to
 its input if the model drops `{query}` (a template without it is un-attackable and fails
@@ -198,7 +232,10 @@ array by length but never assigns `index` to a candidate added mid-search — it
 
 `ReferenceLossSelector` is written against **our** `Victim` (`hf_model` + `tokenizer`,
 `backend == "local"`) using `apply_chat_template`, because upstream's needs its
-`WhiteBoxModelBase` / `model_utils.encode_trace` stack.
+`WhiteBoxModelBase` / `model_utils.encode_trace` stack. Its `batch_size` was accepted and
+never used until it was fixed — see §6a item 5. The padding/label index arithmetic now lives in
+a pure-Python `_build_batch`, split from the forward pass precisely so it can be verified with
+no torch; keep that split.
 
 ### G — `constraint/`
 A constraint only *drops* candidates — never rewrites (`mutation/`), never scores for the record
@@ -213,7 +250,7 @@ A constraint only *drops* candidates — never rewrites (`mutation/`), never sco
 
 ---
 
-## 6. Phase H — migrating the recipes (5 done, 4 no-op, 3 left)
+## 6. Phase H — migrating the recipes (5 composed · 4 no-op · 3 audited)
 
 | recipe | what it now composes |
 |---|---|
@@ -226,10 +263,10 @@ A constraint only *drops* candidates — never rewrites (`mutation/`), never sco
 **The four static one-shots need nothing.** `static_injection`, `deepinception`, `ica`,
 `multilingual` have no candidate type, no selection rule and no local prompt text — templates
 already come from `ipi.seed`, verdicts from `metrics.check_ipi_success`. Wrapping a single query
-in an `Instance` would be ceremony, not composition. They change in Phase I, when `run_scenario`
-stops taking `IPIScenario`.
+in an `Instance` would be ceremony, not composition. They *did* change in Phase I, when
+`run_scenario` moved to `Instance` — but only in their field reads.
 
-### 6a. What is left — `autodan`, `beast`, `gcg`
+### 6a. `autodan`, `beast`, `gcg` — audited, defects fixed, structural swap declined
 
 All three are **torch-gated and have never been executed in this sandbox**. They were
 audited by reading; the audit changed the plan, so read this before following the older
@@ -353,8 +390,9 @@ mechanical migration. Revisit on a GPU machine, with the selector's batching fix
 
 `Instance` is the seam end to end. What changed:
 
-- **`run_scenario(target, instance, verbose)`** on all 12 recipe classes and on the
-  `BaseAttacker` ABC. The bodies are unchanged apart from the field reads.
+- **`run_scenario(target, instance, verbose)`** on every recipe class — 13 implementations
+  across 12 modules (`adaptive.py` carries two, RS and Beam-RS) — and on the `BaseAttacker`
+  ABC. The bodies are unchanged apart from the field reads.
 - **`ipi/harness.py`** is the new home of the plumbing `evaluator.py` used to hold — the half an
   attack needs to *run*, symmetric with `metrics/`, which is the half it needs to be *judged*.
   Three functions: `make_target_fn` (the one place the IPI prompt shape is defined),
@@ -372,10 +410,12 @@ mechanical migration. Revisit on a GPU machine, with the selector's batching fix
   needed more: its dataset cell still offered BIPIA / Hijack / AgentDojo / manual loaders removed
   back in Phase A, and its judge cell still imported `ipi.judges`. Header, dataset cell and judge
   cell rewritten; GPTFuzzer's cell text corrected to MCTS + binary reward (§7).
-- **Verified:** 22 smoke checks (up from 21 — `make_target_fn`'s prompt shape is now covered, and
-  the dual-verifiable loader is checked against the JSON on disk rather than against the deleted
-  legacy loader), plus a check that `ipi.dataset` / `ipi.evaluator` are *not* importable, so a
-  stale Kaggle install shadowing `ipi/` fails loudly instead of serving the old type.
+- **Verified:** the suite grew from 21 checks to 22 here (`make_target_fn`'s prompt shape is now
+  covered, and the dual-verifiable loader is checked against the JSON on disk rather than against
+  the deleted legacy loader), and to **24** with the later `eval_mode` and selector-batching
+  checks. One of them asserts `ipi.dataset` / `ipi.evaluator` / `ipi.evaluators` / `ipi.targets`
+  are *not* importable, so a stale checkout shadowing `ipi/` fails loudly instead of serving the
+  old type.
 
 **Behaviour is unchanged.** The `pipeline_context` the new loader injects is byte-identical to the
 `clean_context` the old one did, for all 360 records — checked, not assumed.
@@ -384,48 +424,66 @@ mechanical migration. Revisit on a GPU machine, with the selector's batching fix
 
 ## 7. Behaviour changes that move published numbers
 
-Everything else in this refactor is structural. These four are not — flag them in any writeup
-that compares against a pre-refactor run.
+Everything else here is structural. **These nine are not** — flag them in any writeup that
+compares against a pre-refactor run. They are ordered by how much they move.
 
-1. **GPTFuzzer's search reward is now binary.** Upstream's RoBERTa judge emits a jailbreak
+**Void — do not compare at all**
+
+1. **BEAST never received the injection goal.** It optimised tokens after a generic
+   constructor-default prefix and never delivered the scenario's instruction to the victim, so
+   it was not attacking the row it reported on. Fixed in §6a. **Every pre-existing BEAST number
+   is void**, not merely shifted.
+2. **ICA's default demonstrations changed** — from the 30 AdvBench pairs to 10 authored IPI
+   demonstrations (§9). That moves ICA's ASR by construction. `variant="original"` still gives
+   the paper row.
+
+**ASR moves**
+
+3. **GPTFuzzer's search reward is now binary.** Upstream's RoBERTa judge emits a jailbreak
    *label*, and `Instance.num_jailbreak` sums labels, so MCTS back-propagation expects binary. We
    substitute the dataset's ground truth (`EvaluatorIPISuccess`). `judge=` is now annotative: it
    scores the trace and breaks ties for the reported best candidate but no longer steers the
    search. The old normalised-score reward was a workaround for not shipping the classifier.
-2. **GPTFuzzer's selection changed from flat UCB1 to real MCTS.** Verified to descend the
+4. **GPTFuzzer's selection changed from flat UCB1 to real MCTS.** Verified to descend the
    mutation tree (depth 6 on a 2-seed pool over 12 queries) rather than re-rolling roots.
-3. **TAP's on-topic filter changed prompt and parser** — now `constraint.DeleteOffTopic`
+5. **TAP's on-topic filter changed prompt and parser** — now `constraint.DeleteOffTopic`
    (upstream's verbatim `[[YES]]`/`[[NO]]`) instead of the locally authored bare-Yes/No
    `constraint.TAP_on_topic`, which is deleted. If every candidate at a level is judged off
    topic, the filter now keeps two rather than ending the run.
-4. **RS / Beam-RS now consult their evaluator.** The classes accepted `judge=` and ignored it;
+
+**Query counts and candidate choice move; ASR does not**
+
+Every item below was invisible for the same reason: `AttackEvaluator` overwrites the attack's own
+verdict before reporting, so a parameter that *only* steers the search can be wrong indefinitely
+without a visible symptom. That is the pattern to watch for, not these four instances of it.
+
+6. **RS / Beam-RS now consult their evaluator.** The classes accepted `judge=` and ignored it;
    the functions took a differently-shaped `judge` gated on a hard-coded `score >= 7`. Both now
-   take an `Evaluator`, and the class passes its own through. The logprob still drives the
-   search and the returned `success` is still `check_ipi_success` on the final response — the
-   evaluator only gates early stopping, so it changes query counts, not verdicts.
+   take an `Evaluator`, and the class passes its own through. The logprob still drives the search
+   and the returned `success` is still `check_ipi_success` on the final response — the evaluator
+   only gates early stopping.
+7. **`eval_mode` is owned by the data.** Every Attacker class defaults to `eval_mode=None` and
+   resolves it from the instance's `attack_eval_mode`. Seven attackers previously hard-coded
+   `"function_name"`, which **no scenario in the benchmark uses** — the suite is 180 `startswith`
+   + 180 `contains`. Cosmetic for the four OPI one-shots; for RS, Beam-RS, AutoDAN and GCG it
+   gated early stopping and best-candidate selection against a criterion that could never fire,
+   so their **query counts drop**.
+8. **GCG / RS / Beam-RS judge success against the evaluation target**, not the optimisation
+   target. The two differ on **120 of 360** scenarios, and the short one made the search stop on
+   a partial match. `eval_target_str` now separates them (§6a).
+9. **`n_queries` means victim calls** in BEAST and GCG, where it meant forward passes — BEAST
+   reported a constant 9000, GCG ~513 per step. Their `avg_queries` drops by orders of magnitude
+   and becomes comparable with the rest of the table for the first time. The compute count moved
+   to `n_forward_passes`.
 
-**ICA's default demonstrations changed** (§9) — that moves ICA's ASR by construction.
-
-**5. `eval_mode` is now owned by the data.** Every Attacker class defaults to
-`eval_mode=None` and resolves it from the instance's `attack_eval_mode`. Seven attackers
-previously hard-coded `"function_name"`, which **no scenario in the benchmark uses** — the
-suite is 180 `startswith` + 180 `contains`. For the four OPI one-shots that was cosmetic;
-for RS, Beam-RS, AutoDAN and GCG it gated early stopping and best-candidate selection
-against a criterion that could never fire, so their **query counts drop**. ASR is
-unaffected — `AttackEvaluator` always recomputed it from the same metadata, which is
-exactly why the bug survived this long.
-
-**6. BEAST now receives the injection goal**, and **7. GCG / RS / Beam-RS now judge
-success against the evaluation target rather than the optimisation target** (both §6a).
-BEAST's previous numbers are void; the other three change query counts and which candidate
-is returned, not ASR. **8. `n_queries` means victim calls** for BEAST and GCG, where it
-used to mean forward passes — their `avg_queries` drops by orders of magnitude and becomes
-comparable with the rest of the table for the first time.
-
-**Phase I adds nothing to this list.** It moved the seam, not the arithmetic: the prompt the
-victim sees is byte-identical (the new loader's `pipeline_context` equals the old one's
+**Phase I itself adds nothing to this list.** It moved the seam, not the arithmetic: the prompt
+the victim sees is byte-identical (the new loader's `pipeline_context` equals the old one's
 `clean_context` on all 360 records — checked), and `resolve_attack_target` resolves to the same
 `(target_str, eval_mode)` the `AttackEvaluator` used to compute inline.
+
+**Not verified by execution:** items 1, 8 and 9 touch `beast.py` and `gcg.py`, which torch cannot
+load in this sandbox. Item 8 *is* exercised for RS/Beam-RS by `smoke_check.py` against a mock
+victim. See trap 17.
 
 ---
 
@@ -527,11 +585,19 @@ with `prompt_num=5` is the paper-reproduction row.
 16. **Upstream's `[list[0], list[1]]` fallback appears twice** — `SelectBasedOnScores` and
     `DeleteOffTopic` — and `IndexError`s on a single-candidate dataset both times. Both are
     `[:2]` here. If you port anything else that truncates a ranked list, check its fallback.
-17. **No torch, no network, and broken `setuptools` in the sandbox this was built in.** So:
-    `autodan`/`beast`/`gcg` were never imported, let alone run; `pip wheel` never ran, and
+17. **No torch, no network, and broken `setuptools` in the sandbox this was built in.** So
+    `autodan`/`beast`/`gcg` were never imported, let alone run, and `pip wheel` never ran —
     packaging correctness is argued structurally (a directory needs `__init__.py` to be found by
-    `packages.find`) rather than verified by building. **Verify both on a real machine before
-    relying on them.**
+    `packages.find`) rather than verified by building.
+
+    **The unexecuted surface, to validate first on a GPU machine:** BEAST's goal wiring and its
+    two counters; GCG's `eval_target_str` threading and its `n_forward_passes` split;
+    `mutation/gradient.py` (a pure move — AST-compared against the previous commit, so the risk
+    is the import wiring, not the maths); and `ReferenceLossSelector._score_batch`'s tensor block.
+    Everything *around* that block is covered — `_build_batch` was split out as pure Python for
+    exactly this reason and is mutation-tested — but the forward pass and the cross-entropy are
+    read-only-verified. RS/Beam-RS are the exception: their `eval_target_str` split *is* exercised
+    against a mock victim in `smoke_check.py`.
 18. **Reusing the attacker LLM as TAP's on-topic judge silently disables pruning.** It answers in
     its own JSON format, the filter cannot parse `[[YES]]`/`[[NO]]`, and an unparseable answer
     keeps the candidate. `run_tap(on_topic_model=...)` now accepts a `UnifiedLLM` as well as a
@@ -559,6 +625,13 @@ with `prompt_num=5` is the paper-reproduction row.
 
 ## 11. Untouched by design
 
-`ipi/victim.py`, `ipi/target.py`, `ipi/llm_unified.py`, `ipi/config.py`, `ipi/runner.py` and all
-of `ipi/defenses/`. The `Victim` contract is our own abstraction and stays the target interface —
-it is *not* being renamed to upstream's `models/`. Defenses are already clean.
+`ipi/victim.py`, `ipi/target.py`, `ipi/llm_unified.py`, `ipi/config.py` and all of
+`ipi/defenses/` — behaviour untouched throughout. The `Victim` contract is our own abstraction and
+stays the target interface; it is *not* being renamed to upstream's `models/`. Defenses are
+already clean.
+
+`ipi/runner.py` is untouched in behaviour but its docstring was rewritten: it never held an
+`IPIScenario` (it speaks plain dicts and a bare `target_fn`), so Phase I needed nothing from it,
+but it is **not** the benchmark path and now says so. `AttackEvaluator` over an `AttackDataset`
+is. `ipi/target.py` and `ipi/defenses/channels.py` had comments repointed at `harness.make_target_fn`;
+`channels.py`'s two regexes are still coupled to the prompt shape that function emits.
