@@ -591,7 +591,7 @@ def run_autodan_ga(
     target_llm: Victim,
     # Eval
     eval_target_fn: Optional[Callable[[str], str]] = None,
-    eval_mode: str = "function_name",
+    eval_mode: str = "contains",
     target_max_n_tokens: int = 200,
     # GA hyperparams
     num_steps: int = 100,
@@ -627,7 +627,8 @@ def run_autodan_ga(
         eval_target_fn:    Optional callable(injection: str) -> response: str.
                            Used for full response evaluation. If None, target_llm
                            is called directly.
-        eval_mode:         IPI success mode: "function_name"|"exact_call"|etc.
+        eval_mode:         check_ipi_success mode (normally resolved from the
+                           instance by AutoDANAttacker, not chosen here).
         target_max_n_tokens: Max tokens when generating the full response.
         num_steps:         Number of GA generations. Default 100.
         batch_size:        Population size. Default 64.
@@ -781,7 +782,7 @@ def run_autodan_hga(
     target_llm: Victim,
     # Eval
     eval_target_fn: Optional[Callable[[str], str]] = None,
-    eval_mode: str = "function_name",
+    eval_mode: str = "contains",
     target_max_n_tokens: int = 200,
     # HGA hyperparams
     num_steps: int = 100,
@@ -988,7 +989,8 @@ class AutoDANAttacker(AdaptiveAttacker):
         num_points:       Crossover points per paragraph. Default 5.
         mutation_rate:    Mutation probability per individual. Default 0.01.
         hga_period:       HGA word-dict step every N steps (HGA only). Default 5.
-        eval_mode:        IPI success eval mode. Default "function_name".
+        eval_mode:        IPI success check mode. Default None → read the
+                          instance's own attack_eval_mode.
         llm_mutator:      Optional callable(str)->str for LLM-based mutation.
         extra_seeds:      Additional seed strings for the initial population.
         seed_variant:     Seed pool for generation 0 — "ipi" (41 IPI templates,
@@ -1009,7 +1011,7 @@ class AutoDANAttacker(AdaptiveAttacker):
         num_points: int = 5,
         mutation_rate: float = 0.01,
         hga_period: int = 5,
-        eval_mode: str = "function_name",
+        eval_mode: Optional[str] = None,
         llm_mutator: Optional[Callable[[str], str]] = None,
         extra_seeds: Optional[list[str]] = None,
         seed_variant: str = "ipi",
@@ -1045,14 +1047,14 @@ class AutoDANAttacker(AdaptiveAttacker):
         from ..harness import make_target_fn
         from ..metrics import ScenarioResult, resolve_attack_target
         target_fn = make_target_fn(instance, target)
-        target_str, _ = resolve_attack_target(instance)
+        target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
 
         common_kwargs = dict(
             goal=instance.query,
             target_str=target_str,
             target_llm=target,
             eval_target_fn=target_fn,
-            eval_mode=self.eval_mode,
+            eval_mode=eval_mode,
             num_steps=self.num_steps,
             batch_size=self.batch_size,
             num_elites_frac=self.num_elites_frac,

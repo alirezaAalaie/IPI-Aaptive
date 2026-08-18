@@ -217,7 +217,7 @@ def run_static_injection(
     judge: Optional[Evaluator] = None,
     user_task: str = "",
     fake_answer: str = "",
-    eval_mode: str = "function_name",
+    eval_mode: str = "contains",
     target_str: str = "",
 ) -> StaticInjectionResult:
     """
@@ -324,7 +324,7 @@ class _StaticInjectionAttacker(StaticAttacker):
         self,
         judge: Optional[Evaluator] = None,
         fake_answer: str = "",
-        eval_mode: str = "function_name",
+        eval_mode: Optional[str] = None,
     ):
         """
         Args:
@@ -345,8 +345,7 @@ class _StaticInjectionAttacker(StaticAttacker):
         from ..harness import make_target_fn
         from ..metrics import ScenarioResult, resolve_attack_target
         target_fn = make_target_fn(instance, target)
-        # eval_mode stays the attacker's own; only the target string is resolved.
-        target_str, _ = resolve_attack_target(instance)
+        target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
 
         r = run_static_injection(
             strategy=self._STRATEGY,
@@ -355,7 +354,7 @@ class _StaticInjectionAttacker(StaticAttacker):
             judge=self.judge,
             user_task=instance.attack_attrs.get("user_task", ""),
             fake_answer=self.fake_answer,
-            eval_mode=self.eval_mode,
+            eval_mode=eval_mode,
             target_str=target_str,
         )
 
@@ -398,12 +397,13 @@ class NaiveAttacker(_StaticInjectionAttacker):
 
     Args:
         judge:      Guidance Evaluator (ipi.metrics).
-        eval_mode:  IPI success check mode. Default "function_name".
+        eval_mode:  IPI success check mode. Default None → read the
+                    instance's own attack_eval_mode.
     """
     _STRATEGY   = "naive"
     _ATTACK_NAME = "naive"
 
-    def __init__(self, judge: Optional[Evaluator] = None, eval_mode: str = "function_name"):
+    def __init__(self, judge: Optional[Evaluator] = None, eval_mode: Optional[str] = None):
         super().__init__(judge=judge, fake_answer="", eval_mode=eval_mode)
 
 
@@ -420,12 +420,13 @@ class EscapeAttacker(_StaticInjectionAttacker):
 
     Args:
         judge:      Guidance Evaluator (ipi.metrics).
-        eval_mode:  IPI success check mode. Default "function_name".
+        eval_mode:  IPI success check mode. Default None → read the
+                    instance's own attack_eval_mode.
     """
     _STRATEGY   = "escape"
     _ATTACK_NAME = "escape"
 
-    def __init__(self, judge: Optional[Evaluator] = None, eval_mode: str = "function_name"):
+    def __init__(self, judge: Optional[Evaluator] = None, eval_mode: Optional[str] = None):
         super().__init__(judge=judge, fake_answer="", eval_mode=eval_mode)
 
 
@@ -442,12 +443,13 @@ class IgnoreAttacker(_StaticInjectionAttacker):
 
     Args:
         judge:      Guidance Evaluator (ipi.metrics).
-        eval_mode:  IPI success check mode. Default "function_name".
+        eval_mode:  IPI success check mode. Default None → read the
+                    instance's own attack_eval_mode.
     """
     _STRATEGY   = "ignore"
     _ATTACK_NAME = "ignore"
 
-    def __init__(self, judge: Optional[Evaluator] = None, eval_mode: str = "function_name"):
+    def __init__(self, judge: Optional[Evaluator] = None, eval_mode: Optional[str] = None):
         super().__init__(judge=judge, fake_answer="", eval_mode=eval_mode)
 
 
@@ -467,7 +469,8 @@ class FakeCompletionAttacker(_StaticInjectionAttacker):
         judge:        Guidance Evaluator (ipi.metrics).
         fake_answer:  Custom fake-completion string.  If empty (default), one is
                       auto-generated from the scenario's ``user_task`` text.
-        eval_mode:    IPI success check mode. Default "function_name".
+        eval_mode:    IPI success check mode. Default None → read the
+                    instance's own attack_eval_mode.
     """
     _STRATEGY   = "fake_completion"
     _ATTACK_NAME = "fake_completion"
@@ -476,7 +479,7 @@ class FakeCompletionAttacker(_StaticInjectionAttacker):
         self,
         judge: Optional[Evaluator] = None,
         fake_answer: str = "",
-        eval_mode: str = "function_name",
+        eval_mode: Optional[str] = None,
     ):
         super().__init__(judge=judge, fake_answer=fake_answer, eval_mode=eval_mode)
 
@@ -500,7 +503,8 @@ class CombinedAttacker(_StaticInjectionAttacker):
         judge:        Guidance Evaluator (ipi.metrics).
         fake_answer:  Custom fake-completion string.  If empty (default), one is
                       auto-generated from the scenario's ``user_task`` text.
-        eval_mode:    IPI success check mode. Default "function_name".
+        eval_mode:    IPI success check mode. Default None → read the
+                    instance's own attack_eval_mode.
     """
     _STRATEGY   = "combined"
     _ATTACK_NAME = "combined"
@@ -509,7 +513,7 @@ class CombinedAttacker(_StaticInjectionAttacker):
         self,
         judge: Optional[Evaluator] = None,
         fake_answer: str = "",
-        eval_mode: str = "function_name",
+        eval_mode: Optional[str] = None,
     ):
         super().__init__(judge=judge, fake_answer=fake_answer, eval_mode=eval_mode)
 
@@ -526,7 +530,7 @@ def create_static_attacker(
     strategy: str,
     judge: Optional[Evaluator] = None,
     fake_answer: str = "",
-    eval_mode: str = "function_name",
+    eval_mode: Optional[str] = None,
 ) -> _StaticInjectionAttacker:
     """
     Factory that mirrors the original OPI ``create_attacker()`` API.
@@ -536,7 +540,8 @@ def create_static_attacker(
                      "combined" (also "combine").
         judge:       Guidance Evaluator (ipi.metrics).
         fake_answer: Custom fake-completion text (FakeCompletion / Combined only).
-        eval_mode:   IPI success check mode. Default "function_name".
+        eval_mode:   IPI success check mode. Default None → read the
+                    instance's own attack_eval_mode.
 
     Returns:
         The corresponding attacker instance.

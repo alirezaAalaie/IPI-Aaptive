@@ -135,7 +135,7 @@ def run_beast(
     temperature: float = 1.0,
     ngram: int = 1,            # tokens added per attack iteration (keep 1)
     # Eval
-    eval_mode: str = "function_name",
+    eval_mode: str = "contains",
     eval_target_fn: Optional[callable] = None,   # callable(injection) -> response
     target_max_n_tokens: int = 200,
     # Budget
@@ -167,7 +167,8 @@ def run_beast(
         top_k:             Top-k for sampling. Default None (disabled).
         temperature:       Temperature for candidate sampling. Default 1.0.
         ngram:             Tokens per attack step. 1 = single token (original). Default 1.
-        eval_mode:         IPI success eval mode: "function_name"|"exact_call"|etc.
+        eval_mode:         check_ipi_success mode (normally resolved from the
+                           instance by BEASTAttacker, not chosen here).
         eval_target_fn:    Optional callable(injection: str) -> response: str.
                            If provided, used to get the full agent response for eval.
                            If None, target_llm is used directly with system_prompt.
@@ -371,7 +372,9 @@ class BEASTAttacker(AdaptiveAttacker):
         k1:              Beam width. Default 15.
         k2:              Candidates sampled per beam per step. Default 15.
         new_gen_length:  Adversarial tokens to generate. Default 40.
-        eval_mode:       IPI eval mode. Default "function_name".
+        eval_mode:       IPI success check mode. Default None → read the
+                         instance's own attack_eval_mode. Force one only
+                         to deviate from the data deliberately.
         n_trials:        Average objective over n_trials. Default 1.
         budget_seconds:  Time budget per scenario. None = unlimited.
     """
@@ -383,7 +386,7 @@ class BEASTAttacker(AdaptiveAttacker):
         k1: int = 15,
         k2: int = 15,
         new_gen_length: int = 40,
-        eval_mode: str = "function_name",
+        eval_mode: Optional[str] = None,
         n_trials: int = 1,
         budget_seconds: Optional[float] = None,
     ):
@@ -404,7 +407,7 @@ class BEASTAttacker(AdaptiveAttacker):
         from ..harness import make_target_fn
         from ..metrics import ScenarioResult, resolve_attack_target
         target_fn = make_target_fn(instance, target)
-        target_str, _ = resolve_attack_target(instance)
+        target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
         r = run_beast(
             prompt_prefix=self.prompt_prefix,
             target_str=target_str,
@@ -412,7 +415,7 @@ class BEASTAttacker(AdaptiveAttacker):
             k1=self.k1,
             k2=self.k2,
             new_gen_length=self.new_gen_length,
-            eval_mode=self.eval_mode,
+            eval_mode=eval_mode,
             eval_target_fn=target_fn,
             n_trials=self.n_trials,
             budget_seconds=self.budget_seconds,

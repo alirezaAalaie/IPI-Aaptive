@@ -352,7 +352,7 @@ def run_gcg(
     target_llm: Victim,
     # Eval
     eval_target_fn: Optional[Callable[[str], str]] = None,
-    eval_mode: str = "function_name",
+    eval_mode: str = "contains",
     target_max_n_tokens: int = 200,
     # GCG hyperparams
     num_steps: int = 500,
@@ -387,7 +387,8 @@ def run_gcg(
         eval_target_fn:    Optional callable(injection: str) -> response: str.
                            If provided, used for success evaluation.
                            If None, target_llm is called directly.
-        eval_mode:         IPI success mode: "function_name"|"exact_call"|"contains"|"startswith".
+        eval_mode:         check_ipi_success mode (normally resolved from the
+                           instance by GCGAttacker, not chosen here).
         target_max_n_tokens: Max tokens for full response generation.
         num_steps:         Maximum optimisation iterations. Default 500.
         adv_suffix_len:    Number of adversarial suffix tokens. Default 20.
@@ -628,7 +629,8 @@ class GCGAttacker(AdaptiveAttacker):
         top_k:              Gradient-guided token candidates per position. Default 256.
         batch_size_eval:    Mini-batch size for candidate scoring. Default 128.
         allow_non_ascii:    Allow non-ASCII tokens in suffix. Default False.
-        eval_mode:          IPI success eval mode. Default "function_name".
+        eval_mode:          IPI success check mode. Default None → read the
+                            instance's own attack_eval_mode.
         adv_init:           Initial adversarial string. Default "! " * 20.
         budget_seconds:     Wall-clock budget per scenario. None = unlimited.
         seed:               Random seed. Default 42.
@@ -644,7 +646,7 @@ class GCGAttacker(AdaptiveAttacker):
         top_k: int = 256,
         batch_size_eval: int = 128,
         allow_non_ascii: bool = False,
-        eval_mode: str = "function_name",
+        eval_mode: Optional[str] = None,
         adv_init: str = "",
         budget_seconds: Optional[float] = None,
         seed: int = 42,
@@ -668,8 +670,10 @@ class GCGAttacker(AdaptiveAttacker):
 
     def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
         from ..harness import make_target_fn, resolve_optimization_target
-        from ..metrics import ScenarioResult
+        from ..metrics import ScenarioResult, resolve_attack_target
         target_fn = make_target_fn(instance, target)
+        # The optimization target drives the CE loss; the eval mode comes from the data.
+        _, eval_mode = resolve_attack_target(instance, self.eval_mode)
         r = run_gcg(
             adv_prefix=self.adv_prefix,
             # optimization_target: tokenized as the full CE-loss target sequence.
@@ -677,7 +681,7 @@ class GCGAttacker(AdaptiveAttacker):
             target_str=resolve_optimization_target(instance),
             target_llm=target,
             eval_target_fn=target_fn,
-            eval_mode=self.eval_mode,
+            eval_mode=eval_mode,
             num_steps=self.num_steps,
             adv_suffix_len=self.adv_suffix_len,
             batch_size=self.batch_size,

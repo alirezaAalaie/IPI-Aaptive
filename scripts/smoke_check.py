@@ -258,6 +258,42 @@ def _harness_target_fn():
     assert resolve_optimization_target(inst) == "Print only HACKED"
 
 
+@check("eval_mode is owned by the data, not the attacker")
+def _eval_mode_is_data_owned():
+    """
+    Every attacker's ``eval_mode`` must default to ``None`` — meaning "read the
+    instance's own ``attack_eval_mode``". A hard-coded default is the bug this pins:
+    the benchmark is 180 ``startswith`` + 180 ``contains`` and contains **no**
+    ``function_name`` scenario, so an attacker defaulting to ``function_name`` searches,
+    stops early and picks its best candidate against a criterion the data never
+    satisfies. ``AttackEvaluator`` still overwrites the final verdict, which is exactly
+    why this stayed invisible — the ASR looked plausible while the search was aimed at
+    the wrong string.
+    """
+    import inspect
+    from ipi import attacks as A
+
+    checked = []
+    for name in [n for n in dir(A) if n.endswith("Attacker")]:
+        cls = getattr(A, name)
+        if cls is None:          # torch-gated and unavailable in this sandbox
+            continue
+        params = inspect.signature(cls.__init__).parameters
+        if "eval_mode" not in params:
+            continue
+        default = params["eval_mode"].default
+        assert default is None, (
+            f"{name}.eval_mode defaults to {default!r}; it must default to None so the "
+            f"instance's attack_eval_mode decides")
+        checked.append(name)
+    assert len(checked) >= 8, f"expected at least 8 attackers to check, saw {checked}"
+
+    # And the benchmark really does never use function_name — the premise above.
+    from ipi.datasets import DualVerifiableDataset
+    modes = {i.attack_attrs["attack_eval_mode"] for i in DualVerifiableDataset()}
+    assert modes == {"startswith", "contains"}, modes
+
+
 @check("seed registry loads")
 def _seeds():
     from ipi.seed import SeedTemplate

@@ -596,7 +596,7 @@ def run_adaptive_rs(
     target_max_n_tokens: int = 150,
     judge_max_n_calls: int = 1,
     # IPI eval
-    eval_mode: str = "function_name",
+    eval_mode: str = "contains",
     target_token: str = "",        # "" = auto-detect from target_str
     # Init
     adv_init: str = "",            # "" = auto-select
@@ -639,7 +639,8 @@ def run_adaptive_rs(
         deterministic_jailbreak: Stop as soon as target_token becomes argmax.
         target_max_n_tokens: Max tokens for full response generation.
         judge_max_n_calls:  Max judge calls per restart.
-        eval_mode:         IPI eval mode: "function_name"|"exact_call"|"contains"|"startswith".
+        eval_mode:         check_ipi_success mode (normally resolved from the
+                           instance by RSAttacker/BeamRSAttacker, not here).
         target_token:      First token to maximize. "" = auto from target_str.
         adv_init:          Initial adversarial string. "" = model-specific default.
         seed:              Random seed.
@@ -860,7 +861,7 @@ def run_adaptive_beam(
     target_max_n_tokens: int = 150,
     judge_max_n_calls: int = 1,
     # IPI eval
-    eval_mode: str = "function_name",
+    eval_mode: str = "contains",
     target_token: str = "",
     # Init
     adv_init: str = "",
@@ -1081,7 +1082,8 @@ class RSAttacker(AdaptiveAttacker):
         n_tokens_change_max: Max tokens to substitute per iteration. Default 4.
         n_iterations:        Max RS iterations per restart. Default 500.
         adv_position:        "suffix" | "prefix" | "inline". Default "suffix".
-        eval_mode:           IPI eval mode. Default "function_name".
+        eval_mode:           IPI success check mode. Default None → read the
+                             instance's own attack_eval_mode.
         n_restarts:          Number of random restarts. Default 1.
         adv_init:            Initial adversarial string. "" = auto-select.
         seed:                Random seed. Default 1.
@@ -1095,7 +1097,7 @@ class RSAttacker(AdaptiveAttacker):
         n_tokens_change_max: int = 4,
         n_iterations: int = 500,
         adv_position: str = "suffix",
-        eval_mode: str = "function_name",
+        eval_mode: Optional[str] = None,
         n_restarts: int = 1,
         adv_init: str = "",
         seed: int = 1,
@@ -1112,7 +1114,10 @@ class RSAttacker(AdaptiveAttacker):
         self.seed                 = seed
 
     def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
-        from ..metrics import ScenarioResult
+        from ..metrics import ScenarioResult, resolve_attack_target
+        # The optimization target drives the logprob search; the eval mode comes from
+        # the data — the instance decides how it is scored, never the attacker.
+        _, eval_mode = resolve_attack_target(instance, self.eval_mode)
         r = run_adaptive_rs(
             goal=instance.query,
             target_llm=target,
@@ -1125,7 +1130,7 @@ class RSAttacker(AdaptiveAttacker):
             n_tokens_change_max=self.n_tokens_change_max,
             n_iterations=self.n_iterations,
             adv_position=self.adv_position,
-            eval_mode=self.eval_mode,
+            eval_mode=eval_mode,
             n_restarts=self.n_restarts,
             adv_init=self.adv_init,
             seed=self.seed,
@@ -1172,7 +1177,8 @@ class BeamRSAttacker(AdaptiveAttacker):
         k_beam:              Beam width. Default 5.
         n_mutations_per_beam: Mutations per beam candidate per iteration. Default 4.
         adv_position:        "suffix" | "prefix" | "inline". Default "suffix".
-        eval_mode:           IPI eval mode. Default "function_name".
+        eval_mode:           IPI success check mode. Default None → read the
+                             instance's own attack_eval_mode.
         adv_init:            Initial adversarial string. "" = auto-select.
         seed:                Random seed. Default 1.
     """
@@ -1187,7 +1193,7 @@ class BeamRSAttacker(AdaptiveAttacker):
         k_beam: int = 5,
         n_mutations_per_beam: int = 4,
         adv_position: str = "suffix",
-        eval_mode: str = "function_name",
+        eval_mode: Optional[str] = None,
         adv_init: str = "",
         seed: int = 1,
     ):
@@ -1204,7 +1210,10 @@ class BeamRSAttacker(AdaptiveAttacker):
         self.seed                 = seed
 
     def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
-        from ..metrics import ScenarioResult
+        from ..metrics import ScenarioResult, resolve_attack_target
+        # The optimization target drives the logprob search; the eval mode comes from
+        # the data — the instance decides how it is scored, never the attacker.
+        _, eval_mode = resolve_attack_target(instance, self.eval_mode)
         r = run_adaptive_beam(
             goal=instance.query,
             target_llm=target,
@@ -1217,7 +1226,7 @@ class BeamRSAttacker(AdaptiveAttacker):
             k_beam=self.k_beam,
             n_mutations_per_beam=self.n_mutations_per_beam,
             adv_position=self.adv_position,
-            eval_mode=self.eval_mode,
+            eval_mode=eval_mode,
             adv_init=self.adv_init,
             seed=self.seed,
             verbose=verbose,
