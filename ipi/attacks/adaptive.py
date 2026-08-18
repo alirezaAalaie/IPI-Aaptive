@@ -836,12 +836,23 @@ def run_adaptive_rs(
         best_overall.n_queries += n_queries
         best_overall.n_iterations_done += it
 
-        if best_logprob > best_overall.logprob:
-            best_overall.logprob        = best_logprob
-            best_overall.injection      = best_msg
-            best_overall.adv            = best_adv
+        # A restart that succeeded wins outright, whatever its logprob. Writing
+        # `success` only inside the logprob-improvement branch — the old behaviour —
+        # meant a later restart could succeed, break the loop, and still be reported as
+        # a failure because an earlier restart happened to reach a higher logprob.
+        # Only reachable with n_restarts > 1, which is exactly the setting the paper
+        # recommends for amplifying ASR.
+        if ipi_success and not best_overall.success:
+            best_overall.success         = True
+            best_overall.logprob         = best_logprob
+            best_overall.injection       = best_msg
+            best_overall.adv             = best_adv
             best_overall.target_response = final_response
-            best_overall.success        = ipi_success
+        elif not best_overall.success and best_logprob > best_overall.logprob:
+            best_overall.logprob         = best_logprob
+            best_overall.injection       = best_msg
+            best_overall.adv             = best_adv
+            best_overall.target_response = final_response
 
         if ipi_success:
             break

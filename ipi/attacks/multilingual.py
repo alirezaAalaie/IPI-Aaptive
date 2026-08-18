@@ -19,6 +19,19 @@ Multi-query static attack: one injection per language, best-of aggregation
 (`n_queries` = number of languages attempted). No attacker LLM required for the
 search itself, but a translator is needed.
 
+Two scenarios, as in the paper
+------------------------------
+  ``scenario="intentional"`` (default) — the translated instruction is wrapped in the
+      AIM jailbreak template before injection, which is what the reference
+      ``Multilingual`` recipe does: its ``Translate`` rule sets ``jailbreak_prompt`` to
+      that template and the attacker sends
+      ``jailbreak_prompt.format(translated_query=...)``. The template is
+      ``mutation.Translate.original`` in the seed registry, verbatim.
+  ``scenario="unintentional"`` — the bare translated instruction, no wrapper. This is
+      the paper's *unintentional* setting, and it was the only thing implemented here;
+      the registry already carried the wrapper, unused, so the row labelled
+      "Multilingual" was measuring the weaker of the two.
+
 IPI adaptation vs original
 --------------------------
   delivery: the translated instruction is injected through the data channel via
@@ -68,6 +81,32 @@ DEFAULT_LANGUAGES: dict[str, str] = {
     "sw":    "Swahili",
     "jv":    "Javanese",
 }
+
+
+DEFAULT_SCENARIO = "intentional"
+
+
+def _load_wrapper() -> str:
+    """The verbatim AIM template the reference wraps each translation in."""
+    from ..seed import SeedTemplate
+    return SeedTemplate().new_seeds(
+        prompt_usage="mutation", method_list=["Translate"], variant="original",
+    )[0]
+
+
+def build_multilingual_injection(translated: str, scenario: str = DEFAULT_SCENARIO) -> str:
+    """
+    Wrap a translated instruction according to ``scenario``.
+
+    ``intentional`` substitutes it into the AIM template at ``{translated_query}``,
+    exactly as the reference recipe does. ``unintentional`` returns it bare.
+    """
+    if scenario == "unintentional":
+        return translated
+    if scenario != "intentional":
+        raise ValueError(
+            f"scenario must be 'intentional' or 'unintentional', got {scenario!r}")
+    return _load_wrapper().replace("{translated_query}", translated)
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +197,7 @@ def run_multilingual(
     eval_mode: str = "contains",
     target_str: str = "",
     stop_on_success: bool = True,
+    scenario: str = DEFAULT_SCENARIO,
 ) -> MultilingualResult:
     """
     Run the multilingual attack: translate the goal into each language, inject, best-of.
@@ -173,6 +213,8 @@ def run_multilingual(
         eval_mode:      check_ipi_success mode.
         target_str:     Expected action string for the check (falls back to goal).
         stop_on_success: Stop at the first language that succeeds (saves queries).
+        scenario:       "intentional" (default, AIM-wrapped, what the reference recipe
+                        runs) or "unintentional" (bare translation).
 
     Returns:
         MultilingualResult.
@@ -195,8 +237,10 @@ def run_multilingual(
         if not translated:
             continue
 
+        injection = build_multilingual_injection(translated, scenario)
+
         try:
-            response = target_fn(translated)
+            response = target_fn(injection)
         except Exception as exc:
             log.warning("[Multilingual] target_fn raised for %s: %s", code, exc)
             response = ""
@@ -206,13 +250,13 @@ def run_multilingual(
         score = 0
         if judge is not None:
             try:
-                score = judge.score(translated, response, attacker_goal=goal)
+                score = judge.score(injection, response, attacker_goal=goal)
             except Exception as exc:
                 log.debug("[Multilingual] judge.score failed for %s: %s", code, exc)
 
         best.per_language[code] = {"success": success, "score": score}
         best.trace.append({
-            "language": code, "injection": translated,
+            "language": code, "translated": translated, "injection": injection,
             "response": response, "success": success, "score": score,
         })
 
@@ -220,7 +264,7 @@ def run_multilingual(
         if improved:
             best.success = best.success or success
             best.score = max(best.score, score)
-            best.injection = translated
+            best.injection = injection
             best.target_response = response
             best.best_language = code
 
@@ -247,6 +291,8 @@ class MultilingualAttacker(StaticAttacker):
         translator_llm: Optional LLM (or model string) translator, used if ``translator``
                         is not provided. If neither is set, a keyless Google endpoint is
                         used (requires network).
+        scenario:       "intentional" (default — AIM-wrapped, what the reference recipe
+                        runs) or "unintentional" (bare translation).
         eval_mode:      check_ipi_success mode. Default None → auto-detect from the
                         scenario's ``attack_eval_mode``.
         stop_on_success: Stop at the first successful language. Default True.
@@ -262,13 +308,18 @@ class MultilingualAttacker(StaticAttacker):
         translator_llm: Optional[Union[str, UnifiedLLM]] = None,
         eval_mode: Optional[str] = None,
         stop_on_success: bool = True,
+        scenario: str = DEFAULT_SCENARIO,
     ):
         super().__init__(judge)
+        if scenario not in ("intentional", "unintentional"):
+            raise ValueError(
+                f"scenario must be 'intentional' or 'unintentional', got {scenario!r}")
         self.languages       = languages or DEFAULT_LANGUAGES
         self.translator      = translator
         self.translator_llm  = translator_llm
         self.eval_mode       = eval_mode
         self.stop_on_success = stop_on_success
+        self.scenario        = scenario
 
     @classmethod
     def requires_local_target(cls) -> bool:
@@ -290,6 +341,7 @@ class MultilingualAttacker(StaticAttacker):
             eval_mode=eval_mode,
             target_str=target_str,
             stop_on_success=self.stop_on_success,
+            scenario=self.scenario,
         )
 
         if verbose:
