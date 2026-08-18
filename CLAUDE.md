@@ -273,13 +273,20 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
 ## Current work
 
 The architecture refactor onto EasyJailbreak's component families (carrier object +
-`seed/ mutation/ selector/ constraint/ metrics/`) is **committed**. Phases A–G and I are
-shipped; **Phase H has 3 recipes left** — `autodan`, `beast` and `gcg`, all torch-gated, all
-needing a GPU machine to migrate safely. Design doc: `docs/ipi-refactor-plan.md`. **What is
-done, what is left and the traps: `docs/refactor-handoff.md` — read it before touching `ipi/`,
-and start at its §0.** Green check:
-`python3 scripts/smoke_check.py`, `python3 scripts/check_seed_fidelity.py` and
-`python3 scripts/check_metrics_fidelity.py`.
+`seed/ mutation/ selector/ constraint/ metrics/`) is **committed and complete** — all phases
+A–I. Six defects found while auditing the white-box recipes are fixed; the structural swap for
+`autodan`/`beast`/`gcg` was declined with reasons rather than done.
+
+**Three docs, three jobs:**
+- `docs/next-session.md` — **the to-do list.** Start here. Nothing is pushed to GitHub, so no
+  Kaggle notebook can see any of this; the white-box edits have never been executed for want of
+  a GPU; nine behaviour changes mean published numbers need re-baselining, and BEAST's are void.
+- `docs/refactor-handoff.md` — the state of `ipi/` and 21 traps. Read before touching `ipi/`.
+- `docs/ipi-refactor-plan.md` — the design doc and the locked decisions.
+
+Green check (all six pass):
+`scripts/{smoke_check,check_seed_fidelity,check_metrics_fidelity,check_defensivetoken_fidelity,check_pisanitizer_fidelity}.py`
+plus `python3 -m compileall -q ipi`.
 
 Gathering and validating **defense baselines** and the **adversaries** to evaluate them against.
 `code/attack/EasyJailbreak-master/` was added recently as a source of additional attacks —

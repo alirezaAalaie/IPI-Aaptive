@@ -37,7 +37,10 @@ the authority. Every hash above was verified to exist when this section was writ
 **Nothing is pushed.** Kaggle installs from GitHub, so no notebook can see any of this until
 `git push` — that is the first thing to do if a run is expected.
 
-Read order for a cold start: this file → `docs/ipi-refactor-plan.md` (§"What upstream actually
+**What is still to do lives in `docs/next-session.md`** — this file is the state of the code;
+that one is the to-do list (push, the GPU validation pass, re-baselining, the open decisions).
+
+Read order for a cold start: this file → `docs/next-session.md` → `docs/ipi-refactor-plan.md` (§"What upstream actually
 does" is the rationale) → `CLAUDE.md` "Known gotchas" → the module docstring of whichever
 component family you are touching. The module docstrings carry the per-component deviations;
 this file carries the cross-cutting ones.
