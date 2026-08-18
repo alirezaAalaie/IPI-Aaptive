@@ -259,6 +259,12 @@ call (the live dataset is `DualVerifiableDataset`, whose goals are literal strin
   `SeedTemplate().new_seeds(...)` mirrors the upstream API (asserts `seeds_num ≤ pool`, samples
   without replacement). `sample_population()` is the one addition, for GA/fuzzing populations
   larger than the pool. `advbench_pairs()` serves the ICA demos.
+
+  > **Superseded by the refactor.** The registry moved to **`ipi/seed/`** and was re-keyed
+  > `usage → method → variant → [templates]`, absorbing `prompts.py` (attacker / judge /
+  > constraint prompts) and gaining `attack.AutoDAN.original` (128 upstream seeds) and
+  > `demo.ICA.ipi`. `advbench_pairs()` is now `ica_demos(variant=...)`. `ipi/attacks/seeds.py`
+  > and `ipi/prompts.py` are deleted. See `docs/refactor-handoff.md`.
 - **`mutations.py`** — the `MutationBase` operator pattern. Two families with **verbatim upstream
   prompts**: GPTFuzzer's five (`Expand`, `Shorten`, `Rephrase`, `GenerateSimilar`, `CrossOver`)
   and ReNeLLM's six (`AlterSentenceStructure`, `ChangeStyle`, `Rephrase`,
@@ -281,11 +287,17 @@ defaults to **auto** — resolved from the scenario's `attack_eval_mode` rather 
   `str.replace` as upstream (`science fiction`→scene, `4`→characters, `5`→layers), **but** on the
   template *before* substituting the goal, not after — upstream's after-order corrupts any goal
   containing `4`/`5`. Otherwise identical.
-- **ICA** — now the faithful construction: 5-shot **AdvBench** `(goal, target)` demonstrations
+- **ICA** — the faithful construction: 5-shot **AdvBench** `(goal, target)` demonstrations
   formatted `User:{goal}\nAssistant:{target}` then `User:{goal}`, exactly like the reference
   template — replacing the earlier hand-written tool-compliance demos, which were the thing that
   didn't fit the dataset. IPI change: the whole transcript is emitted as one injected-document
   string (data channel) rather than as real chat turns.
+
+  > **Revised by the refactor.** The AdvBench pairs only *restate* the request ("Sure, here is a
+  > tutorial on …") and never carry anything out, and refusal is the wrong barrier for IPI. The
+  > default is now `demo.ICA.ipi` — 10 authored demonstrations of an assistant executing an
+  > *injected* instruction, benign by construction, so the completions are real and complete.
+  > `ICAAttacker(variant="original")` still gives the 30-pair paper row.
 - **Multilingual** — same nine languages as the reference `Translate` mutation, same keyless
   Google endpoint. Deviations: we do **not** wrap the translated goal in the reference's AIM
   jailbreak system prompt (that's a direct-chat device; for IPI the translated instruction is the
@@ -303,10 +315,11 @@ defaults to **auto** — resolved from the scenario's `attack_eval_mode` rather 
 
 ### AutoDAN / packaging
 
-- `autodan.py` now seeds its GA population from `seeds.sample_population(..., prompt_usage="ipi")`
-  instead of the deleted `ipi_seeds.py` — same 41-template pool, same without-replacement fill.
-- `pyproject.toml` gained `[tool.setuptools.package-data]` for `ipi.datasets` and `ipi.attacks`
-  `*.json`, so both the dataset and the seed registry ship in the wheel Kaggle installs.
+- `autodan.py` now seeds its GA population from `sample_population(...)` instead of the deleted
+  `ipi_seeds.py` — same 41-template pool, same without-replacement fill. Post-refactor it reads
+  `attack.AutoDAN.<seed_variant>`, so `seed_variant="original"` gets the 128 upstream seeds.
+- `pyproject.toml` gained `[tool.setuptools.package-data]` for `ipi.data` and (post-refactor)
+  `ipi.seed` `*.json`, so both the dataset and the seed registry ship in the wheel Kaggle installs.
 
 ### Verified
 
