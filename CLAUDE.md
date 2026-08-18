@@ -231,14 +231,18 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   `scripts/check_defensivetoken_fidelity.py` asserts byte-equality against the vendored upstream.
   Notebook: `experiments/defensivetoken_defense_notebook.ipynb`. Tokens are per-model and do not
   transfer; only the four models in `SUPPORTED_MODELS` have released weights.
-- **Seven attackers still default to `eval_mode="function_name"`, which no scenario uses.**
-  The benchmark is 180 `startswith` + 180 `contains`; `function_name` is the AgentDojo
-  convention. The four OPI static one-shots are unaffected in practice — one query, and
-  `AttackEvaluator` overwrites their verdict — but `beast`, `autodan` and `gcg` feed
-  `eval_mode` into their *early stopping* and best-candidate choice, so they run against a
-  criterion the dataset never satisfies. Switch them to `metrics.resolve_attack_target` when
-  migrating them (handoff §6a); it moves their query counts, so it is a measured change, not
-  a drive-by fix.
+- **`eval_mode` is owned by the data.** Every `*Attacker` defaults to `eval_mode=None` and
+  resolves it with `metrics.resolve_attack_target(instance, self.eval_mode)`; the benchmark
+  is 180 `startswith` + 180 `contains` and never `function_name` (that is the AgentDojo
+  convention). Pass a string only to force a deliberate deviation, and never add a
+  hard-coded default — a smoke check fails if you do. **`target_str` still has the same
+  shape of bug**: GCG and RS/Beam-RS pass `harness.resolve_optimization_target(instance)` and
+  the bare functions use that one string for both the loss *and* `check_ipi_success`, which
+  differ on 120 of 360 scenarios. See `docs/refactor-handoff.md` §6a.
+- **`n_queries` is not comparable across attacks.** BEAST reports a formula
+  (`new_gen_length * ngram * k1 * k2` = 9000, constant even when the budget cuts the run
+  short) and GCG counts forward passes (~513/step); both actually make ~1 victim call per
+  step. Don't put those two in the same avg_queries column as TAP/PAIR without saying so.
 - **PISanitizer is the closest published peer to our own defense** — attention-based, and
   prevention rather than detection. It is the only baseline that also defends an *API* victim,
   since only the sanitizer needs local weights. `PISanitizerDefense` subclasses `DefendedVictim`

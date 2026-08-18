@@ -55,7 +55,7 @@ the components) is 5 of 15 done, 4 more confirmed to need nothing, **3 left** �
 | E | `mutation/` — 31 operators, generation + rule | ✅ green |
 | F | `selector/` — 7 policies including real MCTS | ✅ green |
 | G | `constraint/` — `DeleteOffTopic` · `DeleteHarmLess` · `PerplexityConstraint` | ✅ green |
-| H | migrate the recipes onto the components | 🟡 5 done · 4 no-op · **3 left** (torch-gated) |
+| H | migrate the recipes onto the components | 🟡 5 done · 4 no-op · 3 audited, **decisions open** (§6a) |
 | I | the seam: `Instance` into `run_scenario`, delete the legacy modules, notebooks | ✅ green |
 
 ---
@@ -231,27 +231,85 @@ stops taking `IPIScenario`.
 
 ### 6a. What is left — `autodan`, `beast`, `gcg`
 
-All three are **torch-gated and could not be executed in this sandbox**, so they were left alone
-rather than edited blind. Do them on a machine with torch and a GPU. Concretely:
+All three are **torch-gated and have never been executed in this sandbox**. They were
+audited by reading; the audit changed the plan, so read this before following the older
+version of it.
 
-1. **`autodan`** — swap its inline sentence crossover and synonym replacement for
-   `mutation.rule.SentenceCrossOver` and `mutation.rule.ReplaceWordsWithSynonyms`. ⚠️ **Verify
-   equivalence first**: ours are ports of *EasyJailbreak's* versions, autodan.py's were written
-   from the AutoDAN repo. Diff the two implementations and run the GA both ways on one scenario
-   before swapping. Its GA population (`list[str]`) becomes an `AttackDataset`; `_score_candidates`
-   is the loss function `ReferenceLossSelector` generalises.
-2. **`mutation/gradient/`** — extract the token-gradient step from **our** `attacks/gcg.py`
-   (upstream's `MutationTokenGradient` needs their model layer). This is Phase E's one deferred
-   item.
-3. **`gcg` / `beast`** — candidates become `Instance`s; candidate selection becomes
-   `selector.ReferenceLossSelector`.
-4. **Re-check trap 5 for these three** before deleting any `judge=` parameter — it turned out to
-   be only half true for `adaptive` (see the trap).
-5. **Switch their `eval_mode` default from `"function_name"` to auto** via
-   `metrics.resolve_attack_target(instance)`, as the five EasyJailbreak ports already do. No
-   scenario in the benchmark is scored with `function_name`, so today these three early-stop and
-   pick their best candidate against a criterion that never fires (trap 19). This changes their
-   query counts, so measure it rather than folding it in silently.
+**Done for all three already:** they take an `Instance` (Phase I), their `eval_mode` is
+data-owned, and the GCG token-gradient step is extracted into `ipi/mutation/gradient.py`.
+
+#### The original plan, and why two thirds of it is wrong
+
+1. ~~**`autodan`** — swap its inline crossover and synonym replacement for
+   `mutation.rule.SentenceCrossOver` / `ReplaceWordsWithSynonyms`.~~ **Do not.** The
+   handoff said to verify equivalence first; verified, and they are not equivalent.
+
+   | | `rule.SentenceCrossOver` (EasyJailbreak) | `autodan._crossover` (AutoDAN repo) |
+   |---|---|---|
+   | degenerate case | `if num_swaps >= max_swaps: return str1, str2` | proceeds with `min(num_points, max_swaps)` |
+   | paragraphs | flattened — splits the whole text, rejoins with `" "` | split on `\n\n`, crossover **within** each paragraph, rejoined |
+   | sentence split | `(?<=[.!?])\s+` | `(?<=[,.!?])\s+` — also breaks on commas |
+   | swap-point range | `range(1, max_swaps)` | `range(1, max_swaps + 1)` |
+
+   The first row is the one that bites. AutoDAN's default is `num_points=5`, so any
+   template with **≤ 6 sentences returns its parents unchanged** — crossover silently
+   becomes a no-op for most of the 41-template IPI pool and the GA degenerates to
+   mutation-only. The second row matters because AutoDAN's seeds are multi-paragraph
+   role-play prompts.
+
+   The synonym pairing is a category error, not a near-miss.
+   `rule.ReplaceWordsWithSynonyms` is AutoDAN-**HGA**'s momentum word replacement, and
+   `autodan._hga_word_replace` already implements that — *more* completely (stop-words,
+   the protected model-name set, paragraph preservation, the ≤5-replacements cap, and a
+   real roulette wheel rather than sequential Bernoulli trials that can fall through
+   replacing nothing). `autodan._synonym_replace` is a different operator: the **GA**'s
+   fallback mutation when no `llm_mutator` is supplied. Neither substitutes for the other.
+
+   **If anything moves, it moves the other way** — `autodan`'s paragraph-aware versions
+   are the better implementations and are the ones worth promoting into `mutation/rule.py`.
+
+2. **`mutation/gradient.py`** — ✅ done. Six primitives, byte-identical (AST-compared
+   against the previous commit, since torch cannot run here).
+
+3. ~~**`gcg` / `beast`** — candidates become `Instance`s; selection becomes
+   `selector.ReferenceLossSelector`.~~ **Correct but ~100x slower, as written.**
+   `ReferenceLossSelector` re-encodes text and runs **one unbatched forward per
+   instance** — its `batch_size` argument is accepted, stored, and never used (a defect
+   in the Phase F component, fix it there first). GCG scores ~512 candidates per step in
+   batches of 128 that share the prompt prefix, at the token level, never touching text.
+   Converting is a real trade-off to measure, not a mechanical migration.
+
+4. **Trap 5 — confirmed dead for all three.** `self.judge` is never read in `beast.py`,
+   `autodan.py` or `gcg.py`, and none of `run_beast` / `run_autodan_ga` /
+   `run_autodan_hga` / `run_gcg` takes a `judge` at all. Either give it a job (gate early
+   stopping, as RS/Beam-RS now do) or delete the parameter.
+
+#### Defects found while auditing (none fixed — all move published numbers)
+
+- **BEAST never receives the injection goal.** `BEASTAttacker.run_scenario` passes
+  `prompt_prefix=self.prompt_prefix` — a constructor default,
+  `"Ignore previous instructions and "`. `instance.query` is used only to fill
+  `ScenarioResult.goal`. So BEAST optimises tokens after a generic prefix toward the
+  target string, and the scenario's actual instruction is never delivered to the victim.
+  This is the largest of the findings: BEAST is not attacking the scenario it reports on.
+- **BEAST has no early stopping.** Success is evaluated exactly once, after the whole
+  beam search. `eval_mode` therefore steers nothing in BEAST (unlike AutoDAN/GCG).
+- **BEAST's `n_queries` is a formula, not a count**: `new_gen_length * ngram * k1 * k2`
+  = 9000 at the defaults, constant even when `budget_seconds` cuts the run short. The
+  real victim-query count is 1.
+- **GCG's `n_queries` counts forward passes**: +1 per gradient, +`batch_size` (512) per
+  step, +1 per eval — roughly 513 per step against 1 actual victim query. Neither
+  BEAST's nor GCG's `avg_queries` is comparable to any other attack's.
+- **GCG and RS/Beam-RS check success against the *optimization* target, not the
+  evaluation target.** Both pass `harness.resolve_optimization_target(instance)` as
+  `target_str`, and the bare functions use that one string for both the loss and
+  `check_ipi_success`. The two differ in **120 of 360** scenarios (60 where
+  `optimization_target` is a strict prefix of `target_str`, 60 where they diverge
+  otherwise), so on those the attack stops early on a partial match. The fix is a second
+  parameter — `eval_target_str`, defaulting to `target_str` — so the loss and the verdict
+  can point at different strings. `AttackEvaluator` still overwrites the final verdict,
+  so this changes query counts and which candidate is returned, not ASR.
+- **`ReferenceLossSelector.batch_size` is accepted and never used** (see 3 above).
 
 ### 6b. Phase I — done
 
@@ -309,6 +367,15 @@ that compares against a pre-refactor run.
    evaluator only gates early stopping, so it changes query counts, not verdicts.
 
 **ICA's default demonstrations changed** (§9) — that moves ICA's ASR by construction.
+
+**5. `eval_mode` is now owned by the data.** Every Attacker class defaults to
+`eval_mode=None` and resolves it from the instance's `attack_eval_mode`. Seven attackers
+previously hard-coded `"function_name"`, which **no scenario in the benchmark uses** — the
+suite is 180 `startswith` + 180 `contains`. For the four OPI one-shots that was cosmetic;
+for RS, Beam-RS, AutoDAN and GCG it gated early stopping and best-candidate selection
+against a criterion that could never fire, so their **query counts drop**. ASR is
+unaffected — `AttackEvaluator` always recomputed it from the same metadata, which is
+exactly why the bug survived this long.
 
 **Phase I adds nothing to this list.** It moved the seam, not the arithmetic: the prompt the
 victim sees is byte-identical (the new loader's `pipeline_context` equals the old one's
@@ -424,14 +491,16 @@ with `prompt_num=5` is the paper-reproduction row.
     its own JSON format, the filter cannot parse `[[YES]]`/`[[NO]]`, and an unparseable answer
     keeps the candidate. `run_tap(on_topic_model=...)` now accepts a `UnifiedLLM` as well as a
     model string so a real judge can be passed.
-19. **Seven attackers default to `eval_mode="function_name"`, which no scenario in the benchmark
-    uses.** The dual-verifiable suite is 180 `startswith` + 180 `contains`; `function_name` is the
-    AgentDojo convention. The five EasyJailbreak ports auto-resolve, and the four OPI static
-    one-shots are unaffected in practice (one query, and `AttackEvaluator` overwrites their
-    verdict). **`beast`, `autodan` and `gcg` are not** — they feed `eval_mode` into their early
-    stopping and best-candidate choice, so they search against a criterion the benchmark never
-    satisfies. Left alone deliberately: fixing it changes their query counts, and they are the
-    three recipes that cannot be run here. Do it as part of §6a.
+19. **~~Seven attackers default to `eval_mode="function_name"`~~ — fixed; the shape of the
+    bug is the lesson.** No scenario in the benchmark uses `function_name` (180
+    `startswith` + 180 `contains`), yet seven attackers optimised toward it. It survived
+    because `AttackEvaluator` overwrites the final verdict, so the *reported* ASR stayed
+    plausible while each search was aimed at a string the data never asks for. **Any
+    parameter that both steers a search and is overwritten before reporting can be wrong
+    indefinitely without a visible symptom.** `eval_mode` is now data-owned everywhere and
+    pinned by a smoke check; `target_str` still has the same shape of bug in GCG and
+    RS/Beam-RS (§6a).
+
 20. **`ipi/attack_attrs` reads are `.get()`, not attribute access, and that is a hazard.**
     `Instance.__getattr__` raises on an unknown name, but `attack_attrs.get("user_taks")` returns
     `None` and the prompt comes out with an empty user task — a silently weaker attack, not a
