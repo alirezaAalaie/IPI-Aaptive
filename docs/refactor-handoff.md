@@ -55,7 +55,7 @@ the components) is 5 of 15 done, 4 more confirmed to need nothing, **3 left** �
 | E | `mutation/` — 31 operators, generation + rule | ✅ green |
 | F | `selector/` — 7 policies including real MCTS | ✅ green |
 | G | `constraint/` — `DeleteOffTopic` · `DeleteHarmLess` · `PerplexityConstraint` | ✅ green |
-| H | migrate the recipes onto the components | 🟡 5 done · 4 no-op · 3 audited, **decisions open** (§6a) |
+| H | migrate the recipes onto the components | ✅ 5 composed · 4 no-op · 3 audited + defects fixed; structural swap declined with reasons (§6a) |
 | I | the seam: `Instance` into `run_scenario`, delete the legacy modules, notebooks | ✅ green |
 
 ---
@@ -284,32 +284,55 @@ data-owned, and the GCG token-gradient step is extracted into `ipi/mutation/grad
    `run_autodan_hga` / `run_gcg` takes a `judge` at all. Either give it a job (gate early
    stopping, as RS/Beam-RS now do) or delete the parameter.
 
-#### Defects found while auditing (none fixed — all move published numbers)
+#### Defects found while auditing — all four fixed
 
-- **BEAST never receives the injection goal.** `BEASTAttacker.run_scenario` passes
-  `prompt_prefix=self.prompt_prefix` — a constructor default,
-  `"Ignore previous instructions and "`. `instance.query` is used only to fill
-  `ScenarioResult.goal`. So BEAST optimises tokens after a generic prefix toward the
-  target string, and the scenario's actual instruction is never delivered to the victim.
-  This is the largest of the findings: BEAST is not attacking the scenario it reports on.
-- **BEAST has no early stopping.** Success is evaluated exactly once, after the whole
-  beam search. `eval_mode` therefore steers nothing in BEAST (unlike AutoDAN/GCG).
-- **BEAST's `n_queries` is a formula, not a count**: `new_gen_length * ngram * k1 * k2`
-  = 9000 at the defaults, constant even when `budget_seconds` cuts the run short. The
-  real victim-query count is 1.
-- **GCG's `n_queries` counts forward passes**: +1 per gradient, +`batch_size` (512) per
-  step, +1 per eval — roughly 513 per step against 1 actual victim query. Neither
-  BEAST's nor GCG's `avg_queries` is comparable to any other attack's.
-- **GCG and RS/Beam-RS check success against the *optimization* target, not the
-  evaluation target.** Both pass `harness.resolve_optimization_target(instance)` as
-  `target_str`, and the bare functions use that one string for both the loss and
-  `check_ipi_success`. The two differ in **120 of 360** scenarios (60 where
-  `optimization_target` is a strict prefix of `target_str`, 60 where they diverge
-  otherwise), so on those the attack stops early on a partial match. The fix is a second
-  parameter — `eval_target_str`, defaulting to `target_str` — so the loss and the verdict
-  can point at different strings. `AttackEvaluator` still overwrites the final verdict,
-  so this changes query counts and which candidate is returned, not ASR.
-- **`ReferenceLossSelector.batch_size` is accepted and never used** (see 3 above).
+Each moves published numbers; none moves ASR, because `AttackEvaluator` always recomputed
+that from the instance's own ground truth. That is precisely why all four survived.
+
+1. **BEAST never received the injection goal.** `run_scenario` passed
+   `prompt_prefix=self.prompt_prefix` — a *constructor default*,
+   `"Ignore previous instructions and "`. `instance.query` was used only to fill
+   `ScenarioResult.goal`. BEAST optimised tokens after a generic prefix toward the target
+   string and never delivered the scenario's instruction to the victim: it was attacking
+   something other than the row it reported. **Fixed** — `run_scenario` now composes
+   `prompt_prefix + instance.query` (inserting a separating space when the prefix lacks
+   one) and both docstrings say the prefix is framing, not the whole prompt. **Every
+   pre-existing BEAST number is void.**
+2. **GCG and RS/Beam-RS judged success against the *optimisation* target.** Both passed
+   `harness.resolve_optimization_target(instance)` as `target_str`, and the bare functions
+   used that one string for the loss/logprob *and* for `check_ipi_success`. The two differ
+   on **120 of 360** scenarios (60 where `optimization_target` is a strict prefix of
+   `target_str` — `'www.evil-exfil.com'` vs `'www.evil-exfil.com/leak'` — and 60 diverging
+   otherwise), so on those the attack declared victory on a partial match. **Fixed** —
+   `run_gcg`, `run_adaptive_rs` and `run_adaptive_beam` take `eval_target_str`, defaulting
+   to `target_str`; `run_scenario` passes the optimisation target for the search and the
+   resolved eval target for the verdict. Pinned by three cases in `smoke_check.py` that
+   run RS against a mock victim producing only the prefix.
+3. **`n_queries` was not a query count.** BEAST returned
+   `new_gen_length * ngram * k1 * k2` = 9000 at the defaults — a constant, unchanged even
+   when `budget_seconds` cut the run short. GCG counted forward passes: +1 per gradient,
+   +512 per candidate batch, +1 per eval ≈ 513 per step. Both actually call the victim
+   ~once per step. **Fixed** — `n_queries` now means "calls to the victim" in both, as it
+   already did everywhere else, and the compute count moved to a new `n_forward_passes`
+   field on `BEASTResult`/`GCGResult`, surfaced in `ScenarioResult.extra`. BEAST's count
+   is also now derived from steps actually run, so a budget cut-off is visible.
+4. **BEAST has no early stopping.** Success is evaluated once, after the whole beam
+   search, so `eval_mode` steers nothing there (unlike AutoDAN and GCG). Not a bug to fix
+   — it is what the algorithm does — but it means BEAST cannot end early on a hit, and its
+   `n_queries` is 1 by construction. Recorded so nobody reads its flat query count as a
+   bug.
+
+Still open, deliberately: **`ReferenceLossSelector.batch_size` is accepted and never
+used** (see 3 in the plan above). Fix it there before anyone reconsiders the gcg/beast
+conversion, since it is what makes that conversion expensive.
+
+#### Scope call: the structural migration stops here
+
+`autodan`, `beast` and `gcg` take an `Instance`, are data-owned on `eval_mode`, and share
+`mutation/gradient.py`. They do **not** hold `AttackDataset` populations or select through
+`ReferenceLossSelector`, and that is deliberate — for `autodan` the swap is wrong (it
+disables crossover), and for `gcg`/`beast` it is a large measured slowdown rather than a
+mechanical migration. Revisit on a GPU machine, with the selector's batching fixed first.
 
 ### 6b. Phase I — done
 
@@ -376,6 +399,13 @@ for RS, Beam-RS, AutoDAN and GCG it gated early stopping and best-candidate sele
 against a criterion that could never fire, so their **query counts drop**. ASR is
 unaffected — `AttackEvaluator` always recomputed it from the same metadata, which is
 exactly why the bug survived this long.
+
+**6. BEAST now receives the injection goal**, and **7. GCG / RS / Beam-RS now judge
+success against the evaluation target rather than the optimisation target** (both §6a).
+BEAST's previous numbers are void; the other three change query counts and which candidate
+is returned, not ASR. **8. `n_queries` means victim calls** for BEAST and GCG, where it
+used to mean forward passes — their `avg_queries` drops by orders of magnitude and becomes
+comparable with the rest of the table for the first time.
 
 **Phase I adds nothing to this list.** It moved the seam, not the arithmetic: the prompt the
 victim sees is byte-identical (the new loader's `pipeline_context` equals the old one's

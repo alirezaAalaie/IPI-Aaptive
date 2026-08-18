@@ -235,14 +235,20 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   resolves it with `metrics.resolve_attack_target(instance, self.eval_mode)`; the benchmark
   is 180 `startswith` + 180 `contains` and never `function_name` (that is the AgentDojo
   convention). Pass a string only to force a deliberate deviation, and never add a
-  hard-coded default — a smoke check fails if you do. **`target_str` still has the same
-  shape of bug**: GCG and RS/Beam-RS pass `harness.resolve_optimization_target(instance)` and
-  the bare functions use that one string for both the loss *and* `check_ipi_success`, which
-  differ on 120 of 360 scenarios. See `docs/refactor-handoff.md` §6a.
-- **`n_queries` is not comparable across attacks.** BEAST reports a formula
-  (`new_gen_length * ngram * k1 * k2` = 9000, constant even when the budget cuts the run
-  short) and GCG counts forward passes (~513/step); both actually make ~1 victim call per
-  step. Don't put those two in the same avg_queries column as TAP/PAIR without saying so.
+  hard-coded default — a smoke check fails if you do.
+- **The optimisation target and the eval target are two different strings.** GCG, RS and
+  Beam-RS optimise toward `harness.resolve_optimization_target(instance)` — which must be a
+  real token sequence — and judge success against `eval_target_str`, the instance's own
+  `target_str`. They differ on 120 of 360 scenarios, and collapsing them makes the search
+  stop on a partial match. Any new search attack needs both.
+- **`n_queries` means calls to the victim, everywhere.** Model forward/backward passes go in
+  `n_forward_passes` (on `BEASTResult`/`GCGResult`, surfaced in `ScenarioResult.extra`).
+  BEAST used to report `new_gen_length * ngram * k1 * k2` as its query count and GCG ~513
+  per step; both actually query once per step. Keep the two counters distinct or the
+  avg_queries column stops meaning anything.
+- **BEAST's `prompt_prefix` is framing, not the whole prompt.** `run_scenario` appends
+  `instance.query` to it. Passing it alone — which the code did until this was found —
+  means BEAST optimises tokens for an instruction the victim never sees.
 - **PISanitizer is the closest published peer to our own defense** — attention-based, and
   prevention rather than detection. It is the only baseline that also defends an *API* victim,
   since only the sanitizer needs local weights. `PISanitizerDefense` subclasses `DefendedVictim`

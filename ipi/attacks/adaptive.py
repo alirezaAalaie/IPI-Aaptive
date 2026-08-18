@@ -578,6 +578,7 @@ def run_adaptive_rs(
     goal: str,
     target_llm: Victim,
     target_str: str,
+    eval_target_str: Optional[str] = None,
     judge: Optional[Evaluator] = None,
     # Template
     prompt_template: str = "ipi_tool",
@@ -639,6 +640,14 @@ def run_adaptive_rs(
         deterministic_jailbreak: Stop as soon as target_token becomes argmax.
         target_max_n_tokens: Max tokens for full response generation.
         judge_max_n_calls:  Max judge calls per restart.
+        eval_target_str:   The string success is *checked* against, when it differs
+                           from the one whose first-token logprob the search maximises.
+                           None means "same as target_str". For IPI they differ on 120
+                           of the 360 dual-verifiable scenarios: target_str is the
+                           instance's optimization_target (a short real token sequence,
+                           which the logprob search requires) while success is judged
+                           against its longer target_str. Checking the short one makes
+                           the search stop early on a partial match.
         eval_mode:         check_ipi_success mode (normally resolved from the
                            instance by RSAttacker/BeamRSAttacker, not here).
         target_token:      First token to maximize. "" = auto from target_str.
@@ -652,6 +661,9 @@ def run_adaptive_rs(
     """
     random.seed(seed)
     np.random.seed(seed)
+
+    # What the search optimises toward vs what success is judged against.
+    eval_target = eval_target_str or target_str
 
     is_local = target_llm.backend == "local"
     tokenizer = target_llm.tokenizer if is_local else None
@@ -747,7 +759,7 @@ def run_adaptive_rs(
                 logprob_dict = target_llm.get_first_token_logprobs(eval_msgs)
                 logprob = _extract_logprob(logprob_dict, target_token)
 
-                ipi_success = check_ipi_success(final_response, target_str, eval_mode)
+                ipi_success = check_ipi_success(final_response, eval_target, eval_mode)
                 if ipi_success:
                     judge_ok = True
                     if judge is not None and judge_n_calls < judge_max_n_calls:
@@ -819,7 +831,7 @@ def run_adaptive_rs(
             )
             n_queries += 1
 
-        ipi_success = check_ipi_success(final_response, target_str, eval_mode)
+        ipi_success = check_ipi_success(final_response, eval_target, eval_mode)
 
         best_overall.n_queries += n_queries
         best_overall.n_iterations_done += it
@@ -845,6 +857,7 @@ def run_adaptive_beam(
     goal: str,
     target_llm: Victim,
     target_str: str,
+    eval_target_str: Optional[str] = None,
     judge: Optional[Evaluator] = None,
     # Template
     prompt_template: str = "ipi_tool",
@@ -894,6 +907,9 @@ def run_adaptive_beam(
     """
     random.seed(seed)
     np.random.seed(seed)
+
+    # What the search optimises toward vs what success is judged against.
+    eval_target = eval_target_str or target_str
 
     is_local = target_llm.backend == "local"
     tokenizer = target_llm.tokenizer if is_local else None
@@ -1020,7 +1036,7 @@ def run_adaptive_beam(
             n_queries += 1
             best_injection = best_beam_msg
 
-            if check_ipi_success(best_response, target_str, eval_mode):
+            if check_ipi_success(best_response, eval_target, eval_mode):
                 judge_ok = True
                 if judge is not None:
                     score = judge.score(best_beam_msg, best_response, attacker_goal=goal)
@@ -1048,7 +1064,7 @@ def run_adaptive_beam(
     n_queries += 1
 
     return AdaptiveResult(
-        success=check_ipi_success(best_response, target_str, eval_mode),
+        success=check_ipi_success(best_response, eval_target, eval_mode),
         logprob=beam_logprobs[0],
         injection=best_beam_msg,
         adv=beam_advs[0],
@@ -1115,9 +1131,10 @@ class RSAttacker(AdaptiveAttacker):
 
     def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
         from ..metrics import ScenarioResult, resolve_attack_target
-        # The optimization target drives the logprob search; the eval mode comes from
-        # the data — the instance decides how it is scored, never the attacker.
-        _, eval_mode = resolve_attack_target(instance, self.eval_mode)
+        # Two different strings, deliberately: the optimization target drives the
+        # logprob search (it must be a real token sequence), while success is judged
+        # against the instance's own target_str and eval_mode. The data decides both.
+        eval_target, eval_mode = resolve_attack_target(instance, self.eval_mode)
         r = run_adaptive_rs(
             goal=instance.query,
             target_llm=target,
@@ -1125,6 +1142,7 @@ class RSAttacker(AdaptiveAttacker):
             # A short literal for RS token-logprob maximization — never a sentinel.
             # See harness.resolve_optimization_target for the fallback order.
             target_str=resolve_optimization_target(instance),
+            eval_target_str=eval_target,
             prompt_template=self.prompt_template,
             n_tokens_adv=self.n_tokens_adv,
             n_tokens_change_max=self.n_tokens_change_max,
@@ -1211,14 +1229,16 @@ class BeamRSAttacker(AdaptiveAttacker):
 
     def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
         from ..metrics import ScenarioResult, resolve_attack_target
-        # The optimization target drives the logprob search; the eval mode comes from
-        # the data — the instance decides how it is scored, never the attacker.
-        _, eval_mode = resolve_attack_target(instance, self.eval_mode)
+        # Two different strings, deliberately: the optimization target drives the
+        # logprob search (it must be a real token sequence), while success is judged
+        # against the instance's own target_str and eval_mode. The data decides both.
+        eval_target, eval_mode = resolve_attack_target(instance, self.eval_mode)
         r = run_adaptive_beam(
             goal=instance.query,
             target_llm=target,
             judge=self.judge,
             target_str=resolve_optimization_target(instance),
+            eval_target_str=eval_target,
             prompt_template=self.prompt_template,
             n_tokens_adv=self.n_tokens_adv,
             n_tokens_change_max=self.n_tokens_change_max,

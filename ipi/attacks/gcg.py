@@ -91,7 +91,8 @@ class GCGResult:
     adv_suffix: str           # optimised adversarial suffix (decoded)
     adv_suffix_ids: list[int] # raw suffix token ids
     target_response: str      # agent's response to the best injection
-    n_queries: int            # approximate forward + backward passes
+    n_queries: int            # calls to the victim (target_fn) — comparable across attacks
+    n_forward_passes: int     # forward + backward passes through the model (compute, not queries)
     n_steps: int              # iterations completed
     time_seconds: float
     adv_prefix: str
@@ -101,7 +102,8 @@ class GCGResult:
     def __repr__(self) -> str:
         return (
             f"GCGResult(success={self.success}, best_loss={self.best_loss:.4f}, "
-            f"n_queries={self.n_queries}, n_steps={self.n_steps}, "
+            f"n_queries={self.n_queries}, fwd={self.n_forward_passes}, "
+            f"n_steps={self.n_steps}, "
             f"time={self.time_seconds:.1f}s)"
         )
 
@@ -129,6 +131,7 @@ def run_gcg(
     adv_prefix: str,
     target_str: str,
     target_llm: Victim,
+    eval_target_str: Optional[str] = None,
     # Eval
     eval_target_fn: Optional[Callable[[str], str]] = None,
     eval_mode: str = "contains",
@@ -159,8 +162,14 @@ def run_gcg(
         adv_prefix:        Fixed text prepended to the adversarial suffix.
                            For IPI: the injection context / instruction start.
                            E.g. "Ignore all previous instructions and ".
-        target_str:        The desired agent output / tool call.
-                           E.g. "send_email(to='evil@x.com')".
+        target_str:        The string the CE loss optimises toward. Must be a real token
+                           sequence — for IPI this is the instance's
+                           ``optimization_target``, never a sentinel like "__base64__".
+        eval_target_str:   The string success is *checked* against, if different. None
+                           (default) means "same as target_str". These differ on 120 of
+                           the 360 dual-verifiable scenarios (``optimization_target`` is
+                           often a shorter literal than ``target_str``), and checking
+                           against the short one makes GCG stop early on a partial match.
         target_llm:        Must be a LocalLLM (backend='local'). GCG requires
                            white-box gradient access.
         eval_target_fn:    Optional callable(injection: str) -> response: str.
@@ -220,11 +229,15 @@ def run_gcg(
     else:
         target_list = [(adv_prefix, target_str)]
 
+    # What the loss optimises toward vs what success is judged against.
+    eval_target = eval_target_str or target_str
+
     start_time = time.time()
     best_loss   = float("inf")
     best_ids    = list(adv_suffix_ids)
     best_response = ""
-    n_queries   = 0
+    n_queries   = 0      # victim calls only — comparable with every other attack
+    n_forward   = 0      # forward/backward passes — compute, not queries
     trace: list[dict] = []
 
     for step in range(num_steps):
@@ -251,7 +264,7 @@ def run_gcg(
                 suffix_slice=suffix_slice,
                 target_slice=target_slice,
             )
-            n_queries += 1
+            n_forward += 1
             grad_accum = grads if grad_accum is None else grad_accum + grads
 
         if grad_accum is None:
@@ -289,7 +302,7 @@ def run_gcg(
                 candidate_ids=candidates,
                 batch_size_eval=batch_size_eval,
             )
-            n_queries += candidates.shape[0]
+            n_forward += candidates.shape[0]
             cand_losses += losses_i
 
         cand_losses /= len(target_list)
@@ -318,7 +331,7 @@ def run_gcg(
         n_queries += 1
         best_response = response
 
-        success = check_ipi_success(response, target_str, eval_mode)
+        success = check_ipi_success(response, eval_target, eval_mode)
 
         if verbose:
             elapsed = time.time() - start_time
@@ -346,6 +359,7 @@ def run_gcg(
                 adv_suffix_ids=best_ids,
                 target_response=response,
                 n_queries=n_queries,
+                n_forward_passes=n_forward,
                 n_steps=step + 1,
                 time_seconds=time.time() - start_time,
                 adv_prefix=adv_prefix,
@@ -363,18 +377,20 @@ def run_gcg(
     # Final eval
     if eval_target_fn is not None:
         best_response = eval_target_fn(full_injection)
+        n_queries += 1
     elif not best_response:
         best_response = target_llm(full_injection)
         n_queries += 1
 
     return GCGResult(
-        success=check_ipi_success(best_response, target_str, eval_mode),
+        success=check_ipi_success(best_response, eval_target, eval_mode),
         best_loss=best_loss,
         injection=full_injection,
         adv_suffix=best_suffix_decoded,
         adv_suffix_ids=best_ids,
         target_response=best_response,
         n_queries=n_queries,
+        n_forward_passes=n_forward,
         n_steps=num_steps,
         time_seconds=time.time() - start_time,
         adv_prefix=adv_prefix,
@@ -451,13 +467,16 @@ class GCGAttacker(AdaptiveAttacker):
         from ..harness import make_target_fn, resolve_optimization_target
         from ..metrics import ScenarioResult, resolve_attack_target
         target_fn = make_target_fn(instance, target)
-        # The optimization target drives the CE loss; the eval mode comes from the data.
-        _, eval_mode = resolve_attack_target(instance, self.eval_mode)
+        # Two different strings, deliberately: the optimization target drives the CE
+        # loss (it must be a real token sequence), while success is judged against the
+        # instance's own target_str and eval_mode. They differ on 120/360 scenarios.
+        eval_target, eval_mode = resolve_attack_target(instance, self.eval_mode)
         r = run_gcg(
             adv_prefix=self.adv_prefix,
             # optimization_target: tokenized as the full CE-loss target sequence.
             # Must be a real string — never a sentinel like __base64__.
             target_str=resolve_optimization_target(instance),
+            eval_target_str=eval_target,
             target_llm=target,
             eval_target_fn=target_fn,
             eval_mode=eval_mode,
@@ -485,6 +504,7 @@ class GCGAttacker(AdaptiveAttacker):
                 "best_loss": r.best_loss,
                 "n_steps": r.n_steps,
                 "adv_suffix": r.adv_suffix,
+                "n_forward_passes": r.n_forward_passes,
                 "time_seconds": r.time_seconds,
             },
         )
