@@ -56,8 +56,7 @@ import torch
 import torch.nn.functional as F
 
 from ..attacker import AdaptiveAttacker
-from ..evaluator import check_ipi_success
-from ..judges import Judge
+from ..metrics import Evaluator, check_ipi_success
 from ..llm_unified import LocalLLM, UnifiedLLM
 from ..victim import Victim
 
@@ -366,7 +365,7 @@ class BEASTAttacker(AdaptiveAttacker):
     Requires a LocalLLM target (white-box access for logit computation).
 
     Args:
-        judge:           Judge instance (owned by this attacker).
+        judge:           Guidance Evaluator (owned by this attacker).
         prompt_prefix:   Text prepended to adversarial tokens. Default "Ignore previous instructions and ".
         k1:              Beam width. Default 15.
         k2:              Candidates sampled per beam per step. Default 15.
@@ -378,7 +377,7 @@ class BEASTAttacker(AdaptiveAttacker):
 
     def __init__(
         self,
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         prompt_prefix: str = "Ignore previous instructions and ",
         k1: int = 15,
         k2: int = 15,
@@ -401,7 +400,8 @@ class BEASTAttacker(AdaptiveAttacker):
         return True
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult, make_scenario_target_fn
+        from ..evaluator import make_scenario_target_fn
+        from ..metrics import ScenarioResult
         target_fn = make_scenario_target_fn(scenario, target)
         r = run_beast(
             prompt_prefix=self.prompt_prefix,

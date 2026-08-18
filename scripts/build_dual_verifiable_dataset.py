@@ -11,7 +11,7 @@ This script constructs a dataset of ~360 scenarios combining:
      URL exfil, Identity change, DAN mode).
 
 Outputs:
-  ipi/datasets/dual_verifiable_dataset.json
+  ipi/data/dual_verifiable_dataset.json
 """
 
 import json
@@ -892,6 +892,6 @@ def build_dataset(output_path: str) -> None:
 if __name__ == "__main__":
     target_json = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "../ipi/datasets/dual_verifiable_dataset.json"
+        "../ipi/data/dual_verifiable_dataset.json"
     )
     build_dataset(target_json)

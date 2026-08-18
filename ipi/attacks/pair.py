@@ -6,7 +6,7 @@ in Twenty Queries"
 
 IPI adaptations:
   - Attacker system prompt replaced with IPI-specific version (single-task mode).
-  - All four judge types supported (EditDistance, IPILLMJudge, GPTJudge, Keyword).
+  - Any guidance evaluator works (edit distance, IPI/generative LLM judge, keyword).
   - JSON output key is "injection_string" instead of "prompt" for IPI modes.
   - Structured feedback: score + agent response + optional tool calls.
   - Conversation history truncated to avoid context overflow (keep system + last 6 turns).
@@ -17,23 +17,32 @@ Modes:
 
 Stream diversity: each of the n_streams parallel conversations receives a
 different strategy hint in its first message to encourage diverse attack angles.
+
+Composition
+-----------
+Each stream is an ``Instance``: ``jailbreak_prompt`` is its current injection,
+``target_responses[-1]`` the victim's reply, ``eval_results[-1]`` the judge's score, and
+the attacker transcript rides in ``attack_attrs["conv"]``. Scoring goes through whatever
+``metrics`` evaluator sits in ``judge=``, on the dataset path. Each refinement is recorded
+with ``MutationBase.new_child``, so a stream is a chain whose ``level`` counts iterations.
+PAIR has no pruning step, so — unlike TAP — no selector or constraint is involved; that
+absence is the algorithm, not an omission.
 """
 import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 from ..attacker import JudgeGuidedAttacker
+from ..datasets import AttackDataset, Instance
 from ..config import (
     ATTACK_TEMP, ATTACK_TOP_P, ATTACK_MAX_TOKENS,
     MAX_ATTACK_ATTEMPTS, PAIR_N_STREAMS, PAIR_N_ITERATIONS,
 )
-from ..judges import Judge
+from ..metrics import Evaluator
 from ..llm_unified import APILLM, UnifiedLLM, parse_json_response
+from ..mutation import MutationBase
 from ..victim import Victim
-from ..prompts import (
-    get_attacker_prompt_original,
-    ATTACKER_PROMPT_IPI_SINGLE,
-)
+from ..seed import SeedTemplate, render
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +121,7 @@ def run_pair(
     goal: str,
     target_fn: Callable[[str], str],
     attacker_model: Union[str, UnifiedLLM],
-    judge: Judge,
+    judge: Evaluator,
     n_streams: int = PAIR_N_STREAMS,
     n_iterations: int = PAIR_N_ITERATIONS,
     prompt_mode: str = "ipi_single",
@@ -135,7 +144,7 @@ def run_pair(
         target_fn:      Callable(injection: str) -> response: str.
                         Your defended victim pipeline.
         attacker_model: litellm model string.
-        judge:          Judge instance.
+        judge:          Guidance Evaluator (ipi.metrics).
         n_streams:      Number of parallel attack streams.
         n_iterations:   Max iterations.
         prompt_mode:    "ipi_single" | "original"
@@ -154,13 +163,16 @@ def run_pair(
     req_key = _inj_key(prompt_mode)
     hints = _IPI_STRATEGY_HINTS if prompt_mode != "original" else _ORIGINAL_STRATEGY_HINTS
 
-    system_prompt = (
-        ATTACKER_PROMPT_IPI_SINGLE
-        if prompt_mode != "original"
-        else get_attacker_prompt_original(
-            goal=goal,
-            target_str=context.get("target_str", ""),
-        )
+    # Attacker system prompt from the seed registry (attack.PAIR.<variant>). Only the
+    # ``original`` framing carries {query}/{target_str}; the IPI one is goal-agnostic,
+    # so rendering it is a no-op.
+    system_prompt = render(
+        SeedTemplate().new_seeds(
+            prompt_usage="attack", method_list=["PAIR"],
+            variant="original" if prompt_mode == "original" else "ipi",
+        )[0],
+        goal,
+        target_str=context.get("target_str", ""),
     )
 
     if isinstance(attacker_model, UnifiedLLM):
@@ -173,20 +185,30 @@ def run_pair(
             max_tokens=ATTACK_MAX_TOKENS,
         )
 
-    # Initialize streams with different strategy hints
+    # One Instance per stream. ``jailbreak_prompt`` is that stream's current injection,
+    # ``eval_results[-1]`` its score, and the attacker transcript rides in
+    # ``attack_attrs["conv"]`` — the same carrier layout TAP uses, minus the tree.
+    target_str = context.get("target_str", "")
     streams = []
     for i in range(n_streams):
         hint = hints[i % len(hints)]
         init_msg = _make_stream_init(goal, context, hint, prompt_mode)
-        streams.append({
-            "conv": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": init_msg},
-            ],
-            "injection": "",
-            "score": 0,
-            "response": "",
-        })
+        streams.append(Instance(
+            id=f"stream-{i}",
+            query=goal,
+            jailbreak_prompt="",
+            reference_responses=[target_str] if target_str else [],
+            attack_attrs={
+                "conv": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": init_msg},
+                ],
+                "stream": i,
+                "user_task": context.get("user_task", ""),
+                "target_tool_calls": context.get("target_tool_calls", ""),
+                "actual_tools_called": context.get("actual_tools_called", ""),
+            },
+        ))
 
     best_injection = ""
     best_response  = ""
@@ -204,7 +226,7 @@ def run_pair(
             raw = ""
             for attempt in range(MAX_ATTACK_ATTEMPTS):
                 try:
-                    raw = attacker(stream["conv"])
+                    raw = attacker(stream.attack_attrs["conv"])
                     parsed = parse_json_response(raw, required_keys=[req_key])
                     if parsed and parsed.get(req_key):
                         injection = parsed[req_key]
@@ -216,7 +238,7 @@ def run_pair(
                 log.debug("[PAIR] stream=%d: no valid injection.", i)
                 continue
 
-            stream["conv"].append({"role": "assistant", "content": raw})
+            stream.attack_attrs["conv"].append({"role": "assistant", "content": raw})
 
             # ---- QUERY TARGET ----------------------------------------------
             try:
@@ -227,20 +249,16 @@ def run_pair(
             n_queries += 1
 
             # ---- JUDGE -----------------------------------------------------
-            judge_ctx = {
-                "attacker_goal":       goal,
-                "user_task":           context.get("user_task", ""),
-                "target_tool_calls":   context.get("target_tool_calls", ""),
-                "actual_tools_called": context.get("actual_tools_called", ""),
-            }
-            s = judge.score(injection, response, **judge_ctx)
-
-            stream["injection"] = injection
-            stream["score"]     = s
-            stream["response"]  = response
+            # The judge reads goal / injection / response / IPI context straight off the
+            # Instance; the context fields were put in attack_attrs at construction.
+            stream.jailbreak_prompt = injection
+            stream.target_responses = [response]
+            judge(AttackDataset([stream]))
+            s = Evaluator.as_score(stream.eval_results[-1]) if stream.eval_results else 1
+            stream.eval_results = [s]
 
             trace.append({
-                "iteration": it + 1, "stream": i,
+                "iteration": it + 1, "stream": i, "level": stream.level,
                 "injection": injection, "response": response, "score": s,
             })
 
@@ -254,12 +272,22 @@ def run_pair(
 
             # ---- UPDATE STREAM ---------------------------------------------
             feedback = _make_feedback(response, s, prompt_mode)
-            stream["conv"].append({"role": "user", "content": feedback})
+            conv = stream.attack_attrs["conv"]
+            conv.append({"role": "user", "content": feedback})
 
             # Truncate: keep system prompt + last 6 turns (12 messages) to
             # avoid hitting context limits on long runs
-            if len(stream["conv"]) > 13:
-                stream["conv"] = stream["conv"][:1] + stream["conv"][-12:]
+            if len(conv) > 13:
+                conv = conv[:1] + conv[-12:]
+
+            # Record the refinement as a lineage step: each iteration is a child of the
+            # previous attempt on this stream, so `level` counts refinements and the
+            # trace is a chain rather than a flat list.
+            refined = MutationBase.new_child(stream)
+            refined.attack_attrs["conv"] = conv
+            refined.target_responses = []
+            refined.eval_results = []
+            streams[i] = refined
 
         # ---- EARLY STOP (after all streams each iteration) -----------------
         if judge.is_success(best_score):
@@ -295,7 +323,7 @@ class PAIRAttacker(JudgeGuidedAttacker):
     PAIR (Prompt Automatic Iterative Refinement) attacker class.
 
     Args:
-        judge:         Judge instance (owned by this attacker).
+        judge:         Guidance Evaluator (owned by this attacker).
         attacker_llm:  APILLM instance (or model string) for generating injections.
         n_streams:     Parallel attack streams. Default 3.
         n_iterations:  Max iterations per stream. Default 10.
@@ -304,7 +332,7 @@ class PAIRAttacker(JudgeGuidedAttacker):
 
     def __init__(
         self,
-        judge: Judge,
+        judge: Evaluator,
         attacker_llm: Union[str, APILLM],
         n_streams: int = PAIR_N_STREAMS,
         n_iterations: int = PAIR_N_ITERATIONS,
@@ -321,7 +349,8 @@ class PAIRAttacker(JudgeGuidedAttacker):
         self.prompt_mode  = prompt_mode
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult, make_scenario_target_fn
+        from ..evaluator import make_scenario_target_fn
+        from ..metrics import ScenarioResult
         target_fn = make_scenario_target_fn(scenario, target)
         r = run_pair(
             goal=scenario.injection_goal,

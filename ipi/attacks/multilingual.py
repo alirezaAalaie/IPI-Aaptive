@@ -48,8 +48,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 from ..attacker import StaticAttacker
-from ..evaluator import check_ipi_success
-from ..judges import Judge
+from ..metrics import Evaluator, check_ipi_success
 from ..llm_unified import APILLM, UnifiedLLM
 from ..victim import Victim
 
@@ -151,7 +150,7 @@ class MultilingualResult:
 def run_multilingual(
     goal: str,
     target_fn: Callable[[str], str],
-    judge: Optional[Judge] = None,
+    judge: Optional[Evaluator] = None,
     languages: Optional[dict[str, str]] = None,
     translator: Optional[Callable[[str, str], str]] = None,
     translator_llm: Optional[Union[str, UnifiedLLM]] = None,
@@ -165,7 +164,7 @@ def run_multilingual(
     Args:
         goal:           Attacker injection goal (English).
         target_fn:      Callable(injection: str) -> response: str.
-        judge:          Optional Judge for scoring.
+        judge:          Optional guidance Evaluator (ipi.metrics) for scoring.
         languages:      {code: name} map. Default: the nine from Deng et al.
         translator:     Optional Callable(text, dest_code) -> translated text.
         translator_llm: Optional LLM (or model string) translator. Used if ``translator``
@@ -241,7 +240,7 @@ class MultilingualAttacker(StaticAttacker):
     translation is often a near-free bypass.
 
     Args:
-        judge:          Optional Judge for scoring.
+        judge:          Optional guidance Evaluator (ipi.metrics) for scoring.
         languages:      {code: name} map. Default: the nine from the paper.
         translator:     Optional Callable(text, dest_code) -> str.
         translator_llm: Optional LLM (or model string) translator, used if ``translator``
@@ -256,7 +255,7 @@ class MultilingualAttacker(StaticAttacker):
 
     def __init__(
         self,
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         languages: Optional[dict[str, str]] = None,
         translator: Optional[Callable[[str, str], str]] = None,
         translator_llm: Optional[Union[str, UnifiedLLM]] = None,
@@ -275,7 +274,8 @@ class MultilingualAttacker(StaticAttacker):
         return False
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult, make_scenario_target_fn, resolve_attack_target
+        from ..evaluator import make_scenario_target_fn
+        from ..metrics import ScenarioResult, resolve_attack_target
         target_fn = make_scenario_target_fn(scenario, target)
         target_str, eval_mode = resolve_attack_target(scenario, self.eval_mode)
 

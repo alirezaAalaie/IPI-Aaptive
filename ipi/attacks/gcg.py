@@ -72,8 +72,7 @@ import torch
 import torch.nn.functional as F
 
 from ..attacker import AdaptiveAttacker
-from ..evaluator import check_ipi_success
-from ..judges import Judge
+from ..metrics import Evaluator, check_ipi_success
 from ..victim import Victim
 
 log = logging.getLogger(__name__)
@@ -619,7 +618,7 @@ class GCGAttacker(AdaptiveAttacker):
     the desired tool-call / action string.
 
     Args:
-        judge:              Judge instance (owned by this attacker).
+        judge:              Guidance Evaluator (owned by this attacker).
         adv_prefix:         Fixed prefix prepended to the adversarial suffix.
                             Default: "Ignore previous instructions and ".
         adv_suffix_len:     Number of adversarial suffix tokens. Default 20.
@@ -636,7 +635,7 @@ class GCGAttacker(AdaptiveAttacker):
 
     def __init__(
         self,
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         adv_prefix: str = "Ignore previous instructions and ",
         adv_suffix_len: int = 20,
         num_steps: int = 500,
@@ -667,7 +666,8 @@ class GCGAttacker(AdaptiveAttacker):
         return True
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult, make_scenario_target_fn
+        from ..evaluator import make_scenario_target_fn
+        from ..metrics import ScenarioResult
         target_fn = make_scenario_target_fn(scenario, target)
         r = run_gcg(
             adv_prefix=self.adv_prefix,

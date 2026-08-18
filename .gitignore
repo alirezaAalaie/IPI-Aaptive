@@ -13,7 +13,9 @@ results.json
 results/
 code/
 papers/
-data/
+# Anchored to the repo root: the alpaca corpora in ./data are ignored, but
+# ipi/data/ is packaged source and must stay tracked.
+/data/
 struq_lora_weights/
 secalign_lora_weights/
 

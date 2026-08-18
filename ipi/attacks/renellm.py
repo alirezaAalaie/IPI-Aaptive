@@ -11,7 +11,7 @@ Mechanism (faithful to the reference ``ReNeLLM`` recipe)
 For each attempt (up to ``evo_max``):
   1. Prompt rewriting — pick a random number ``n`` of the six rewrite operators, apply a
      random ordering of them to the payload. Operators are shared, verbatim-prompt
-     objects in ``mutations.RENELLM_MUTATORS`` (AlterSentenceStructure, ChangeStyle,
+     objects in ``mutation.RENELLM_MUTATORS`` (AlterSentenceStructure, ChangeStyle,
      Rephrase, InsertMeaninglessCharacters, MisspellSensitiveWords, Translation).
   2. Scenario nesting — select one of the three container scenarios (code completion,
      story continuation, LaTeX table) and substitute the rewritten payload for
@@ -28,12 +28,21 @@ IPI adaptation vs original
   nesting:    the three containers map onto IPI directly — an injected *document* that is a
               code file / story / table with the instruction hidden inside.
   constraint: the reference runs a ``DeleteHarmLess`` LLM harmfulness filter between
-              rewrites and an LLM harmfulness judge for success. We drop the harmfulness
-              filter (our payloads are injection instructions, not harmful content) and
-              use ``check_ipi_success`` resolved from the scenario instead. An optional
-              Judge still scores for the trace.
+              rewrites and an LLM harmfulness judge for success. We drop the filter — our
+              payloads are injection instructions, not harmful content, so it would reject
+              every candidate and starve the search — and use ``EvaluatorIPISuccess``
+              against the scenario's ground truth instead. The filter is ported and
+              available as ``constraint.DeleteHarmLess`` for a paper-faithful row. An
+              optional guidance evaluator still scores for the trace.
   delivery:   the nested prompt is injected through the data channel via
               ``make_scenario_target_fn``.
+
+Composition
+-----------
+The payload rides on an ``Instance.query`` and each rewrite operator runs on the dataset
+path, so a candidate's ``level`` counts how many operators touched it and the rewrite
+chain is inspectable. Success is ``metrics.EvaluatorIPISuccess``; the containers and the
+operator prompts come from ``ipi.seed`` and ``ipi.mutation``.
 
 Report of differences is in docs/easyjailbreak-audit.md.
 """
@@ -46,20 +55,22 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 from ..attacker import AdaptiveAttacker
+from ..datasets import AttackDataset, Instance
 from ..config import ATTACK_TEMP, ATTACK_TOP_P, ATTACK_MAX_TOKENS
-from ..evaluator import check_ipi_success
-from ..judges import Judge
+from ..metrics import Evaluator, EvaluatorIPISuccess
 from ..llm_unified import APILLM, UnifiedLLM
 from ..victim import Victim
-from .mutations import RENELLM_MUTATORS
-from .seeds import SeedTemplate, render
+from ..mutation import RENELLM_MUTATORS
+from ..seed import SeedTemplate, render
 
 log = logging.getLogger(__name__)
 
 
 def _load_scenarios() -> list[str]:
     """The three verbatim ReNeLLM nesting containers from the registry."""
-    return SeedTemplate().new_seeds(method_list=["ReNeLLM"], prompt_usage="original")
+    return SeedTemplate().new_seeds(
+        prompt_usage="attack", method_list=["ReNeLLM"], variant="original",
+    )
 
 
 @dataclass
@@ -85,7 +96,7 @@ def run_renellm(
     goal: str,
     target_fn: Callable[[str], str],
     attacker_model: Union[str, UnifiedLLM],
-    judge: Optional[Judge] = None,
+    judge: Optional[Evaluator] = None,
     evo_max: int = 20,
     eval_mode: str = "contains",
     target_str: str = "",
@@ -99,7 +110,7 @@ def run_renellm(
         goal:           Attacker injection goal.
         target_fn:      Callable(injection: str) -> response: str.
         attacker_model: LLM (or model string) used for the rewrite operators.
-        judge:          Optional Judge for scoring the trace.
+        judge:          Optional guidance Evaluator (ipi.metrics) for scoring the trace.
         evo_max:        Max rewrite→nest→query iterations. Default 20.
         eval_mode:      check_ipi_success mode (usually resolved from the scenario).
         target_str:     Expected success string (falls back to goal).
@@ -115,10 +126,18 @@ def run_renellm(
                max_tokens=ATTACK_MAX_TOKENS)
         if isinstance(attacker_model, str) else attacker_model
     )
-    # A plain (str) -> str callable for the mutation operators.
-    llm_call = lambda text: attacker(text)  # noqa: E731  UnifiedLLM.__call__(str) wraps as a user msg
+    # The six rewrite operators, with the attacker LLM bound. They rewrite `query`,
+    # which is where the payload lives on the carrier.
+    mutator_pool = RENELLM_MUTATORS(attacker)
     containers = scenarios or _load_scenarios()
     check_str = target_str or goal
+    evaluator = EvaluatorIPISuccess(mode=eval_mode)
+    root = Instance(
+        id="renellm-root",
+        query=goal,
+        reference_responses=[check_str],
+        attack_attrs={"target_str": check_str, "attack_eval_mode": eval_mode},
+    )
 
     best = ReNeLLMResult(
         success=False, score=0, injection="", target_response="",
@@ -127,16 +146,20 @@ def run_renellm(
 
     for it in range(evo_max):
         # --- Stage 1: rewrite the payload (random subset, random order) -------
-        payload = goal
-        n = rng.randint(1, len(RENELLM_MUTATORS))
-        mutators = rng.sample(RENELLM_MUTATORS, n)
+        # Each operator runs on the dataset path, so the chain of rewrites is recorded
+        # as lineage: `candidate.level` counts how many operators touched this payload.
+        n = rng.randint(1, len(mutator_pool))
+        mutators = rng.sample(mutator_pool, n)
         rng.shuffle(mutators)
+        candidate = root
         for mutator in mutators:
-            payload = mutator(llm_call, payload)
+            candidate = mutator(AttackDataset([candidate]))[0]
+        payload = candidate.query
 
         # --- Stage 2: nest into a scenario container --------------------------
         scenario_tmpl = rng.choice(containers)
         injection = render(scenario_tmpl, payload)
+        candidate.jailbreak_prompt = injection
 
         # --- Query + evaluate -------------------------------------------------
         try:
@@ -145,8 +168,10 @@ def run_renellm(
             log.warning("[ReNeLLM] target_fn raised: %s", exc)
             response = ""
         best.n_queries += 1
+        candidate.target_responses = [response]
 
-        success = check_ipi_success(response, check_str, eval_mode)
+        evaluator(AttackDataset([candidate]))
+        success = bool(candidate.eval_results and candidate.eval_results[-1])
         score = 0
         if judge is not None:
             try:
@@ -156,6 +181,7 @@ def run_renellm(
 
         best.trace.append({
             "iteration": it + 1, "rewritten_payload": payload,
+            "n_operators": len(mutators), "level": candidate.level,
             "injection": injection, "response": response,
             "success": success, "score": score,
         })
@@ -184,7 +210,7 @@ class ReNeLLMAttacker(AdaptiveAttacker):
 
     Args:
         attacker_llm: LLM (or model string) driving the rewrite operators.
-        judge:        Optional Judge for scoring the trace (not required for success).
+        judge:        Optional guidance Evaluator; annotates the trace, never decides success.
         evo_max:      Max iterations. Default 20 (paper).
         eval_mode:    check_ipi_success mode. Default None → auto-detect from the
                       scenario's ``attack_eval_mode``.
@@ -196,7 +222,7 @@ class ReNeLLMAttacker(AdaptiveAttacker):
     def __init__(
         self,
         attacker_llm: Union[str, APILLM],
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         evo_max: int = 20,
         eval_mode: Optional[str] = None,
         seed: Optional[int] = None,
@@ -216,7 +242,8 @@ class ReNeLLMAttacker(AdaptiveAttacker):
         return False
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult, make_scenario_target_fn, resolve_attack_target
+        from ..evaluator import make_scenario_target_fn
+        from ..metrics import ScenarioResult, resolve_attack_target
         target_fn = make_scenario_target_fn(scenario, target)
         target_str, eval_mode = resolve_attack_target(scenario, self.eval_mode)
 

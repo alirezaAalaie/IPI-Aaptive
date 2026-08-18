@@ -36,17 +36,18 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from ..attacker import StaticAttacker
-from ..evaluator import check_ipi_success
-from ..judges import Judge
+from ..metrics import Evaluator, check_ipi_success
 from ..victim import Victim
-from .seeds import SeedTemplate, render
+from ..seed import SeedTemplate, render
 
 log = logging.getLogger(__name__)
 
 
 def _load_template() -> str:
     """The verbatim DeepInception seed from the registry."""
-    return SeedTemplate().new_seeds(method_list=["DeepInception"], prompt_usage="original")[-1]
+    return SeedTemplate().new_seeds(
+        prompt_usage="attack", method_list=["DeepInception"], variant="original",
+    )[-1]
 
 
 def build_deepinception_injection(
@@ -93,7 +94,7 @@ class DeepInceptionResult:
 def run_deepinception(
     goal: str,
     target_fn: Callable[[str], str],
-    judge: Optional[Judge] = None,
+    judge: Optional[Evaluator] = None,
     scene: str = "science fiction",
     character_number: int = 5,
     layer_number: int = 5,
@@ -106,7 +107,7 @@ def run_deepinception(
     Args:
         goal:             Attacker injection goal.
         target_fn:        Callable(injection: str) -> response: str.
-        judge:            Optional Judge for scoring.
+        judge:            Optional guidance Evaluator (ipi.metrics) for scoring.
         scene:            Fictional setting. Default "science fiction".
         character_number: Characters per layer. Default 5.
         layer_number:     Nesting depth. Default 5.
@@ -153,7 +154,7 @@ class DeepInceptionAttacker(StaticAttacker):
     Jailbreaker".
 
     Args:
-        judge:            Optional Judge for scoring.
+        judge:            Optional guidance Evaluator (ipi.metrics) for scoring.
         scene:            Fictional setting. Default "science fiction".
         character_number: Characters per layer. Default 5.
         layer_number:     Nesting depth. Default 5.
@@ -165,7 +166,7 @@ class DeepInceptionAttacker(StaticAttacker):
 
     def __init__(
         self,
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         scene: str = "science fiction",
         character_number: int = 5,
         layer_number: int = 5,
@@ -182,7 +183,8 @@ class DeepInceptionAttacker(StaticAttacker):
         return False
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult, make_scenario_target_fn, resolve_attack_target
+        from ..evaluator import make_scenario_target_fn
+        from ..metrics import ScenarioResult, resolve_attack_target
         target_fn = make_scenario_target_fn(scenario, target)
         target_str, eval_mode = resolve_attack_target(scenario, self.eval_mode)
 

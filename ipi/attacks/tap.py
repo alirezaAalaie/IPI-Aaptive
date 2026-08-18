@@ -22,16 +22,32 @@ IPI adaptations (based on two papers):
 
 Phase 1 — On-topic pruning (original TAP):
   Before querying the target, each candidate injection is sent to an evaluator LLM
-  that answers "Yes/No: does this injection attempt to achieve the attacker goal?"
-  Candidates answered "No" are pruned, saving target queries for on-topic attempts.
+  that answers "[[YES]]/[[NO]]: does this injection attempt to achieve the attacker
+  goal?" Candidates answered NO are pruned, saving target queries for on-topic attempts.
   Enable with: on_topic_prune=True  (optionally: on_topic_model="gpt-4o-mini")
+
+  This is now ``constraint.DeleteOffTopic`` — upstream's own filter, with its prompt
+  verbatim in the seed registry. It replaces a locally authored bare-Yes/No version
+  (``constraint.TAP_on_topic``, deleted): same job, but two prompts and two parsers for
+  one filter was exactly the duplication the component families exist to remove. The
+  ``ipi`` variant is authored here in upstream's output format.
+
+Composition
+-----------
+The tree is ``Instance`` nodes in an ``AttackDataset``: ``jailbreak_prompt`` is the
+injection, ``target_responses[-1]`` the victim's reply, ``eval_results[-1]`` the judge's
+score, and the attacker's transcript rides in ``attack_attrs["conv"]``. Branching goes
+through ``MutationBase.new_child`` so parent/child/level are recorded; Phase-1 pruning is
+``constraint.DeleteOffTopic``; width pruning is ``selector.SelectBasedOnScores``; scoring
+is whatever ``metrics`` evaluator sits in ``judge=``. TAP keeps its own branching because
+it is conversational — the attacker refines *its own* previous prompt given feedback,
+which no stateless mutation operator expresses.
 
 Modes:
   "ipi_single"    — single injection string per scenario
   "ipi_universal" — universal prefix/suffix template wrapping attacker goal
   "original"      — original jailbreak framing (backwards compatibility)
 """
-import copy
 import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
@@ -41,15 +57,14 @@ from ..config import (
     ATTACK_TEMP, ATTACK_TOP_P, ATTACK_MAX_TOKENS,
     MAX_ATTACK_ATTEMPTS, TAP_DEPTH, TAP_WIDTH, TAP_BRANCHING,
 )
-from ..judges import Judge
+from ..constraint import DeleteOffTopic
+from ..datasets import AttackDataset, Instance
+from ..metrics import Evaluator
 from ..llm_unified import APILLM, UnifiedLLM, parse_json_response
+from ..mutation import MutationBase
+from ..seed import SeedTemplate, render
+from ..selector import SelectBasedOnScores
 from ..victim import Victim
-from ..prompts import (
-    get_attacker_prompt_original,
-    get_on_topic_prompt,
-    ATTACKER_PROMPT_IPI_SINGLE,
-    ATTACKER_PROMPT_IPI_UNIVERSAL,
-)
 
 log = logging.getLogger(__name__)
 
@@ -77,15 +92,28 @@ class TAPResult:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _select_system_prompt(prompt_mode: str, goal: str, context: dict) -> str:
+def _seed_variant(prompt_mode: str) -> str:
+    """``prompt_mode`` → the registry ``variant`` holding that framing's prompts."""
     if prompt_mode == "original":
-        return get_attacker_prompt_original(
-            goal=goal,
-            target_str=context.get("target_str", ""),
-        )
+        return "original"
     if prompt_mode == "ipi_universal":
-        return ATTACKER_PROMPT_IPI_UNIVERSAL
-    return ATTACKER_PROMPT_IPI_SINGLE  # default
+        return "ipi_universal"
+    return "ipi"          # ipi_single (default)
+
+
+def _select_system_prompt(prompt_mode: str, goal: str, context: dict) -> str:
+    """
+    The attacker LLM's system prompt, from the seed registry (``attack.TAP.<variant>``).
+
+    Only the ``original`` framing carries placeholders — it names the goal and the
+    desired response prefix inline. The IPI framings are goal-agnostic (the goal
+    travels in the user turn), so rendering them is a no-op.
+    """
+    variant = _seed_variant(prompt_mode)
+    template = SeedTemplate().new_seeds(
+        prompt_usage="attack", method_list=["TAP"], variant=variant,
+    )[0]
+    return render(template, goal, target_str=context.get("target_str", ""))
 
 
 def _inj_key(prompt_mode: str) -> str:
@@ -186,35 +214,35 @@ def _truncate_conv(conv: list[dict], keep_last_n: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: On-topic pruning
+# Candidates
 # ---------------------------------------------------------------------------
 
-def _is_on_topic(injection: str, goal: str, llm: "LLM", prompt_mode: str) -> bool:
+def _new_candidate(goal: str, system_prompt: str, init_msg: str,
+                   context: dict) -> Instance:
     """
-    Phase 1 on-topic check (original TAP, Mehrotra et al. 2024).
+    A tree node: the attacker conversation that produced it, plus its last attempt.
 
-    Asks an evaluator LLM whether `injection` is attempting to achieve `goal`.
-    Returns True (keep candidate) if yes, False (prune) if no.
-    On any error, defaults to True (conservative: do not prune on failure).
-
-    Args:
-        injection:   The candidate injection string.
-        goal:        The attacker's objective.
-        llm:         LLM instance used for the check (usually attacker model or a cheaper model).
-        prompt_mode: Controls the evaluator system prompt framing.
+    ``jailbreak_prompt`` is the injection string, ``target_responses[-1]`` the victim's
+    reply and ``eval_results[-1]`` the judge's score — which is what
+    ``SelectBasedOnScores`` prunes on and what an ``EvaluatorIPIGetScore`` fills in. The
+    attacker's own message history lives in ``attack_attrs["conv"]``; ``Instance.copy()``
+    deep-copies ``attack_attrs``, so branching gives each child its own transcript.
     """
-    system_prompt = get_on_topic_prompt(prompt_mode)
-    user_msg = f"ATTACKER GOAL: {goal}\nINJECTION: {injection}\nIs this on-topic? Yes or No."
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": user_msg},
-    ]
-    try:
-        response = llm(messages).strip().lower()
-        return "yes" in response[:30]
-    except Exception as e:
-        log.debug("[TAP] on-topic check failed (keeping candidate): %s", e)
-        return True
+    target_str = context.get("target_str", "")
+    return Instance(
+        query=goal,
+        jailbreak_prompt="",
+        reference_responses=[target_str] if target_str else [],
+        attack_attrs={
+            "conv": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": init_msg},
+            ],
+            "user_task": context.get("user_task", ""),
+            "target_tool_calls": context.get("target_tool_calls", ""),
+            "actual_tools_called": context.get("actual_tools_called", ""),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -225,14 +253,14 @@ def run_tap(
     goal: str,
     target_fn: Callable[[str], str],
     attacker_model: Union[str, UnifiedLLM],
-    judge: Judge,
+    judge: Evaluator,
     depth: int = TAP_DEPTH,
     width: int = TAP_WIDTH,
     branching_factor: int = TAP_BRANCHING,
     prompt_mode: str = "ipi_single",
     context: Optional[dict] = None,
     on_topic_prune: bool = False,
-    on_topic_model: Optional[str] = None,
+    on_topic_model: Optional[Union[str, UnifiedLLM]] = None,
     keep_last_n: int = 3,
     verbose: bool = False,
 ) -> TAPResult:
@@ -243,12 +271,14 @@ def run_tap(
       For each depth level:
         1. BRANCH        — each live candidate spawns `branching_factor` new candidates
                            by asking the attacker LLM to generate a new injection.
-        2. PHASE 1 PRUNE — (optional) filter off-topic candidates using an LLM evaluator
-                           before querying the expensive target. Enable with on_topic_prune=True.
-                           Particularly useful with LLM judges to avoid wasting target queries.
+        2. PHASE 1 PRUNE — (optional) filter off-topic candidates with
+                           ``constraint.DeleteOffTopic`` before querying the expensive
+                           target. Enable with on_topic_prune=True. Particularly useful
+                           with LLM judges, to avoid wasting target queries.
         3. QUERY         — send each injection to target_fn, collect responses.
         4. SCORE         — judge each (injection, response) pair.
-        5. PRUNE         — keep top `width` candidates by score.
+        5. PRUNE         — keep top `width` candidates by score
+                           (``selector.SelectBasedOnScores``).
         6. UPDATE        — feed score + response back to each candidate's conversation.
         7. STOP          — if any score >= judge.success_threshold, return early.
 
@@ -258,7 +288,7 @@ def run_tap(
                          This is your defended victim pipeline. It receives the
                          raw injection string and returns the agent's response.
         attacker_model:  litellm model string (e.g. "gpt-4o", "claude-sonnet-4-6").
-        judge:           Judge instance. Controls scoring and success_threshold.
+        judge:           Guidance Evaluator (ipi.metrics). Controls scoring and success_threshold.
         depth:           Maximum tree depth (iterations).
         width:           Maximum candidates kept after each pruning step.
         branching_factor: New candidates generated per existing candidate per depth.
@@ -271,15 +301,21 @@ def run_tap(
                            - actual_tools_called (str): Populated at runtime if needed.
                            - target_str (str): Used in "original" mode only.
                            - universal_goals (list[str]): For universal mode evaluation.
-        on_topic_prune:  If True, enable Phase 1 on-topic pruning (original TAP).
-                         Before querying the target, each candidate is checked by an
-                         evaluator LLM to confirm it's attempting to achieve `goal`.
-                         Off-topic candidates are pruned before spending target queries.
-                         Recommended when using IPILLMJudge or GPTJudge (expensive judges).
+        on_topic_prune:  If True, enable Phase 1 on-topic pruning (original TAP) via
+                         ``constraint.DeleteOffTopic``. Before querying the target, each
+                         candidate is checked by an evaluator LLM to confirm it is
+                         attempting to achieve `goal`. Off-topic candidates are pruned
+                         before spending target queries. If *every* candidate is judged
+                         off topic the filter keeps two rather than emptying the level —
+                         a broken judge must not silently end the run.
+                         Recommended when using EvaluatorIPIGetScore or EvaluatorGenerativeGetScore (expensive judges).
                          Default: False (off, to preserve IPI-adapted behavior by default).
-        on_topic_model:  litellm model string for the Phase 1 on-topic evaluator.
-                         If None, reuses `attacker_model`. Use a cheap/fast model
-                         (e.g., "gpt-4o-mini") to reduce cost. Only used when
+        on_topic_model:  litellm model string, or a ``UnifiedLLM``, for the Phase 1
+                         on-topic evaluator. If None, reuses `attacker_model` — which
+                         only works if that model will answer the filter's
+                         ``[[YES]]``/``[[NO]]`` question rather than its own JSON format;
+                         an unparseable answer keeps the candidate. Use a cheap/fast model
+                         (e.g. "gpt-4o-mini") to reduce cost. Only used when
                          on_topic_prune=True.
         keep_last_n:     Number of recent attacker turns (user+assistant pairs) kept in
                          each candidate's conversation. The system prompt and the opening
@@ -307,34 +343,32 @@ def run_tap(
             max_tokens=ATTACK_MAX_TOKENS,
         )
 
-    # Phase 1 on-topic evaluator — reuse attacker LLM or create a separate one
-    on_topic_llm: Optional[UnifiedLLM] = None
+    # Phase 1 on-topic filter — reuse the attacker LLM or create a cheaper one.
+    on_topic: Optional[DeleteOffTopic] = None
     if on_topic_prune:
-        attacker_name = attacker.model_name
-        if on_topic_model and on_topic_model != attacker_name:
+        if isinstance(on_topic_model, UnifiedLLM):
+            on_topic_llm = on_topic_model
+        elif on_topic_model and on_topic_model != attacker.model_name:
             on_topic_llm = APILLM(
                 model=on_topic_model,
                 temperature=0.0,
                 top_p=1.0,
-                max_tokens=8,   # only needs "Yes" or "No"
+                max_tokens=16,   # only needs "Response: [[YES]]"
             )
         else:
             on_topic_llm = attacker  # reuse attacker; already constructed
+        # tree_width is set per level below, so Phase 1 filters without truncating —
+        # the width pruning happens after scoring, as in this recipe's original shape.
+        # The filter has one IPI framing, so ipi_universal shares it — unlike the
+        # attacker prompt, the on-topic question does not change with the output shape.
+        on_topic = DeleteOffTopic(
+            on_topic_llm, tree_width=0,
+            variant="original" if prompt_mode == "original" else "ipi")
 
+    prune = SelectBasedOnScores(tree_width=width)
     init_msg = _make_init_message(goal, context, prompt_mode)
-
-    # Each candidate: conv (message list), injection, score, response
     candidates = [
-        {
-            "conv": [
-                {"role": "system",  "content": system_prompt},
-                {"role": "user",    "content": init_msg},
-            ],
-            "injection": "",
-            "score": 0,
-            "response": "",
-        }
-        for _ in range(width)
+        _new_candidate(goal, system_prompt, init_msg, context) for _ in range(width)
     ]
 
     best_injection = ""
@@ -349,15 +383,19 @@ def run_tap(
                      d + 1, depth, len(candidates), best_score)
 
         # ---- BRANCH --------------------------------------------------------
-        branched = []
+        branched: list[Instance] = []
         for cand in candidates:
             for _ in range(branching_factor):
-                new_cand = copy.deepcopy(cand)
+                # new_child() records the parent/child edge and the level, so the tree
+                # is inspectable afterwards and a selector could descend it.
+                child = MutationBase.new_child(cand)
+                child.target_responses = []
+                child.eval_results = []
                 injection = None
                 raw = ""
                 for attempt in range(MAX_ATTACK_ATTEMPTS):
                     try:
-                        raw = attacker(new_cand["conv"])
+                        raw = attacker(child.attack_attrs["conv"])
                         parsed = parse_json_response(raw, required_keys=req_keys)
                         if parsed:
                             injection = _extract_injection(parsed, prompt_mode, goal)
@@ -368,22 +406,21 @@ def run_tap(
                 if not injection:
                     log.debug("[TAP] skipping candidate: no valid injection after %d attempts",
                               MAX_ATTACK_ATTEMPTS)
+                    cand.children.remove(child)
                     continue
-                new_cand["injection"] = injection
-                new_cand["conv"].append({"role": "assistant", "content": raw})
-                branched.append(new_cand)
+                child.jailbreak_prompt = injection
+                child.attack_attrs["conv"].append({"role": "assistant", "content": raw})
+                branched.append(child)
 
         if not branched:
             log.warning("[TAP] depth=%d: no valid candidates generated, stopping early.", d + 1)
             break
 
         # ---- PHASE 1: ON-TOPIC PRUNING (optional) --------------------------
-        if on_topic_prune and on_topic_llm is not None:
+        if on_topic is not None:
             before = len(branched)
-            branched = [
-                c for c in branched
-                if _is_on_topic(c["injection"], goal, on_topic_llm, prompt_mode)
-            ]
+            on_topic.tree_width = before          # filter only; width pruning is later
+            branched = list(on_topic(AttackDataset(branched)))
             pruned = before - len(branched)
             if verbose and pruned:
                 log.info("[TAP] depth=%d: Phase 1 pruned %d/%d off-topic candidates.",
@@ -395,44 +432,45 @@ def run_tap(
         # ---- QUERY + SCORE -------------------------------------------------
         for cand in branched:
             try:
-                response = target_fn(cand["injection"])
+                response = target_fn(cand.jailbreak_prompt)
             except Exception as e:
                 log.warning("[TAP] target_fn raised: %s", e)
                 response = ""
             n_queries += 1
+            cand.target_responses = [response]
 
-            judge_ctx = {
-                "attacker_goal":      goal,
-                "user_task":          context.get("user_task", ""),
-                "target_tool_calls":  context.get("target_tool_calls", ""),
-                "actual_tools_called": context.get("actual_tools_called", ""),
-            }
-            s = judge.score(cand["injection"], response, **judge_ctx)
-            cand["score"]    = s
-            cand["response"] = response
+        # The judge reads the goal, injection, response and IPI context straight off
+        # each Instance — the context fields were put in attack_attrs at construction.
+        judge(AttackDataset(branched))
 
-            trace.append({"depth": d + 1, "injection": cand["injection"],
-                          "response": response, "score": s})
+        for cand in branched:
+            s = Evaluator.as_score(cand.eval_results[-1]) if cand.eval_results else 1
+            cand.eval_results = [s]
+            response = cand.target_responses[-1]
+
+            trace.append({"depth": d + 1, "injection": cand.jailbreak_prompt,
+                          "response": response, "score": s, "level": cand.level})
 
             if s > best_score:
                 best_score     = s
-                best_injection = cand["injection"]
+                best_injection = cand.jailbreak_prompt
                 best_response  = response
 
             if verbose:
-                log.info("  score=%d | %s", s, cand["injection"][:80])
+                log.info("  score=%d | %s", s, cand.jailbreak_prompt[:80])
 
         # ---- PRUNE ---------------------------------------------------------
-        branched.sort(key=lambda c: c["score"], reverse=True)
-        candidates = branched[:width]
+        candidates = list(prune.select(AttackDataset(branched)))
 
         # ---- UPDATE CONVERSATIONS ------------------------------------------
         for cand in candidates:
             feedback = _make_feedback_message(
-                cand["injection"], cand["response"], cand["score"], goal, prompt_mode
+                cand.jailbreak_prompt, cand.target_responses[-1],
+                cand.eval_results[-1], goal, prompt_mode,
             )
-            cand["conv"].append({"role": "user", "content": feedback})
-            cand["conv"] = _truncate_conv(cand["conv"], keep_last_n)
+            conv = cand.attack_attrs["conv"]
+            conv.append({"role": "user", "content": feedback})
+            cand.attack_attrs["conv"] = _truncate_conv(conv, keep_last_n)
 
         # ---- EARLY STOP ----------------------------------------------------
         if judge.is_success(best_score):
@@ -471,28 +509,29 @@ class TAPAttacker(JudgeGuidedAttacker):
     Pass an instance to AttackEvaluator.
 
     Args:
-        judge:            Judge instance (owned by this attacker).
+        judge:            Guidance Evaluator (owned by this attacker).
         attacker_llm:     APILLM instance (or model string) for generating injections.
         depth:            Maximum tree depth. Default 10.
         width:            Candidates kept after each prune step. Default 5.
         branching_factor: New candidates per existing candidate per depth. Default 2.
         prompt_mode:      "ipi_single" | "ipi_universal" | "original". Default "ipi_single".
         on_topic_prune:   Enable Phase 1 on-topic pruning. Default False.
-        on_topic_model:   Model string for on-topic evaluator. None = reuse attacker_llm.
+        on_topic_model:   Model string or UnifiedLLM for the on-topic evaluator.
+                          None = reuse attacker_llm (see run_tap's note).
         keep_last_n:      Attacker turns retained per candidate conversation. Default 3
                           (the original TAP value). Set 0 to disable truncation.
     """
 
     def __init__(
         self,
-        judge: Judge,
+        judge: Evaluator,
         attacker_llm: Union[str, APILLM],
         depth: int = TAP_DEPTH,
         width: int = TAP_WIDTH,
         branching_factor: int = TAP_BRANCHING,
         prompt_mode: str = "ipi_single",
         on_topic_prune: bool = False,
-        on_topic_model: Optional[str] = None,
+        on_topic_model: Optional[Union[str, UnifiedLLM]] = None,
         keep_last_n: int = 3,
     ):
         super().__init__(judge)
@@ -510,7 +549,8 @@ class TAPAttacker(JudgeGuidedAttacker):
         self.keep_last_n      = keep_last_n
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult, make_scenario_target_fn
+        from ..evaluator import make_scenario_target_fn
+        from ..metrics import ScenarioResult
         target_fn = make_scenario_target_fn(scenario, target)
         r = run_tap(
             goal=scenario.injection_goal,

@@ -10,8 +10,20 @@ File layout
   llm_unified.py  — UnifiedLLM (abstract), APILLM (API), LocalLLM (local HF)
   victim.py       — Victim ABC  (interface any defense must implement)
   attacker.py     — BaseAttacker ABC
-  prompts.py      — attacker and judge system prompts
-  judges.py       — EditDistanceJudge, IPILLMJudge, GPTJudge, KeywordJudge
+  seed/           — SeedTemplate: the registry of every fixed string an attack uses
+                    (injection payloads, attacker/judge/constraint system prompts,
+                    in-context demonstrations)
+  metrics/        — the Evaluator family: *GetScore guidance (1-10) beside
+                    *Judge/*Match success (bool), plus AttackEvaluator, which owns
+                    the reported ASR. Replaces judges.py / scoring.py
+  mutation/       — MutationBase operators: generation (LLM-driven) · rule
+                    (deterministic encodings, scrambles, crossover). Replaces
+                    attacks/mutations.py
+  selector/       — SelectPolicy: which candidate gets the next victim query
+                    (Random · RoundRobin · UCB · EXP3 · MCTSExplore · SelectBasedOnScores
+                    · ReferenceLossSelector)
+  constraint/     — ConstraintBase filters: DeleteOffTopic · DeleteHarmLess
+                    · PerplexityConstraint
   attacks/        — attack implementations (subpackage)
     tap.py        — TAP + TAPAttacker
     pair.py       — PAIR + PAIRAttacker
@@ -20,8 +32,10 @@ File layout
     autodan.py    — AutoDAN GA/HGA + AutoDANAttacker  (local-only)
     gcg.py        — GCG + GCGAttacker  (local-only)
     static_injection.py — Naive, Escape, Ignore, FakeCompletion, Combined (OPI, API-compatible)
-  dataset.py      — IPIScenario, IPIDataset, ManualIPIDataset, AgentDojoDataset, BipiaDataset, HijackDataset
-  evaluator.py    — IPI success checks + AttackEvaluator
+  datasets/       — Instance (the carrier every component speaks) · AttackDataset
+                    · DualVerifiableDataset
+  dataset.py      — LEGACY IPIScenario / IPIDataset; deleted once recipes migrate
+  evaluator.py    — harness helpers (make_scenario_target_fn, RS early stop)
   runner.py       — run_attack / run_experiment (simple scenario-level API)
   target.py       — TargetLLM (Victim wrapping UnifiedLLM) + make_target factory
 
@@ -29,12 +43,11 @@ Quick start
 -----------
     from ipi.llm_unified import APILLM
     from ipi.target import TargetLLM, make_target
-    from ipi.tap import TAPAttacker
-    from ipi.judges import IPILLMJudge
-    from ipi.evaluator import AttackEvaluator
+    from ipi.attacks.tap import TAPAttacker
+    from ipi.metrics import EvaluatorIPIGetScore, AttackEvaluator
 
     target   = TargetLLM(APILLM("gpt-4o-mini", system_prompt="You are an email agent..."))
-    judge    = IPILLMJudge(model="gpt-4o-mini")
+    judge    = EvaluatorIPIGetScore(model="gpt-4o-mini")
     attacker = TAPAttacker(judge=judge, attacker_llm=APILLM("gpt-4o"), depth=10)
 
     evaluator = AttackEvaluator(target=target, attacker=attacker)
@@ -82,11 +95,23 @@ from .llm_unified import (
 # ---- Target wrapper (Victim wrapping UnifiedLLM) ----
 from .target import TargetLLM, make_target
 
-# ---- Judges ----
-from .judges import EditDistanceJudge, GPTJudge, IPILLMJudge, KeywordJudge
-
 # ---- Abstract Attacker Base ----
 from .attacker import BaseAttacker, StaticAttacker, AdaptiveAttacker, JudgeGuidedAttacker
+
+# ---- Mutation operators ----
+from .mutation import MutationBase, GPTFUZZER_MUTATORS, RENELLM_MUTATORS
+
+# ---- Selection policies ----
+from .selector import SelectPolicy, MCTSExploreSelectPolicy, SelectBasedOnScores
+
+# ---- Constraints ----
+from .constraint import ConstraintBase, DeleteOffTopic, PerplexityConstraint
+
+# ---- Seed / prompt registry ----
+from .seed import (
+    SeedBase, SeedTemplate, PLACEHOLDER, TARGET_PLACEHOLDER,
+    load_seed_templates, render, sample_population, ica_demos,
+)
 
 # ---- Attack classes + low-level functions ----
 from .attacks.tap import TAPAttacker, TAPResult, run_tap
@@ -116,24 +141,41 @@ from .attacks import (
 )
 
 # ---- Dataset ----
-from .dataset import (
-    IPIScenario, IPIDataset, ManualIPIDataset, AgentDojoDataset, BipiaDataset,
-    HijackDataset, DualVerifiableDataset, HIJACK_ATTACKS, _BIPIA_TARGET_MAP, _BIPIA_OPTIM_TARGET_MAP,
-)
+# The carrier (Instance / AttackDataset) is the new seam; ipi.dataset's IPIScenario
+# is legacy and disappears once the recipes migrate. Both are exported during the
+# transition, under distinct names so nothing is ambiguous.
+from .datasets import Instance, AttackDataset
+from .datasets import DualVerifiableDataset, load_dual_verifiable
+from .dataset import IPIScenario, IPIDataset
+from .dataset import DualVerifiableDataset as LegacyDualVerifiableDataset
 
-# ---- Evaluator ----
-from .evaluator import (
+# ---- Metrics (success + guidance) ----
+from .metrics import (
+    Evaluator,
     check_function_name,
     check_exact_function_call,
     check_ipi_success,
     check_user_utility,
-    get_target_token,
-    ipi_early_stopping_condition,
-    make_scenario_target_fn,
+    resolve_attack_target,
+    EvaluatorGenerativeGetScore,
+    EvaluatorIPIGetScore,
+    EvaluatorEditDistanceGetScore,
+    EvaluatorIPISuccess,
+    EvaluatorUserUtility,
+    EvaluatorMatch,
+    EvaluatorPrefixExactMatch,
+    EvaluatorPatternJudge,
+    EvaluatorKeywordJudge,
     ScenarioResult,
     EvalResult,
     AttackEvaluator,
-    BipiaSuccessEvaluator,
+)
+
+# ---- Harness helpers ----
+from .evaluator import (
+    get_target_token,
+    ipi_early_stopping_condition,
+    make_scenario_target_fn,
 )
 
 # ---- Defenses ----
@@ -152,11 +194,13 @@ from .defenses import (
 from .runner import ExperimentResult, run_attack, run_experiment
 
 # ---- Subpackage namespaces ----
-from . import datasets, targets, evaluators, defenses, attacks
+from . import (datasets, defenses, attacks, seed, mutation, selector,
+               constraint, metrics)
 
 __all__ = [
     # Subpackage namespaces
-    "datasets", "targets", "evaluators", "defenses", "attacks",
+    "datasets", "defenses", "attacks", "seed", "mutation", "selector",
+    "constraint", "metrics",
     # Victim interface
     "Victim",
     # LLM hierarchy
@@ -172,10 +216,17 @@ __all__ = [
     "SpotlightDefense", "CompositeDefense",
     "SecAlignDefense", "StruQDefense",
 
-    # Judges
-    "EditDistanceJudge", "IPILLMJudge", "GPTJudge", "KeywordJudge",
     # Attacker Base
     "BaseAttacker", "StaticAttacker", "AdaptiveAttacker", "JudgeGuidedAttacker",
+    # Mutation operators
+    "MutationBase", "GPTFUZZER_MUTATORS", "RENELLM_MUTATORS",
+    # Selection policies
+    "SelectPolicy", "MCTSExploreSelectPolicy", "SelectBasedOnScores",
+    # Constraints
+    "ConstraintBase", "DeleteOffTopic", "PerplexityConstraint",
+    # Seed / prompt registry
+    "SeedBase", "SeedTemplate", "PLACEHOLDER", "TARGET_PLACEHOLDER",
+    "load_seed_templates", "render", "sample_population", "ica_demos",
     # Attack classes
     "TAPAttacker", "PAIRAttacker", "RSAttacker", "BeamRSAttacker", "BEASTAttacker",
     "AutoDANAttacker", "GCGAttacker",
@@ -196,14 +247,23 @@ __all__ = [
     "run_static_injection", "StaticInjectionResult", "create_static_attacker",
     "build_naive_injection", "build_escape_injection", "build_ignore_injection",
     "build_fake_completion_injection", "build_combined_injection",
-    # Dataset
-    "IPIScenario", "IPIDataset", "ManualIPIDataset", "AgentDojoDataset", "BipiaDataset",
-    "HijackDataset", "DualVerifiableDataset", "HIJACK_ATTACKS", "_BIPIA_TARGET_MAP", "_BIPIA_OPTIM_TARGET_MAP",
-    # Evaluator
-    "check_function_name", "check_exact_function_call", "check_ipi_success", "check_user_utility",
-    "get_target_token", "ipi_early_stopping_condition",
-    "make_scenario_target_fn", "ScenarioResult", "EvalResult", "AttackEvaluator",
-    "BipiaSuccessEvaluator",
+    # Dataset — carrier
+    "Instance", "AttackDataset", "DualVerifiableDataset", "load_dual_verifiable",
+    # Dataset — legacy (removed once recipes migrate)
+    "IPIScenario", "IPIDataset", "LegacyDualVerifiableDataset",
+    # Metrics — primitives
+    "Evaluator",
+    "check_function_name", "check_exact_function_call", "check_ipi_success",
+    "check_user_utility", "resolve_attack_target",
+    # Metrics — guidance (1-10) and success (bool)
+    "EvaluatorGenerativeGetScore", "EvaluatorIPIGetScore",
+    "EvaluatorEditDistanceGetScore",
+    "EvaluatorIPISuccess", "EvaluatorUserUtility", "EvaluatorMatch",
+    "EvaluatorPrefixExactMatch", "EvaluatorPatternJudge", "EvaluatorKeywordJudge",
+    # Metrics — runner
+    "ScenarioResult", "EvalResult", "AttackEvaluator",
+    # Harness helpers
+    "get_target_token", "ipi_early_stopping_condition", "make_scenario_target_fn",
     # Simple API
     "run_attack", "run_experiment", "ExperimentResult",
 ]

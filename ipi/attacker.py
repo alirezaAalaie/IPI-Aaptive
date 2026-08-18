@@ -2,18 +2,18 @@
 BaseAttacker — abstract base class for all IPI attack implementations.
 
 Every attack (TAP, PAIR, RS, Beam-RS, BEAST) subclasses BaseAttacker and:
-  1. Takes a judge as a required constructor argument (owns its judge).
+  1. Takes its guidance evaluator as a constructor argument (owns it).
   2. Sets all attack hyperparameters at construction time.
   3. Implements run_scenario(target, scenario, verbose) → ScenarioResult.
 
 Usage
 -----
     from ipi.tap import TAPAttacker
-    from ipi.judges import IPILLMJudge
+    from ipi.metrics import EvaluatorIPIGetScore
     from ipi.llm_unified import APILLM
-    from ipi.evaluator import AttackEvaluator
+    from ipi.metrics import AttackEvaluator
 
-    judge    = IPILLMJudge(model="gpt-4o-mini")
+    judge    = EvaluatorIPIGetScore(model="gpt-4o-mini")
     attacker = TAPAttacker(judge=judge, attacker_llm=APILLM("gpt-4o"), depth=10)
     evaluator = AttackEvaluator(target=APILLM("gpt-4o-mini", system_prompt="..."),
                                 attacker=attacker)
@@ -33,13 +33,13 @@ Hierarchy
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from .dataset import IPIScenario
-from .judges import Judge
+from .metrics import Evaluator
 
 if TYPE_CHECKING:
-    from .evaluator import ScenarioResult
+    from .metrics import ScenarioResult
     from .victim import Victim
 
 
@@ -50,7 +50,7 @@ class BaseAttacker(ABC):
     Subclasses implement ``run_scenario(target, scenario, verbose) -> ScenarioResult``.
     """
 
-    def __init__(self, judge: Optional[Judge] = None):
+    def __init__(self, judge: Optional[Evaluator] = None):
         self.judge = judge
 
     @classmethod
@@ -99,10 +99,11 @@ class StaticAttacker(BaseAttacker):
     They do NOT require an LLM judge during injection generation (judge is optional).
 
     Args:
-        judge: Optional Judge instance (used only if explicit quality scoring is requested).
+        judge: Optional guidance Evaluator (used only if explicit quality scoring
+               is requested). See ipi.metrics.
     """
 
-    def __init__(self, judge: Optional[Judge] = None):
+    def __init__(self, judge: Optional[Evaluator] = None):
         super().__init__(judge=judge)
 
     @property
@@ -119,10 +120,10 @@ class AdaptiveAttacker(BaseAttacker):
     multiple target model queries.
 
     Args:
-        judge: Optional Judge instance.
+        judge: Optional guidance Evaluator (ipi.metrics).
     """
 
-    def __init__(self, judge: Optional[Judge] = None):
+    def __init__(self, judge: Optional[Evaluator] = None):
         super().__init__(judge=judge)
 
     @property
@@ -132,17 +133,20 @@ class AdaptiveAttacker(BaseAttacker):
 
 class JudgeGuidedAttacker(AdaptiveAttacker):
     """
-    Base class for adaptive attacks that explicitly require an LLM Judge during search.
+    Base class for adaptive attacks that need a guidance signal at every step.
 
-    Judge-guided attacks (TAP, PAIR) rely on an LLM Judge at every iteration
-    to evaluate candidate injections, score responses, and steer the search tree.
+    TAP and PAIR score every candidate to decide which branch to expand, so a
+    ``*GetScore`` evaluator (``ipi.metrics``) is required rather than optional. That
+    score steers the search only — the reported ASR comes from ``AttackEvaluator``.
 
     Args:
-        judge: Required Judge instance.
+        judge: Required guidance Evaluator.
     """
 
-    def __init__(self, judge: Judge):
+    def __init__(self, judge: Evaluator):
         if judge is None:
-            raise ValueError(f"{self.__class__.__name__} requires a valid Judge instance.")
+            raise ValueError(
+                f"{self.__class__.__name__} requires a guidance Evaluator "
+                f"(e.g. metrics.EvaluatorIPIGetScore).")
         super().__init__(judge=judge)
 

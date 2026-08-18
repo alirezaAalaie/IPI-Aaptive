@@ -37,8 +37,13 @@ IPI adaptations vs original
   candidate population / seeds:
       Original: hand-crafted templates loaded from ``assets/prompt_group.pth``
                 (a list of jailbreak-style sentences with [REPLACE] / [MODEL] tokens).
-      IPI:      Four built-in IPI seed templates plus an optional user-supplied list.
-                No external .pth file is required — the package is self-contained.
+      IPI:      The seed registry, ``seed_variant="ipi"`` → ``attack.AutoDAN.ipi``
+                (41 IPI templates across 9 strategy families), plus an optional
+                user-supplied ``extra_seeds`` list. No external .pth file is
+                required — the package is self-contained. The upstream pool is
+                still reachable as ``seed_variant="original"``
+                (``attack.AutoDAN.original``, 128 templates verbatim) for the
+                paper-reproduction row.
 
   Success evaluation:
       Original: refusal-prefix keyword check (not any(prefix in response ...)).
@@ -70,44 +75,47 @@ import torch
 import torch.nn as nn
 
 from ..attacker import AdaptiveAttacker
-from ..evaluator import check_ipi_success
-from ..judges import Judge
+from ..metrics import Evaluator, check_ipi_success
 from ..victim import Victim
-from .seeds import SeedTemplate, sample_population
+from ..seed import sample_population
 
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# IPI seed templates
+# Seed population
 # ---------------------------------------------------------------------------
 
-# The initial GA population is drawn from the shared IPI seed pool in the seed
-# registry (``seeds.py`` / ``seed_templates.json`` → ipi/IPI: ~40 distinct
-# templates across 9 strategy families). This replaces the original
-# ``assets/prompt_group.pth`` so the package needs no external data files, while
-# giving the genetic algorithm enough genetic diversity at generation 0 for
-# crossover and the momentum word-dictionary to actually do work.
-_IPI_SEED_TEMPLATES: list[str] = SeedTemplate().new_seeds(
-    method_list=["IPI"], prompt_usage="ipi"
-)
+# The initial GA population is drawn from the seed registry (``ipi/seed/``),
+# replacing the original ``assets/prompt_group.pth`` so the package needs no
+# external data files.
+#
+#   seed_variant="ipi"      attack.AutoDAN.ipi      — 41 IPI templates, 9 strategy
+#                                                     families (the default here)
+#   seed_variant="original" attack.AutoDAN.original — the 128 upstream AutoDAN
+#                                                     seeds, verbatim (paper row)
+#
+# Either pool gives the GA enough diversity at generation 0 for crossover and the
+# momentum word-dictionary to do work.
 
 
 def _make_seed_population(
     goal: str,
     batch_size: int,
     extra_seeds: Optional[list[str]] = None,
+    seed_variant: str = "ipi",
 ) -> list[str]:
     """
-    Build the initial population from the shared IPI seed pool.
+    Build the initial population from the AutoDAN seed pool.
 
     Draws distinct templates without replacement while the pool is large enough
     (only repeating if ``batch_size`` exceeds the number of templates), after
     substituting the goal for each template's placeholder. ``extra_seeds`` are
     placed first.
     """
-    return sample_population(goal, batch_size, prompt_usage="ipi",
-                             method_list=["IPI"], extra_seeds=extra_seeds)
+    return sample_population(goal, batch_size, prompt_usage="attack",
+                             method_list=["AutoDAN"], variant=seed_variant,
+                             extra_seeds=extra_seeds)
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +601,7 @@ def run_autodan_ga(
     mutation_rate: float = 0.01,
     # Population
     extra_seeds: Optional[list[str]] = None,
+    seed_variant: str = "ipi",
     # LLM mutator (optional)
     llm_mutator: Optional[Callable[[str], str]] = None,
     # Budget
@@ -626,6 +635,8 @@ def run_autodan_ga(
         num_points:        Crossover points per paragraph. Default 5.
         mutation_rate:     Probability of mutating an individual. Default 0.01.
         extra_seeds:       Additional seed strings to include in initial population.
+        seed_variant:      Seed pool for generation 0 — "ipi" (41 IPI templates,
+                           default) or "original" (the 128 upstream AutoDAN seeds).
         llm_mutator:       Callable(sentence: str) -> str for LLM-based mutation.
                            If None, synonym replacement (NLTK) is used as fallback.
         budget_seconds:    Wall-clock time budget. None = unlimited.
@@ -652,7 +663,7 @@ def run_autodan_ga(
     num_elites = max(1, int(batch_size * num_elites_frac))
 
     start_time = time.time()
-    population = _make_seed_population(goal, batch_size, extra_seeds)
+    population = _make_seed_population(goal, batch_size, extra_seeds, seed_variant)
     seed_pop_ref = list(population)  # keep reference for mutation fallback
 
     best_loss = float("inf")
@@ -781,6 +792,7 @@ def run_autodan_hga(
     hga_period: int = 5,          # every this many steps, use HGA word-replacement instead of GA
     # Population
     extra_seeds: Optional[list[str]] = None,
+    seed_variant: str = "ipi",
     # LLM mutator (optional)
     llm_mutator: Optional[Callable[[str], str]] = None,
     # Budget
@@ -825,7 +837,7 @@ def run_autodan_hga(
     num_elites = max(1, int(batch_size * num_elites_frac))
 
     start_time = time.time()
-    population = _make_seed_population(goal, batch_size, extra_seeds)
+    population = _make_seed_population(goal, batch_size, extra_seeds, seed_variant)
     seed_pop_ref = list(population)
 
     best_loss = float("inf")
@@ -966,7 +978,7 @@ class AutoDANAttacker(AdaptiveAttacker):
       "hga" — Hybrid GA (alternates GA and word-dictionary-guided word replacement).
 
     Args:
-        judge:            Judge instance (owned by this attacker).
+        judge:            Guidance Evaluator (owned by this attacker).
         variant:          "ga" | "hga". Default "hga".
         num_steps:        GA generations. Default 100.
         batch_size:       Population size. Default 64.
@@ -978,13 +990,16 @@ class AutoDANAttacker(AdaptiveAttacker):
         eval_mode:        IPI success eval mode. Default "function_name".
         llm_mutator:      Optional callable(str)->str for LLM-based mutation.
         extra_seeds:      Additional seed strings for the initial population.
+        seed_variant:     Seed pool for generation 0 — "ipi" (41 IPI templates,
+                          default) or "original" (the 128 upstream AutoDAN seeds,
+                          for the paper-reproduction row).
         budget_seconds:   Wall-clock budget per scenario. None = unlimited.
         seed:             Random seed for reproducibility. Default 20.
     """
 
     def __init__(
         self,
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         variant: str = "hga",
         num_steps: int = 100,
         batch_size: int = 64,
@@ -996,12 +1011,16 @@ class AutoDANAttacker(AdaptiveAttacker):
         eval_mode: str = "function_name",
         llm_mutator: Optional[Callable[[str], str]] = None,
         extra_seeds: Optional[list[str]] = None,
+        seed_variant: str = "ipi",
         budget_seconds: Optional[float] = None,
         seed: int = 20,
     ):
         super().__init__(judge)
         if variant not in ("ga", "hga"):
             raise ValueError(f"variant must be 'ga' or 'hga', got {variant!r}")
+        if seed_variant not in ("ipi", "original"):
+            raise ValueError(
+                f"seed_variant must be 'ipi' or 'original', got {seed_variant!r}")
         self.variant           = variant
         self.num_steps         = num_steps
         self.batch_size        = batch_size
@@ -1013,6 +1032,7 @@ class AutoDANAttacker(AdaptiveAttacker):
         self.eval_mode         = eval_mode
         self.llm_mutator       = llm_mutator
         self.extra_seeds       = extra_seeds
+        self.seed_variant      = seed_variant
         self.budget_seconds    = budget_seconds
         self.seed              = seed
 
@@ -1021,7 +1041,8 @@ class AutoDANAttacker(AdaptiveAttacker):
         return True
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult, make_scenario_target_fn
+        from ..evaluator import make_scenario_target_fn
+        from ..metrics import ScenarioResult
         target_fn = make_scenario_target_fn(scenario, target)
 
         common_kwargs = dict(
@@ -1038,6 +1059,7 @@ class AutoDANAttacker(AdaptiveAttacker):
             mutation_rate=self.mutation_rate,
             llm_mutator=self.llm_mutator,
             extra_seeds=self.extra_seeds,
+            seed_variant=self.seed_variant,
             budget_seconds=self.budget_seconds,
             seed=self.seed,
             verbose=verbose,

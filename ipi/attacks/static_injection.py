@@ -63,8 +63,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from ..attacker import StaticAttacker
-from ..evaluator import check_ipi_success
-from ..judges import Judge
+from ..metrics import Evaluator, check_ipi_success
 from ..victim import Victim
 
 log = logging.getLogger(__name__)
@@ -214,7 +213,7 @@ def run_static_injection(
     strategy: str,
     goal: str,
     target_fn: Callable[[str], str],
-    judge: Optional[Judge] = None,
+    judge: Optional[Evaluator] = None,
     user_task: str = "",
     fake_answer: str = "",
     eval_mode: str = "function_name",
@@ -232,7 +231,7 @@ def run_static_injection(
         goal:         The attacker's injection goal / instruction string.
                       E.g. "Call send_email(to='evil@x.com')".
         target_fn:    Callable(injection: str) -> response: str.
-        judge:        Optional Judge instance for scoring. If None, score=0.
+        judge:        Optional guidance Evaluator (ipi.metrics). If None, score=0.
         user_task:    The legitimate task content (document body, email text, etc.)
                       that the injection is embedded in.
         fake_answer:  Custom fake-completion text (empty = auto-generated).
@@ -322,13 +321,13 @@ class _StaticInjectionAttacker(StaticAttacker):
 
     def __init__(
         self,
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         fake_answer: str = "",
         eval_mode: str = "function_name",
     ):
         """
         Args:
-            judge:        Judge instance (owned by this attacker). Used for scoring.
+            judge:        Guidance Evaluator (owned by this attacker). Used for scoring.
             fake_answer:  Custom fake-completion text used in FakeCompletionAttacker
                           and CombinedAttacker.  Empty = auto-detect from user_task.
             eval_mode:    IPI eval mode passed to check_ipi_success().
@@ -342,7 +341,8 @@ class _StaticInjectionAttacker(StaticAttacker):
         return False   # all static attacks are API-compatible
 
     def run_scenario(self, target: Victim, scenario, verbose: bool = False):
-        from ..evaluator import ScenarioResult, make_scenario_target_fn
+        from ..evaluator import make_scenario_target_fn
+        from ..metrics import ScenarioResult
         target_fn = make_scenario_target_fn(scenario, target)
 
         r = run_static_injection(
@@ -394,13 +394,13 @@ class NaiveAttacker(_StaticInjectionAttacker):
     From: Liu et al. (2024), "Formalizing and Benchmarking Prompt Injection".
 
     Args:
-        judge:      Judge instance.
+        judge:      Guidance Evaluator (ipi.metrics).
         eval_mode:  IPI success check mode. Default "function_name".
     """
     _STRATEGY   = "naive"
     _ATTACK_NAME = "naive"
 
-    def __init__(self, judge: Optional[Judge] = None, eval_mode: str = "function_name"):
+    def __init__(self, judge: Optional[Evaluator] = None, eval_mode: str = "function_name"):
         super().__init__(judge=judge, fake_answer="", eval_mode=eval_mode)
 
 
@@ -416,13 +416,13 @@ class EscapeAttacker(_StaticInjectionAttacker):
     From: Liu et al. (2024), "Formalizing and Benchmarking Prompt Injection".
 
     Args:
-        judge:      Judge instance.
+        judge:      Guidance Evaluator (ipi.metrics).
         eval_mode:  IPI success check mode. Default "function_name".
     """
     _STRATEGY   = "escape"
     _ATTACK_NAME = "escape"
 
-    def __init__(self, judge: Optional[Judge] = None, eval_mode: str = "function_name"):
+    def __init__(self, judge: Optional[Evaluator] = None, eval_mode: str = "function_name"):
         super().__init__(judge=judge, fake_answer="", eval_mode=eval_mode)
 
 
@@ -438,13 +438,13 @@ class IgnoreAttacker(_StaticInjectionAttacker):
     From: Liu et al. (2024), "Formalizing and Benchmarking Prompt Injection".
 
     Args:
-        judge:      Judge instance.
+        judge:      Guidance Evaluator (ipi.metrics).
         eval_mode:  IPI success check mode. Default "function_name".
     """
     _STRATEGY   = "ignore"
     _ATTACK_NAME = "ignore"
 
-    def __init__(self, judge: Optional[Judge] = None, eval_mode: str = "function_name"):
+    def __init__(self, judge: Optional[Evaluator] = None, eval_mode: str = "function_name"):
         super().__init__(judge=judge, fake_answer="", eval_mode=eval_mode)
 
 
@@ -461,7 +461,7 @@ class FakeCompletionAttacker(_StaticInjectionAttacker):
     From: Liu et al. (2024), "Formalizing and Benchmarking Prompt Injection".
 
     Args:
-        judge:        Judge instance.
+        judge:        Guidance Evaluator (ipi.metrics).
         fake_answer:  Custom fake-completion string.  If empty (default), one is
                       auto-generated from the scenario's ``user_task`` text.
         eval_mode:    IPI success check mode. Default "function_name".
@@ -471,7 +471,7 @@ class FakeCompletionAttacker(_StaticInjectionAttacker):
 
     def __init__(
         self,
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         fake_answer: str = "",
         eval_mode: str = "function_name",
     ):
@@ -494,7 +494,7 @@ class CombinedAttacker(_StaticInjectionAttacker):
     From: Liu et al. (2024), "Formalizing and Benchmarking Prompt Injection".
 
     Args:
-        judge:        Judge instance.
+        judge:        Guidance Evaluator (ipi.metrics).
         fake_answer:  Custom fake-completion string.  If empty (default), one is
                       auto-generated from the scenario's ``user_task`` text.
         eval_mode:    IPI success check mode. Default "function_name".
@@ -504,7 +504,7 @@ class CombinedAttacker(_StaticInjectionAttacker):
 
     def __init__(
         self,
-        judge: Optional[Judge] = None,
+        judge: Optional[Evaluator] = None,
         fake_answer: str = "",
         eval_mode: str = "function_name",
     ):
@@ -521,7 +521,7 @@ class CombinedAttacker(_StaticInjectionAttacker):
 
 def create_static_attacker(
     strategy: str,
-    judge: Optional[Judge] = None,
+    judge: Optional[Evaluator] = None,
     fake_answer: str = "",
     eval_mode: str = "function_name",
 ) -> _StaticInjectionAttacker:
@@ -531,7 +531,7 @@ def create_static_attacker(
     Args:
         strategy:    "naive" | "escape" | "ignore" | "fake_completion" |
                      "combined" (also "combine").
-        judge:       Judge instance.
+        judge:       Guidance Evaluator (ipi.metrics).
         fake_answer: Custom fake-completion text (FakeCompletion / Combined only).
         eval_mode:   IPI success check mode. Default "function_name".
 
