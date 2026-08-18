@@ -18,11 +18,13 @@ Every instruction prompt is verbatim from upstream, and the wrapper prompts the 
 operators attach live in the seed registry under ``mutation.<Name>``, checked by
 ``scripts/check_seed_fidelity.py``.
 
-Not here yet: ``gradient/``. Upstream's ``MutationTokenGradient`` is written against its
-``WhiteBoxModelBase`` / ``model_utils.encode_trace`` stack, which we deliberately do not
-have — our ``Victim`` contract replaces it, and ``attacks/gcg.py`` already implements the
-same token-gradient step against it. The operator gets extracted from *our* GCG when that
-recipe migrates in Phase H; porting upstream's would mean porting their model layer.
+``gradient.py`` is the third family and is **deliberately not imported here**: it needs
+torch at module load, and ``import ipi`` must work without it. Import it directly —
+``from ipi.mutation.gradient import sample_candidates``. It holds the GCG token-gradient
+step, extracted from *our* ``attacks/gcg.py`` rather than ported: upstream's
+``MutationTokenGradient`` is written against its ``WhiteBoxModelBase`` /
+``model_utils.encode_trace`` stack, which our ``Victim`` contract replaces. It exposes
+functions, not a ``MutationBase`` subclass — see that module's docstring for why.
 """
 from .base import MutationBase, LLMMutation, LLMCallable
 from .generation import (
