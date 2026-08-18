@@ -37,6 +37,7 @@ code — if a Cipher row is ever wanted, those system prompts belong in the seed
 """
 from __future__ import annotations
 
+import logging
 import base64 as _base64
 import codecs
 import json
@@ -322,6 +323,35 @@ class SentenceCrossOver(MutationBase):
         return children
 
 
+log = logging.getLogger(__name__)
+
+#: Warn once per process, not once per candidate — this is called hundreds of times a
+#: generation.
+_NLTK_WARNED = False
+
+
+def _warn_nltk_missing(what: str, exc: BaseException) -> None:
+    """
+    Say loudly that a word-level operator has degraded to a pass-through.
+
+    AutoDAN-HGA's only mutation between GA steps is synonym replacement. Without nltk
+    it returns its input unchanged, so with the default ``hga_period=5`` **80 of every
+    100 generations do nothing at all** — the search looks like it is running, the loss
+    barely moves, and the best candidate is still a pristine seed template. That is
+    exactly the kind of silent no-op the repo exists to avoid, so it warns rather than
+    logging at debug.
+    """
+    global _NLTK_WARNED
+    if _NLTK_WARNED:
+        return
+    _NLTK_WARNED = True
+    log.warning(
+        "[%s] nltk is unavailable (%s) — word-level mutation is a PASS-THROUGH for the "
+        "rest of this run. AutoDAN-HGA does nothing on its non-GA generations. Fix with: "
+        "pip install nltk && python -m nltk.downloader stopwords wordnet punkt punkt_tab",
+        what, exc)
+
+
 class ReplaceWordsWithSynonyms(MutationBase):
     """
     Replace words with synonyms drawn from AutoDAN-HGA's momentum word dictionary.
@@ -351,12 +381,14 @@ class ReplaceWordsWithSynonyms(MutationBase):
         try:
             import nltk
             from nltk.corpus import wordnet
-        except ImportError:
+        except ImportError as exc:
+            _warn_nltk_missing("ReplaceWordsWithSynonyms", exc)
             return text
 
         try:
             words = nltk.word_tokenize(text)
-        except LookupError:      # nltk installed but corpora not downloaded
+        except LookupError as exc:   # nltk installed but corpora not downloaded
+            _warn_nltk_missing("ReplaceWordsWithSynonyms", exc)
             return text
 
         for word in words:

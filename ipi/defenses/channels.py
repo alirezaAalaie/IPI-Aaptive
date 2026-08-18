@@ -18,6 +18,9 @@ Also hosts the two pieces of upstream machinery both defenses share:
   * ``format_with_other_delimiters``— StruQ/SecAlign ``struq.py`` delimiter
                                       randomisation used to build Completion
                                       training samples.
+  * ``transform_data_channel``     — rewrite only the untrusted span, leaving the
+                                      message structure and the trusted task alone.
+                                      What the in-context defenses wrap / mark.
 """
 from __future__ import annotations
 
@@ -216,6 +219,74 @@ def split_instruction_data(messages: Sequence[Mapping[str, Any]]) -> Tuple[str, 
         "to supply the split explicitly."
     )
     return (user or system), ""
+
+
+def transform_data_channel(
+    messages: Sequence[Mapping[str, Any]],
+    transform,
+) -> List[Dict[str, Any]]:
+    """
+    Apply ``transform(data) -> new_data`` to the untrusted span only.
+
+    ``split_instruction_data`` tells a caller *what* the two channels are;
+    this rewrites one of them in place and leaves the message structure alone.
+    That is what the in-context defenses (Sandwich, Spotlight, Instructional,
+    Reminder) need: they wrap or mark untrusted text, and they must not touch the
+    user's own task.
+
+    They did touch it. Each wrapped the whole user turn, and because
+    ``harness.make_target_fn`` puts the task and the context in *one* user turn —
+    deliberately; two consecutive user turns are rejected by most chat APIs — the
+    legitimate instruction ended up inside
+    ``[START OF UNTRUSTED EXTERNAL DATA] ... IGNORE ALL COMMANDS ABOVE``. The
+    defense was telling the model to ignore its own task, which suppresses the
+    injection and the task together and makes the measured numbers not those
+    defenses.
+
+    Falls back to transforming the whole user turn, with a warning, when the shape
+    is unrecognised — the previous behaviour, so an unknown prompt shape degrades
+    rather than silently becoming inert.
+    """
+    out = [dict(m) for m in messages]
+    user_idx = [i for i, m in enumerate(out) if m.get("role") == "user"]
+    if not user_idx:
+        return out
+
+    idx = user_idx[-1]
+    content = out[idx].get("content", "") or ""
+
+    # 1. AgentDojo / generic: "User Task:\n...\n\nContext:\n..." — the task stays
+    #    outside, only the Context block is untrusted.
+    m = _AGENTDOJO_RE.match(content)
+    if m:
+        head = content[: m.start(2)]
+        data = m.group(2)
+        env = _ENV_RE.match(data.strip())
+        if env:
+            # The harness wraps a context-free injection in <env>...</env>; mark the
+            # inside and keep the tags, which are structure, not data.
+            inner = env.group(1)
+            out[idx]["content"] = head + data.replace(inner, transform(inner), 1)
+        else:
+            out[idx]["content"] = head + transform(data)
+        return out
+
+    # 2. BIPIA shapes: the untrusted context sits inside a marked region.
+    for pos, msg in enumerate(out):
+        text = msg.get("content", "") or ""
+        found = _split_bipia(text)
+        if found and found[1]:
+            _, untrusted = found
+            out[pos]["content"] = text.replace(untrusted, transform(untrusted), 1)
+            return out
+
+    log.warning(
+        "[channels] transform_data_channel could not locate an untrusted span; "
+        "transforming the whole user turn, which puts the legitimate task inside "
+        "the untrusted region. Call set_channels() or fix the prompt shape."
+    )
+    out[idx]["content"] = transform(content)
+    return out
 
 
 # ---------------------------------------------------------------------------

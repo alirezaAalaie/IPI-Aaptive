@@ -205,8 +205,9 @@ def build_momentum_word_dict(
         import nltk
         from nltk.corpus import stopwords
         stop_words = set(stopwords.words("english"))
-    except (ImportError, LookupError):
-        log.debug("[AutoDAN] nltk unavailable — momentum dictionary not updated")
+    except (ImportError, LookupError) as exc:
+        from ..mutation.rule import _warn_nltk_missing
+        _warn_nltk_missing("AutoDAN momentum dictionary", exc)
         return word_dict
 
     word_scores: dict[str, list[float]] = defaultdict(list)

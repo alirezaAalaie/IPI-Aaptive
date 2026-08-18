@@ -199,6 +199,30 @@ class EvalResult:
 # AttackEvaluator
 # ---------------------------------------------------------------------------
 
+def _innermost_prompt(victim):
+    """
+    The messages list closest to the model, walking down a chain of defenses.
+
+    Each ``DefendedVictim`` records its *own* output in ``last_input_messages``, so the
+    outermost wrapper holds the least-transformed prompt. Taking the first non-None —
+    the previous behaviour — reported ``CompositeDefense``'s record, and Composite has a
+    no-op ``preprocess_messages`` of its own: the transformations happen in the defenses
+    it chains underneath. The result was a ``final_prompt`` showing an untouched prompt
+    for a defense that had in fact rewritten it. The ASR was right; the audit trail was
+    not, which is worse than an obvious failure.
+    """
+    seen = set()
+    best = None
+    node = victim
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        found = getattr(node, "last_input_messages", None)
+        if found is not None:
+            best = found
+        node = getattr(node, "target", None) or getattr(node, "llm", None)
+    return best
+
+
 class AttackEvaluator:
     """
     Runs a BaseAttacker across an AttackDataset and decides success.
@@ -296,12 +320,8 @@ class AttackEvaluator:
                 r.success = self._check_success(r.target_response, instance)
                 r.utility_success = self._check_utility(r.target_response, instance)
 
-                # Extract the exact final messages/prompt seen by the model after defense transformation
-                final_prompt = getattr(self.target, "last_input_messages", None)
-                if final_prompt is None and hasattr(self.target, "target"):
-                    final_prompt = getattr(self.target.target, "last_input_messages", None)
-                if final_prompt is None and hasattr(self.target, "llm"):
-                    final_prompt = getattr(self.target.llm, "last_input_messages", None)
+                # The exact messages the model saw, after every defense transformation.
+                final_prompt = _innermost_prompt(self.target)
 
                 def_label = defense_name or type(self.target).__name__
 
