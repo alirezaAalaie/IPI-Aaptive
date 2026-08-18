@@ -193,6 +193,79 @@ def _dv_carrier():
         assert rec["pipeline_context"] == a["pipeline_context"]
 
 
+@check("selector: the scorer trims the logits head and survives an OOM")
+def _token_loss_memory():
+    """
+    The scored span sits at the end of the sequence, so all but ``target_len + 1`` logit
+    positions are discarded. Computing only those is ~46x less activation memory at a
+    typical prompt length — the difference between GCG running and OOMing on a 16 GB
+    card. Both the trimmed and untrimmed paths must return the *same* window, or the
+    loss is silently taken at the wrong positions.
+    """
+    import numpy as np
+    from ipi.datasets import AttackDataset, Instance
+    from ipi.selector import ADV_IDS
+    from ipi.selector import token_loss as tl
+
+    L, V, T = 12, 5, 3
+
+    class _Out:
+        def __init__(self, logits): self.logits = logits
+
+    class _Model:
+        def __init__(self, supports): self.supports = supports
+        def __call__(self, input_ids=None, use_cache=None, **kw):
+            keep = kw.get("logits_to_keep") or kw.get("num_logits_to_keep")
+            if kw and not self.supports:
+                raise TypeError("got an unexpected keyword argument")
+            n = keep or L
+            arr = np.zeros((len(input_ids), n, V))
+            for t in range(n):
+                arr[:, t, :] = (L - n) + t      # encode the absolute position
+            return _Out(arr)
+
+    want = list(range(L - (T + 1), L))
+    for supports in (True, False):
+        tl._LOGITS_KWARG = None
+        out = tl.forward_last_logits(_Model(supports), [[0] * L], T + 1)
+        got = [int(out[0, t, 0]) for t in range(T + 1)]
+        assert got == want, f"trimmed window is {got}, expected {want}"
+    tl._LOGITS_KWARG = None
+
+    # The first kept position must be target_start - 1: position t predicts token t+1.
+    assert want[0] == (L - T) - 1
+
+    # An OOM halves the batch and retries; nothing is skipped, and the reduction sticks.
+    sel = tl.TokenLossSelector.__new__(tl.TokenLossSelector)
+    sel.batch_size = 8
+    attempted = []
+
+    def _boom(batch):
+        attempted.append(len(batch))
+        if len(batch) > 2:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 286.00 MiB")
+        for inst in batch:
+            inst._loss = 1.0
+
+    sel._score_batch = _boom
+    ds = AttackDataset([Instance(id=str(i), query="g", attack_attrs={ADV_IDS: [1]})
+                        for i in range(6)])
+    tl.TokenLossSelector.score(sel, ds)
+    assert all(i._loss == 1.0 for i in ds), "the OOM backoff skipped a candidate"
+    assert sel.batch_size == 2, sel.batch_size
+    assert attempted[0] == 6 and attempted[-1] == 2, attempted
+
+    # A non-OOM failure must not be swallowed.
+    sel2 = tl.TokenLossSelector.__new__(tl.TokenLossSelector)
+    sel2.batch_size = 4
+    sel2._score_batch = lambda b: (_ for _ in ()).throw(RuntimeError("shape mismatch"))
+    try:
+        tl.TokenLossSelector.score(sel2, ds)
+        raise AssertionError("a non-OOM RuntimeError was swallowed by the backoff")
+    except RuntimeError as exc:
+        assert "shape mismatch" in str(exc)
+
+
 @check("selector: TokenLossSelector splices a batch without re-tokenizing")
 def _token_loss_selector():
     """

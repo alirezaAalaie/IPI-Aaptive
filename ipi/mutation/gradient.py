@@ -214,14 +214,16 @@ def score_candidates(
         batch_ids = input_ids.expand(b, -1).clone()               # (b, L)
         batch_ids[:, suffix_slice] = batch_cands                   # (b, L)
 
-        out = model(input_ids=batch_ids, use_cache=False, return_dict=True)
-        logits = out.logits   # (b, L, V)
-
         tgt_ids = input_ids[0, target_slice]                       # (T,)
         T = len(tgt_ids)
-        shift = target_slice.start - 1
-        # logits for predicting target tokens
-        tgt_logits = logits[:, shift: shift + T, :]                # (b, T, V)
+
+        # The target span sits at the end of the sequence, so only the last T+1 logit
+        # positions are ever read. Asking the model for just those is ~46x less
+        # activation memory at a typical prompt length — the difference between GCG
+        # running and OOMing on a 16 GB card.
+        from ..selector.token_loss import forward_last_logits
+        logits = forward_last_logits(model, batch_ids, T + 1)      # (b, T+1, V)
+        tgt_logits = logits[:, :T, :]                              # (b, T, V)
         tgt_ids_exp = tgt_ids.unsqueeze(0).expand(b, -1)           # (b, T)
 
         loss = F.cross_entropy(
@@ -232,7 +234,7 @@ def score_candidates(
 
         losses.extend(loss.tolist())
 
-        del batch_ids, out, logits
+        del batch_ids, logits
         gc.collect()
 
     return torch.tensor(losses)

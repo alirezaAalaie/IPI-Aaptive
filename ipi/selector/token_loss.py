@@ -43,10 +43,47 @@ from .base import SelectPolicy
 
 log = logging.getLogger(__name__)
 
-__all__ = ["TokenLossSelector", "ADV_IDS"]
+__all__ = ["TokenLossSelector", "ADV_IDS", "forward_last_logits"]
 
 #: Where a candidate carries its adversarial token span on the carrier.
 ADV_IDS = "adv_ids"
+
+#: Which kwarg this transformers version uses to trim the logits head, probed once.
+#: ``None`` before probing, ``False`` when the model supports neither.
+_LOGITS_KWARG = None
+
+
+def forward_last_logits(model, input_ids, keep: int):
+    """
+    Forward pass returning only the last ``keep`` logit positions.
+
+    The scored span sits at the end of the sequence, so the whole ``B x L x vocab``
+    logits tensor is thrown away except for ``keep`` positions of it. Asking the model
+    to compute only those is a large, free saving: at ``L=320`` and a six-token target
+    it is ~46x less activation memory, which is the difference between GCG running and
+    OOMing on a 16 GB card. Modern transformers exposes this as ``logits_to_keep``
+    (>=4.50) or ``num_logits_to_keep`` (>=4.45); older versions get the full tensor,
+    sliced afterwards, which is correct but not cheaper.
+
+    Returns a ``(B, keep, vocab)`` tensor.
+    """
+    global _LOGITS_KWARG
+
+    candidates = ([_LOGITS_KWARG] if _LOGITS_KWARG
+                  else ["logits_to_keep", "num_logits_to_keep"])
+    if _LOGITS_KWARG is not False:
+        for kwarg in candidates:
+            try:
+                out = model(input_ids=input_ids, use_cache=False, **{kwarg: keep})
+            except TypeError:
+                continue
+            _LOGITS_KWARG = kwarg
+            return out.logits[:, -keep:, :]
+        _LOGITS_KWARG = False
+        log.debug("[TokenLossSelector] transformers has no logits-trimming kwarg; "
+                  "scoring will materialise full logits")
+
+    return model(input_ids=input_ids, use_cache=False).logits[:, -keep:, :]
 
 
 class TokenLossSelector(SelectPolicy):
@@ -60,14 +97,17 @@ class TokenLossSelector(SelectPolicy):
                     prompt. BEAST calls this ``end_inst_token``.
         target_ids: The target string's ids. The loss is the mean CE over exactly these.
         batch_size: Candidates per forward pass. Unlike ``ReferenceLossSelector`` this
-                    defaults to something finite (64), because its callers routinely
+                    defaults to something finite (32), because its callers routinely
                     hand it 512 candidates and ``None`` would mean one batch of 512.
+                    Raise it if the card allows; the logits head is trimmed to the
+                    scored span, so activation memory is roughly
+                    ``batch_size * (len(target_ids) + 1) * vocab``.
         keep:       How many candidates ``select()`` returns. 1 for GCG's greedy step,
                     ``k1`` for BEAST's beam.
     """
 
     def __init__(self, victim, head_ids: list[int], tail_ids: list[int],
-                 target_ids: list[int], batch_size: int = 64, keep: int = 1):
+                 target_ids: list[int], batch_size: int = 32, keep: int = 1):
         super().__init__(None)
         if getattr(victim, "backend", None) != "local":
             raise ValueError(
@@ -135,12 +175,12 @@ class TokenLossSelector(SelectPolicy):
         input_ids = torch.tensor(rows, dtype=torch.long, device=device)
 
         with torch.no_grad():
-            logits = model(input_ids=input_ids, use_cache=False).logits
+            logits = forward_last_logits(model, input_ids, target_len + 1)
 
         # Position t's logits predict token t+1, so the target span's predictions start
-        # one step earlier. Same shift as gradient.score_candidates.
-        shift = target_start - 1
-        tgt_logits = logits[:, shift: shift + target_len, :]
+        # one step earlier. ``forward_last_logits`` has already trimmed to the last
+        # ``target_len + 1`` positions, which begin exactly at ``target_start - 1``.
+        tgt_logits = logits[:, :target_len, :]
         tgt_ids = input_ids[:, target_start: target_start + target_len]
         b = input_ids.shape[0]
         losses = F.cross_entropy(
@@ -154,11 +194,39 @@ class TokenLossSelector(SelectPolicy):
 
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_oom(exc: BaseException) -> bool:
+        return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
     def score(self, dataset: AttackDataset) -> AttackDataset:
-        """Score every candidate, writing ``instance._loss``. Returns the dataset."""
+        """
+        Score every candidate, writing ``instance._loss``. Returns the dataset.
+
+        On a CUDA OOM the batch size is halved and the batch retried, down to 1. A
+        gradient search that dies on step 1 of scenario 1 wastes the whole run, and the
+        right batch size depends on the prompt length and the card — neither of which
+        the caller can know in advance. The reduction sticks for the rest of the run.
+        """
         instances = list(dataset)
-        for start in range(0, len(instances), self.batch_size):
-            self._score_batch(instances[start: start + self.batch_size])
+        start = 0
+        while start < len(instances):
+            batch = instances[start: start + self.batch_size]
+            try:
+                self._score_batch(batch)
+            except Exception as exc:                       # noqa: BLE001
+                if not self._is_oom(exc) or self.batch_size <= 1:
+                    raise
+                self.batch_size = max(1, self.batch_size // 2)
+                log.warning(
+                    "[TokenLossSelector] CUDA OOM scoring %d candidates — retrying at "
+                    "batch_size=%d for the rest of the run", len(batch), self.batch_size)
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                continue
+            start += len(batch)
         return dataset
 
     def n_batches(self, n_candidates: int) -> int:

@@ -159,7 +159,7 @@ def run_gcg(
     adv_suffix_len: int = 20,
     batch_size: int = 512,
     top_k: int = 256,
-    batch_size_eval: int = 128,
+    batch_size_eval: int = 32,
     allow_non_ascii: bool = False,
     # Multi-target (universal) support
     multi_targets: Optional[list[tuple[str, str]]] = None,
@@ -192,7 +192,9 @@ def run_gcg(
         adv_suffix_len:    Suffix length in tokens. Default 20.
         batch_size:        Candidates proposed per step. Default 512.
         top_k:             Gradient-favoured tokens per position. Default 256.
-        batch_size_eval:   Candidates per scoring forward pass. Default 128.
+        batch_size_eval:   Candidates per scoring forward pass. Default 32 — the
+                           scored span is trimmed to the target, so this is the
+                           knob to raise on a big card and lower on a 16 GB one.
         allow_non_ascii:   Permit non-ASCII tokens in the suffix. Default False.
         multi_targets:     ``[(prefix, target), ...]`` for universal GCG — the loss is
                            averaged across pairs, each with its own prompt split.
@@ -380,7 +382,7 @@ class GCGAttacker(AdaptiveAttacker):
         num_steps:          Optimisation iterations. Default 500.
         batch_size:         Candidate substitutions per step. Default 512.
         top_k:              Gradient-guided token candidates per position. Default 256.
-        batch_size_eval:    Mini-batch size for candidate scoring. Default 128.
+        batch_size_eval:    Mini-batch size for candidate scoring. Default 32.
         allow_non_ascii:    Allow non-ASCII tokens in suffix. Default False.
         eval_mode:          IPI success check mode. Default None → read the
                             instance's own attack_eval_mode.
@@ -397,7 +399,7 @@ class GCGAttacker(AdaptiveAttacker):
         num_steps: int = 500,
         batch_size: int = 512,
         top_k: int = 256,
-        batch_size_eval: int = 128,
+        batch_size_eval: int = 32,
         allow_non_ascii: bool = False,
         eval_mode: Optional[str] = None,
         adv_init: str = "",
