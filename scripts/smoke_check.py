@@ -97,7 +97,12 @@ def _no_legacy():
     wrong ASR, not a traceback. Fail loudly here instead.
     """
     import importlib
-    for mod in ("ipi.dataset", "ipi.evaluator"):
+    # ipi.evaluators / ipi.targets were *packages*. Git does not track empty directories,
+    # so deleting their contents left the bare directories behind in every existing
+    # checkout — where Python 3 happily imports them as empty namespace packages. A fresh
+    # clone and the Kaggle wheel do not have them, so a stale local tree behaves
+    # differently from CI: exactly the divergence that makes a bug irreproducible.
+    for mod in ("ipi.dataset", "ipi.evaluator", "ipi.evaluators", "ipi.targets"):
         try:
             importlib.import_module(mod)
         except ImportError:
