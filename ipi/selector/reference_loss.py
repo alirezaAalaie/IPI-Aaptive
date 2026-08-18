@@ -61,10 +61,16 @@ class ReferenceLossSelector(SelectPolicy):
                       candidates, an OOM for a gradient-scale set. Set it explicitly there.
         is_universal: Score each ``jailbreak_prompt`` across the whole dataset rather
                       than within each parent's group.
+        prompt_builder: ``Callable(injection: str) -> messages``, normally
+                      ``harness.build_optimization_messages`` bound to the instance.
+                      Without it the selector builds a bare ``[system][user]`` pair,
+                      which is *not* what the victim is given for an IPI scenario — the
+                      same mismatch that made GCG / BEAST / AutoDAN optimize a prompt
+                      nobody sends. Pass it for any benchmark run.
     """
 
     def __init__(self, victim, batch_size: Optional[int] = None,
-                 is_universal: bool = False):
+                 is_universal: bool = False, prompt_builder=None):
         super().__init__(None)
         if getattr(victim, "backend", None) != "local":
             raise ValueError(
@@ -76,26 +82,36 @@ class ReferenceLossSelector(SelectPolicy):
         self.victim = victim
         self.batch_size = batch_size
         self.is_universal = is_universal
+        self.prompt_builder = prompt_builder
 
     # ------------------------------------------------------------------
 
     def _prompt_text(self, instance: Instance) -> str:
-        """The text the victim sees, up to where it starts generating."""
-        tokenizer = self.victim.tokenizer
+        """
+        The text the victim sees, up to where it starts generating.
+
+        Goes through ``prompt_builder`` when one is given, so the loss is computed on
+        the victim's real prompt — IPI carrier and defense included — rather than a bare
+        ``[system][user]`` pair. The bare shape stays the default because the selector
+        is also usable standalone, but scoring against it while judging success through
+        ``harness.make_target_fn`` is the mismatch that invalidated the white-box rows.
+        """
+        from ..llm_unified import render_messages
+
         jailbreak_prompt = instance.jailbreak_prompt or "{query}"
         content = jailbreak_prompt.replace("{query}", instance.query or "")
 
-        messages = []
-        system_prompt = getattr(self.victim, "system_prompt", "")
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": content})
-        try:
-            return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            return "\n".join(f"[{m['role'].upper()}] {m['content']}"
-                             for m in messages) + "\n[ASSISTANT] "
+        if self.prompt_builder is not None:
+            messages = self.prompt_builder(content)
+        else:
+            messages = []
+            system_prompt = getattr(self.victim, "system_prompt", "")
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": content})
+
+        text, _ = render_messages(self.victim.tokenizer, messages)
+        return text
 
     def _pad_id(self) -> int:
         """A token id safe to pad with. Value is irrelevant — pads are masked out."""
@@ -207,6 +223,22 @@ class ReferenceLossSelector(SelectPolicy):
 
     # ------------------------------------------------------------------
 
+    def score(self, dataset: AttackDataset) -> AttackDataset:
+        """
+        Score every candidate, writing ``instance._loss``. Returns the dataset.
+
+        ``select()`` keeps only the winner, which is what GCG and BEAST want. A genetic
+        search needs the whole fitness vector — AutoDAN's roulette wheel is over all of
+        it — so the scoring pass is public on its own. Same batching, same masked-label
+        formulation; the only difference is that nothing is discarded.
+        """
+        instances = list(dataset)
+        # `or 1` guards the empty dataset: range(0, 0, 0) raises rather than doing nothing.
+        size = self.batch_size or len(instances) or 1
+        for start in range(0, len(instances), size):
+            self._score_batch(instances[start: start + size])
+        return dataset
+
     def select(self, dataset: AttackDataset) -> AttackDataset:
         """The lowest-loss group of candidates. Writes ``instance._loss`` on the way."""
         if not self.is_universal and len(dataset.group_by_parents()) > 1:
@@ -215,11 +247,7 @@ class ReferenceLossSelector(SelectPolicy):
                 for group in dataset.group_by_parents().values()
             ])
 
-        instances = list(dataset)
-        # `or 1` guards the empty dataset: range(0, 0, 0) raises rather than doing nothing.
-        size = self.batch_size or len(instances) or 1
-        for start in range(0, len(instances), size):
-            self._score_batch(instances[start: start + size])
+        self.score(dataset)
 
         best_group = None
         best_loss = None

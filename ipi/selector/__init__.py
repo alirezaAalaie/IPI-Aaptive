@@ -30,8 +30,10 @@ from .policies import (
     EXP3SelectPolicy,
     MCTSExploreSelectPolicy,
     SelectBasedOnScores,
+    GeneticSelectPolicy,
 )
 from .reference_loss import ReferenceLossSelector
+from .token_loss import TokenLossSelector, ADV_IDS
 
 __all__ = [
     "SelectPolicy",
@@ -41,5 +43,8 @@ __all__ = [
     "EXP3SelectPolicy",
     "MCTSExploreSelectPolicy",
     "SelectBasedOnScores",
+    "GeneticSelectPolicy",
     "ReferenceLossSelector",
+    "TokenLossSelector",
+    "ADV_IDS",
 ]

@@ -273,6 +273,82 @@ class MCTSExploreSelectPolicy(SelectPolicy):
             self.rewards[node.index] += reward * discount
 
 
+class GeneticSelectPolicy(SelectPolicy):
+    """
+    AutoDAN's selection rule: keep the elites, breed the rest by roulette wheel.
+
+    ``select()`` returns the whole next generation's *parents* — ``num_elites`` best
+    candidates passed through untouched, then ``size - num_elites`` drawn with
+    replacement by softmax roulette over fitness. A recipe then runs its crossover and
+    mutation operators over the parents and puts the elites back in front.
+
+    Fitness is read from ``Instance.eval_results[-1]`` and is **higher-is-better**. A
+    loss-driven search (``ReferenceLossSelector`` writes ``instance._loss``) must negate
+    first — upstream's ``autodan_sample_control`` opens with ``score_list = [-x for x in
+    score_list]`` for exactly this reason, and getting the sign wrong inverts the search
+    without erroring.
+
+    Args:
+        dataset:     Candidate pool. Also accepted per-call by ``select()``.
+        num_elites:  Candidates carried over unchanged. Upstream is
+                     ``max(1, int(batch_size * 0.05))``.
+        if_softmax:  Softmax roulette (upstream's default) or score-proportional.
+        seed:        RNG seed.
+    """
+
+    def __init__(self, dataset: Optional[AttackDataset] = None, num_elites: int = 1,
+                 if_softmax: bool = True, seed: Optional[int] = None):
+        super().__init__(dataset, seed)
+        self.num_elites = num_elites
+        self.if_softmax = if_softmax
+        self._np_rng = np.random.default_rng(seed)
+
+    @staticmethod
+    def _fitness(instance: Instance) -> float:
+        return float(instance.eval_results[-1]) if instance.eval_results else float("-inf")
+
+    def elites(self, dataset: Optional[AttackDataset] = None) -> list[Instance]:
+        """The ``num_elites`` fittest candidates, best first."""
+        pool = list(dataset if dataset is not None else self.dataset)
+        return sorted(pool, key=self._fitness, reverse=True)[:self.num_elites]
+
+    def roulette(self, dataset: Optional[AttackDataset] = None,
+                 n: Optional[int] = None) -> list[Instance]:
+        """``n`` parents drawn with replacement, weighted by fitness."""
+        pool = list(dataset if dataset is not None else self.dataset)
+        if not pool:
+            return []
+        n = len(pool) - self.num_elites if n is None else n
+        if n <= 0:
+            return []
+
+        scores = np.array([self._fitness(i) for i in pool], dtype=np.float64)
+        # An -inf (unscored, or a degenerate candidate the loss selector gave up on)
+        # would poison both branches; floor it to the worst finite score.
+        finite = scores[np.isfinite(scores)]
+        scores = np.where(np.isfinite(scores), scores,
+                          finite.min() if finite.size else 0.0)
+
+        if self.if_softmax:
+            probs = np.exp(scores - scores.max())
+        else:
+            probs = scores - scores.min()      # shift to non-negative
+        total = probs.sum()
+        probs = probs / total if total > 0 else np.full(len(pool), 1.0 / len(pool))
+
+        idx = self._np_rng.choice(len(pool), size=n, p=probs, replace=True)
+        return [pool[i] for i in idx]
+
+    def select(self, dataset: Optional[AttackDataset] = None) -> AttackDataset:
+        """Elites first, then the roulette-drawn parents — one full generation."""
+        pool = AttackDataset(list(dataset if dataset is not None else self.dataset))
+        return AttackDataset(self.elites(pool) + self.roulette(pool))
+
+    def update(self, dataset: AttackDataset):
+        """Genetic selection is stateless between generations — fitness is on the pool."""
+        return
+
+
 class SelectBasedOnScores(SelectPolicy):
     """
     Keep the ``tree_width`` highest-scoring candidates — TAP's pruning step.

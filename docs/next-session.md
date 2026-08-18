@@ -19,7 +19,8 @@ python3 scripts/check_pisanitizer_fidelity.py     # port vs vendored upstream
 python3 -m compileall -q ipi                      # torch-gated modules only parse-check
 ```
 
-All six pass as of commit `7fa523e`. Run them before and after anything. If one fails before
+All six pass as of the white-box prompt-seam fix (audit findings 1-5); see
+`docs/attack-fidelity-audit.md`. Run them before and after anything. If one fails before
 you have touched anything, stop and find out why — do not "fix" it forward.
 
 **Read order for a cold start:** this file → `docs/refactor-handoff.md` §0 and §7 →
@@ -65,27 +66,29 @@ wrong and every seed-based attack breaks at import on Kaggle.
 
 ## 2. The GPU validation pass *(blocking for any white-box number)*
 
-No torch and no GPU existed in the sandbox where the last two sessions' changes were written.
-The following code has been **read and compile-checked, never executed**. It is small and
-local, but it is the first thing to run on a real machine.
+No torch and no GPU has existed in any sandbox these changes were written in. Everything
+below has been **read, compile-checked and dry-run with stubs, never executed against a
+model**. It is the first thing to run on a real machine, and it is now a larger surface
+than it was: the three white-box recipes were rewritten onto the component families.
 
-| Where | What changed | What to look for |
-|---|---|---|
-| `attacks/beast.py` `run_scenario` | now composes `prompt_prefix + instance.query` | the injection actually contains the goal; check one `ScenarioResult.injection` by eye |
-| `attacks/beast.py` end of `run_beast` | `n_queries = 1`, `n_forward_passes = (steps_run + 1) * k1 * k2` | `steps_run` reflects a `budget_seconds` cut-off, not the full loop |
-| `attacks/gcg.py` | `eval_target_str` threaded through; `n_forward` split from `n_queries` | success fires on the full target, not the prefix; counters are plausible |
-| `mutation/gradient.py` | pure move out of `attacks/gcg.py` | it *imports* — the maths was AST-compared against the prior commit, so only the wiring is new |
-| `selector/reference_loss.py` `_score_batch` | batched forward + masked-label CE | the block itself; `_build_batch` around it is already mutation-tested without torch |
+| Where | What to look for |
+|---|---|
+| `harness.split_optimization_prompt` | on a real tokenizer, `head + tail` must equal `render_messages(build_optimization_messages(...))`, and `head` must not contain the generation prompt. The torch-free half is pinned by a smoke check; the tokenizer half is not. |
+| `selector/token_loss.py` `_score_batch` | the tensor block. `_build_batch` is checked without torch; the shift-by-one and the CE reduction are not. Cross-check one candidate against `mutation.gradient.score_candidates` — they should agree to ~1e-4. |
+| `mutation/gradient.py` `TokenGradientMutation` | one forward+backward per call; children differ from the parent in exactly one position. |
+| `mutation/gradient.py` `BeamTokenExpansion` | one batched forward for the whole beam; each child is exactly one token longer. |
+| `attacks/gcg.py` | the suffix is inside the user turn (decode `head_ids + adv_ids + tail_ids` and read it); loss decreases; `n_forward` counts passes and `n_queries` counts victim calls. |
+| `attacks/beast.py` | same, plus `n_forward` reflecting a `budget_seconds` cut-off rather than the full loop. |
+| `attacks/autodan.py` | `ReferenceLossSelector.score` batches — one forward per `score_batch_size`, not per candidate. Time a generation and divide. |
+| `selector/reference_loss.py` `prompt_builder` | the loss is computed on the carrier prompt now; confirm the rendered text contains the user task. |
 
-**A cheap equivalence test for the selector**, which is the one place a silent numerical error
-could hide: score the same small dataset with `batch_size=1` and with `batch_size=None` and
-assert the per-instance `_loss` values agree to ~1e-4. They are the same computation by
-construction (right padding + causal attention), so a mismatch means the masking is wrong.
+**Cheap equivalence tests worth running first**, both of which should hold by construction:
 
-RS and Beam-RS are the exception to all of this — their `eval_target_str` split *is* exercised
-against a mock victim in `smoke_check.py`, so they need no special attention.
-
----
+- `ReferenceLossSelector` at `batch_size=1` and `batch_size=None` on the same dataset —
+  agree to ~1e-4.
+- `TokenLossSelector.score` against `mutation.gradient.score_candidates` on the same
+  candidates — same losses. They are two implementations of one formula, and only one of
+  them has ever been the basis of a published number.
 
 ## 3. Re-baseline the numbers *(blocked by 1 and 2)*
 

@@ -1,17 +1,26 @@
 """
-The GCG token-gradient step — the one white-box mutation primitive.
+The white-box token operators — the mutations that rewrite *tokens*, not text.
 
 Phase E's deferred item. The rest of ``ipi/mutation/`` rewrites *text*: an LLM
 paraphrases a template, or a rule base64-encodes it. This family rewrites *tokens*,
 guided by the gradient of the target's own loss, and so it is the only operator that
 needs white-box access.
 
-    build_input_ids            [system][user: prefix+suffix][assistant: target] + slices
+    TokenGradientMutation      GCG's step as a MutationBase: 1 parent -> B children
+    BeamTokenExpansion         BEAST's step as a MutationBase: 1 parent -> k children
+
+    build_input_ids            head + adv suffix + tail + target ids, and their slices
     compute_loss_and_grads     forward + backward -> (loss, d loss / d one-hot suffix)
     get_embedding_matrix       the model's token embedding weights
     sample_candidates          gradient top-k -> B candidate suffixes, one swap each
     score_candidates           teacher-forced CE for every candidate, batched
     build_not_allowed_ids      the non-ASCII / special-token exclusion set
+
+A candidate carries its adversarial span in ``attack_attrs["adv_ids"]``
+(``selector.ADV_IDS``), and ``selector.TokenLossSelector`` scores a batch of them by
+concatenation alone — no per-candidate re-tokenization. That is what makes the carrier
+affordable here: the objection was never the ``Instance`` wrapper, it was re-encoding a
+prompt 512 times per step.
 
 **Extracted from our own ``attacks/gcg.py``, not from upstream.** EasyJailbreak's
 ``MutationTokenGradient`` is written against their ``WhiteBoxModelBase`` — the layer our
@@ -19,14 +28,19 @@ needs white-box access.
 These functions are byte-identical to the ones ``attacks/gcg.py`` has always used; that
 file now imports them from here, so there is one implementation.
 
-Why there is no ``MutationBase`` subclass here yet
---------------------------------------------------
-Every other operator is 1-to-n over ``Instance`` *text*. This one is 1-to-B over token
-**ids**, at ~512 candidates per step, scored in batches that share a KV prefix. Wrapping
-each candidate in an ``Instance`` and selecting with ``ReferenceLossSelector`` — which
-re-encodes text and runs one unbatched forward per instance — would be correct and
-roughly two orders of magnitude slower. The wrapper lands with the GCG recipe migration,
-once that trade-off has been decided and measured. See ``docs/refactor-handoff.md`` §6a.
+Why these are ``MutationBase`` subclasses over a *token* field
+--------------------------------------------------------------
+Every other operator is 1-to-n over ``Instance`` text. These are 1-to-B over token ids,
+at ~512 candidates per step. Wrapping each candidate in an ``Instance`` and selecting
+with ``ReferenceLossSelector`` would re-render and re-tokenize the prompt once per
+candidate — correct, and roughly two orders of magnitude slower. ``TokenLossSelector``
+removes that cost by keeping the prefix and suffix as fixed id lists, so the recipes get
+the component shape at the price of an object allocation per candidate.
+
+``MutationBase.mutate`` guards *text* (empty output, a dropped ``{query}``), which does
+not apply to an id list, so both classes override ``_get_mutated_instance`` directly and
+leave ``_mutate`` unused. They still go through ``new_child``, so lineage is recorded the
+same way as everywhere else.
 
 ``torch`` is imported at module load, so this module is torch-gated like the white-box
 attacks: ``ipi/mutation/__init__.py`` must not import it eagerly.
@@ -40,9 +54,15 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from ..selector.token_loss import ADV_IDS
+from .base import MutationBase
+
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "TokenGradientMutation",
+    "BeamTokenExpansion",
+    "sample_top_p",
     "build_input_ids",
     "compute_loss_and_grads",
     "get_embedding_matrix",
@@ -58,49 +78,44 @@ __all__ = [
 
 def build_input_ids(
     tokenizer,
-    system_prompt: str,
-    adv_prefix: str,
     adv_suffix_ids: list[int],
     target_str: str,
     device,
+    head_text: str,
+    tail_text: str = "",
+    add_special_tokens: bool = False,
 ) -> tuple[torch.Tensor, slice, slice]:
     """
-    Build the full input token sequence:
-      [system] [user: adv_prefix + adv_suffix] [assistant: target_str]
+    Assemble the full input token sequence around the adversarial suffix.
+
+        encode(head_text) + adv_suffix_ids + encode(tail_text) + encode(target_str)
+
+    ``head_text`` / ``tail_text`` come from ``harness.split_optimization_prompt`` (the
+    real victim prompt, carrier and defense included) or ``llm_unified.bare_prompt_split``
+    (a plain ``[system][user]`` pair). Both are rendered from one
+    ``apply_chat_template`` call and split on a marker, which is what puts the suffix
+    *inside* the user turn.
+
+    It used to build its own ``[system][user: adv_prefix]`` prompt with
+    ``add_generation_prompt=True`` and append the suffix after it. That was wrong twice
+    over: the suffix landed in the *assistant* turn, after the generation prompt, and
+    the prompt had none of the IPI carrier the victim is actually given. Both failures
+    are silent — the loss goes down, the attack just is not attacking the right string.
 
     Returns:
         input_ids: (1, L) long tensor on `device`.
         suffix_slice: slice into input_ids for the adv_suffix tokens.
         target_slice: slice into input_ids for the target_str tokens.
     """
-    # Build messages list
-    messages: list[dict] = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": adv_prefix})  # prefix only for now
-
-    # Encode the prompt (without suffix and target)
-    try:
-        prompt_text: str = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-    except Exception:
-        prompt_text = (
-            (f"[SYSTEM] {system_prompt}\n\n" if system_prompt else "")
-            + f"[USER] {adv_prefix}\n[ASSISTANT] "
-        )
-
-    prompt_ids: list[int] = tokenizer.encode(prompt_text, add_special_tokens=False)
-
-    # Target tokens
+    head_ids:   list[int] = tokenizer.encode(head_text, add_special_tokens=add_special_tokens)
+    tail_ids:   list[int] = tokenizer.encode(tail_text, add_special_tokens=False) if tail_text else []
     target_ids: list[int] = tokenizer.encode(target_str, add_special_tokens=False)
 
-    # Full sequence: prompt + adv_suffix + target
-    full_ids = prompt_ids + adv_suffix_ids + target_ids
+    full_ids = head_ids + adv_suffix_ids + tail_ids + target_ids
 
-    suffix_start = len(prompt_ids)
+    suffix_start = len(head_ids)
     suffix_end   = suffix_start + len(adv_suffix_ids)
-    target_start = suffix_end
+    target_start = suffix_end + len(tail_ids)
     target_end   = target_start + len(target_ids)
 
     suffix_slice = slice(suffix_start, suffix_end)
@@ -285,3 +300,197 @@ def build_not_allowed_ids(tokenizer, allow_non_ascii: bool = False) -> Optional[
     if disallowed:
         return torch.tensor(disallowed, dtype=torch.long)
     return None
+
+
+@torch.no_grad()
+def sample_top_p(probs: torch.Tensor, p: float, return_tokens: int = 0) -> torch.Tensor:
+    """
+    Top-p (nucleus) sampling. Returns the sampled token indices.
+
+    Exact port of ``arutils.sample_top_p``. Lived in ``attacks/beast.py`` until
+    ``BeamTokenExpansion`` needed it too.
+
+    Args:
+        probs:         Softmax probabilities, ``(batch, vocab)``.
+        p:             Nucleus mass to keep.
+        return_tokens: Tokens to draw per row. 0 means 1.
+
+    Returns:
+        ``(batch, max(1, return_tokens))`` of token indices.
+    """
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_cum = torch.cumsum(probs_sort, dim=-1)
+    mask = (probs_cum - probs_sort) > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=max(1, return_tokens))
+    return torch.gather(probs_idx, -1, next_token)
+
+
+# ---------------------------------------------------------------------------
+# The operators
+# ---------------------------------------------------------------------------
+
+class _TokenMutation(MutationBase):
+    """
+    Shared plumbing for the two token operators.
+
+    ``attr_name`` is nominal — neither writes an ``Instance`` text field. What they
+    rewrite is ``attack_attrs[ADV_IDS]``, and ``_child`` is the one place that happens,
+    so the lineage edge and the span are always set together.
+    """
+
+    attr_name = "jailbreak_prompt"
+
+    @staticmethod
+    def _adv_ids(instance) -> list[int]:
+        ids = instance.attack_attrs.get(ADV_IDS)
+        if ids is None:
+            raise ValueError(
+                f"instance {instance.id!r} has no attack_attrs[{ADV_IDS!r}]; seed the "
+                "search with one before mutating")
+        return list(ids)
+
+    def _child(self, parent, adv_ids: list[int]):
+        child = self.new_child(parent)
+        child.attack_attrs[ADV_IDS] = list(adv_ids)
+        child.target_responses = []
+        child.eval_results = []
+        return child
+
+    def _mutate(self, text: str, **kwargs) -> str:      # pragma: no cover - unused
+        raise NotImplementedError(
+            f"{type(self).__name__} rewrites token ids, not text; use the dataset path")
+
+
+class TokenGradientMutation(_TokenMutation):
+    """
+    GCG's step: one parent, ``batch_size`` children, each one token-swap away.
+
+    A forward+backward pass gives the gradient of the target loss w.r.t. the one-hot
+    adversarial tokens; each child picks a random position and one of the top-``top_k``
+    tokens the gradient favours there. The *selection* among them is
+    ``selector.TokenLossSelector`` — this operator proposes, it does not score.
+
+    Args:
+        model:      The victim's HF model.
+        head_ids / tail_ids / target_ids: the fixed spans around the adversarial one,
+                    from ``harness.split_optimization_prompt``.
+        device:     Where to build the tensors.
+        batch_size: Children per call. GCG's default is 512.
+        top_k:      Gradient-favoured tokens considered per position. Default 256.
+        not_allowed_ids: Token ids excluded from substitution (non-ASCII / specials).
+    """
+
+    def __init__(self, model, head_ids: list[int], tail_ids: list[int],
+                 target_ids: list[int], device, batch_size: int = 512,
+                 top_k: int = 256, not_allowed_ids=None, attr_name: Optional[str] = None):
+        super().__init__(attr_name)
+        self.model = model
+        self.head_ids = list(head_ids)
+        self.tail_ids = list(tail_ids)
+        self.target_ids = list(target_ids)
+        self.device = device
+        self.batch_size = batch_size
+        self.top_k = top_k
+        self.not_allowed_ids = not_allowed_ids
+        #: Set by each call — the parent's own loss, which the recipe reports.
+        self.last_loss: float = float("inf")
+
+    def _build_ids(self, adv_ids: list[int]):
+        """``(input_ids, suffix_slice, target_slice)`` for one candidate."""
+        full = self.head_ids + adv_ids + self.tail_ids + self.target_ids
+        start = len(self.head_ids)
+        suffix_slice = slice(start, start + len(adv_ids))
+        tgt_start = suffix_slice.stop + len(self.tail_ids)
+        target_slice = slice(tgt_start, tgt_start + len(self.target_ids))
+        return (torch.tensor([full], dtype=torch.long, device=self.device),
+                suffix_slice, target_slice)
+
+    def _get_mutated_instance(self, instance, **kwargs) -> list:
+        adv_ids = self._adv_ids(instance)
+        input_ids, suffix_slice, target_slice = self._build_ids(adv_ids)
+
+        self.model.zero_grad()
+        loss, grads = compute_loss_and_grads(
+            model=self.model, input_ids=input_ids,
+            suffix_slice=suffix_slice, target_slice=target_slice)
+        self.last_loss = float(loss)
+
+        candidates = sample_candidates(
+            grads=grads,
+            suffix_ids=torch.tensor(adv_ids, dtype=torch.long, device=self.device),
+            top_k=self.top_k, batch_size=self.batch_size,
+            not_allowed_ids=self.not_allowed_ids)
+
+        children = [self._child(instance, row) for row in candidates.tolist()]
+        del input_ids, grads
+        gc.collect()
+        return children
+
+
+class BeamTokenExpansion(_TokenMutation):
+    """
+    BEAST's step: one parent, ``k`` children, each one sampled token longer.
+
+    A single forward pass over ``head + adv`` gives the next-token distribution; ``k``
+    tokens are drawn from its top-p nucleus and each becomes a child. Upstream calls
+    this ``k2``. The beam pruning that follows is ``selector.TokenLossSelector(keep=k1)``.
+
+    The tokens are sampled from the *unclosed* user turn — no generation prompt in
+    ``head_ids`` — so they extend the user message, which is where the victim will read
+    them. That is the whole point of the head/tail split.
+
+    Args:
+        victim:  A local ``Victim`` (needs ``generate_n_tokens_batch``).
+        head_ids: Ids before the adversarial span.
+        k:       Children per parent (upstream's ``k2``). Default 15.
+        top_p / top_k / temperature: sampling controls, passed straight through.
+    """
+
+    def __init__(self, victim, head_ids: list[int], k: int = 15, top_p: float = 1.0,
+                 top_k: Optional[int] = None, temperature: float = 1.0,
+                 attr_name: Optional[str] = None):
+        super().__init__(attr_name)
+        self.victim = victim
+        self.head_ids = list(head_ids)
+        self.k = k
+        self.top_p = top_p
+        self.top_k = top_k
+        self.temperature = temperature
+
+    def __call__(self, dataset, **kwargs):
+        """
+        Batched across the whole beam — one forward pass for every parent at once.
+
+        The default ``MutationBase.__call__`` walks instances one at a time; for BEAST
+        that would be ``k1`` forward passes per step instead of one, which is most of
+        the attack's cost.
+        """
+        from ..datasets import AttackDataset
+
+        parents = list(dataset)
+        if not parents:
+            return AttackDataset([])
+
+        seqs = [self.head_ids + self._adv_ids(p) for p in parents]
+        max_bs = getattr(self.victim, "max_bs", 50) or 50
+        sampled: list[list[int]] = []
+        for start in range(0, len(seqs), max_bs):
+            batch = seqs[start: start + max_bs]
+            logits, _ = self.victim.generate_n_tokens_batch(
+                batch, max_gen_len=1, temperature=self.temperature,
+                top_p=self.top_p, top_k=self.top_k)
+            probs = torch.softmax(logits[:, 0], dim=-1)
+            drawn = sample_top_p(probs, self.top_p, return_tokens=self.k)
+            sampled.extend(drawn[:, : self.k].tolist())
+
+        children = []
+        for parent, next_ids in zip(parents, sampled):
+            adv = self._adv_ids(parent)
+            children.extend(self._child(parent, adv + [int(t)]) for t in next_ids)
+        return AttackDataset(children)
+
+    def _get_mutated_instance(self, instance, **kwargs) -> list:
+        from ..datasets import AttackDataset
+        return list(self(AttackDataset([instance])))

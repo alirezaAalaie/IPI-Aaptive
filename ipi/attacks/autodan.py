@@ -1,62 +1,80 @@
 """
-AutoDAN (Automatic and Diverse Attack Networks) adapted for Indirect Prompt Injection.
+AutoDAN (Hierarchical Genetic Algorithm) adapted for Indirect Prompt Injection.
 
 Original paper: Liu et al. (2023), "AutoDAN: Generating Stealthy Jailbreak Prompts on
 Aligned Large Language Models"
 arXiv: https://arxiv.org/abs/2310.04451
 
-Algorithm: Hierarchical Genetic Algorithm (HGA) over readable natural-language suffixes.
-  1. Initialise a population of candidate injection strings (from seed templates).
+Algorithm: a genetic algorithm over readable natural-language injection templates.
+  1. Seed a population from the template pool.
   2. Each generation:
-     a. Score every candidate: cross-entropy loss(target_str | candidate + context).
-        Lower loss = candidate more likely to produce target_str.
-     b. Select elites (best num_elites by loss).
-     c. For the remaining slots, use roulette-wheel selection of parents.
-     d. Apply paragraph-level sentence crossover to selected parent pairs.
-     e. Apply mutation: either LLM-based rewrite (if llm_mutator provided)
-        or synonym replacement (local NLTK fallback).
-     f. Every hga_period steps, additionally apply HGA word-replacement
-        guided by a word-score dictionary built from past performance.
-  3. Return the best injection when success is detected or budget is exhausted.
+     a. Score every candidate by cross-entropy loss(target_str | candidate).
+        Lower loss = the victim is more likely to emit target_str.
+     b. Keep the elites; draw the rest of the parents by softmax roulette on fitness.
+     c. Recombine and mutate the parents.
+     d. Every ``hga_period`` steps the HGA variant swaps the word-level operator in,
+        driven by a momentum dictionary of which words appear in fit candidates.
+  3. Stop on success, or when the budget runs out.
 
-Two variants are provided:
-  run_autodan_ga  — pure GA (standard variant, no word-dict).
-  run_autodan_hga — HGA variant (alternates GA and word-dict-guided word replacement).
+  run_autodan_ga   — pure GA (sentence crossover + mutation).
+  run_autodan_hga  — HGA: alternates the GA step with word-level replacement.
 
-Local-only: AutoDAN requires white-box access to the target model (forward passes
-for loss computation). Use ``LocalLLM`` or a ``Victim`` subclass with ``backend='local'``.
+Local-only: AutoDAN needs white-box access (forward passes for the loss). Use
+``LocalLLM`` or any ``Victim`` with ``backend == "local"``.
+
+Composition
+-----------
+The population is an ``AttackDataset`` of ``Instance``s — ``jailbreak_prompt`` is the
+candidate template, ``eval_results[-1]`` its fitness. Every part comes from a family:
+
+    fitness      ``selector.ReferenceLossSelector.score`` — one batched forward pass per
+                 ``batch_size`` candidates, not one per candidate
+    selection    ``selector.GeneticSelectPolicy`` — elites plus softmax roulette
+    crossover    ``mutation.SentenceCrossOver``
+    mutation     ``mutation.ReplaceWordsWithSynonyms`` (HGA's word-level operator), or
+                 any ``llm_mutator`` callable
+    seeds        ``seed.sample_population``
+    success      ``metrics.check_ipi_success``
+
+This recipe used to inline all five — its own crossover, synonym replacement, word
+roulette, momentum dictionary and elite/roulette selection — duplicating operators that
+already existed in ``ipi/mutation/`` and ``ipi/selector/``. Going through the families
+also buys the batching: scoring was one forward pass *per candidate*, so a population of
+64 cost 64 passes per generation.
 
 IPI adaptations vs original
 ----------------------------
   target_str:
-      Original: "Sure, here is a tutorial for making a bomb:"  (jailbreak compliance prefix)
-      IPI:      The expected agent action / tool call string, e.g.
-                "send_email(to='evil@x.com', subject='...')".
-                CrossEntropyLoss over target_str tokens drives the optimisation.
+      Original: "Sure, here is a tutorial for making a bomb:" (a compliance prefix).
+      IPI:      the expected agent action / tool call, e.g. "send_email(to='evil@x.com')".
+                The CE loss over its tokens is the fitness.
 
   candidate population / seeds:
-      Original: hand-crafted templates loaded from ``assets/prompt_group.pth``
-                (a list of jailbreak-style sentences with [REPLACE] / [MODEL] tokens).
-      IPI:      The seed registry, ``seed_variant="ipi"`` → ``attack.AutoDAN.ipi``
-                (41 IPI templates across 9 strategy families), plus an optional
-                user-supplied ``extra_seeds`` list. No external .pth file is
-                required — the package is self-contained. The upstream pool is
-                still reachable as ``seed_variant="original"``
-                (``attack.AutoDAN.original``, 128 templates verbatim) for the
-                paper-reproduction row.
+      Original: hand-crafted templates from ``assets/prompt_group.pth``.
+      IPI:      the seed registry. ``seed_variant="ipi"`` → ``attack.AutoDAN.ipi``
+                (41 IPI templates across 9 strategy families) plus an optional
+                ``extra_seeds`` list; ``seed_variant="original"`` → the 128 upstream
+                seeds verbatim, for the paper-reproduction row. No external .pth file,
+                so the package stays self-contained.
 
-  Success evaluation:
-      Original: refusal-prefix keyword check (not any(prefix in response ...)).
-      IPI:      check_ipi_success() — function-call / exact-match check.
+  the prompt the loss is computed on:
+      Original: FastChat's ``autodan_SuffixManager`` — one prompt used for both the loss
+                and the generation, with ``[REPLACE]`` substituted by the instruction.
+      IPI:      ``harness.build_optimization_messages`` — the victim's real prompt, IPI
+                carrier and defense preprocessing included, so the GA ranks candidates by
+                a loss on the string that is actually sent. It previously built its own
+                bare ``[system][user]`` prompt *and* appended the goal a second time on
+                top of the template's own ``{query}`` substitution.
 
-  Conversation template:
-      Original: FastChat ``load_conversation_template()`` (model-specific hard-coding).
-      IPI:      ``tokenizer.apply_chat_template()`` — works with any modern HF model.
+  success evaluation:
+      Original: a refusal-prefix keyword check.
+      IPI:      ``check_ipi_success`` against the scenario's own target and eval mode.
 
   NLTK:
-      The local mutation fallback uses nltk (stopwords + wordnet).
-      ``nltk`` is imported lazily and only when no llm_mutator is provided.
-      Install with:  pip install nltk && python -m nltk.downloader stopwords wordnet punkt
+      The word-level operator needs nltk (stopwords + wordnet); it is imported lazily
+      inside ``mutation.ReplaceWordsWithSynonyms`` and degrades to a pass-through if
+      absent, so a missing corpus never kills a run mid-search.
+      Install with: pip install nltk && python -m nltk.downloader stopwords wordnet punkt
 """
 
 from __future__ import annotations
@@ -64,59 +82,29 @@ from __future__ import annotations
 import gc
 import logging
 import random
-import re
 import time
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 import numpy as np
-import torch
-import torch.nn as nn
 
 from ..attacker import AdaptiveAttacker
-from ..datasets import Instance
+from ..datasets import AttackDataset, Instance
 from ..metrics import Evaluator, check_ipi_success
-from ..victim import Victim
+from ..mutation import ReplaceWordsWithSynonyms, SentenceCrossOver
 from ..seed import sample_population
+from ..selector import GeneticSelectPolicy, ReferenceLossSelector
+from ..victim import Victim
 
 log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Seed population
-# ---------------------------------------------------------------------------
-
-# The initial GA population is drawn from the seed registry (``ipi/seed/``),
-# replacing the original ``assets/prompt_group.pth`` so the package needs no
-# external data files.
-#
-#   seed_variant="ipi"      attack.AutoDAN.ipi      — 41 IPI templates, 9 strategy
-#                                                     families (the default here)
-#   seed_variant="original" attack.AutoDAN.original — the 128 upstream AutoDAN
-#                                                     seeds, verbatim (paper row)
-#
-# Either pool gives the GA enough diversity at generation 0 for crossover and the
-# momentum word-dictionary to do work.
-
-
-def _make_seed_population(
-    goal: str,
-    batch_size: int,
-    extra_seeds: Optional[list[str]] = None,
-    seed_variant: str = "ipi",
-) -> list[str]:
-    """
-    Build the initial population from the AutoDAN seed pool.
-
-    Draws distinct templates without replacement while the pool is large enough
-    (only repeating if ``batch_size`` exceeds the number of templates), after
-    substituting the goal for each template's placeholder. ``extra_seeds`` are
-    placed first.
-    """
-    return sample_population(goal, batch_size, prompt_usage="attack",
-                             method_list=["AutoDAN"], variant=seed_variant,
-                             extra_seeds=extra_seeds)
+# Model/developer names AutoDAN's templates address; never swapped for a synonym.
+_PROTECTED_WORDS = {
+    "llama2", "meta", "vicuna", "lmsys", "guanaco", "theblokeai", "wizardlm",
+    "mpt-chat", "mosaicml", "mpt-instruct", "falcon", "tii", "chatgpt",
+    "modelkeeper", "prompt",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -125,13 +113,14 @@ def _make_seed_population(
 
 @dataclass
 class AutoDANResult:
-    """Result of an AutoDAN attack run."""
+    """Result of an AutoDAN GA / HGA run."""
     success: bool
-    best_loss: float          # lowest cross-entropy loss achieved (lower = better)
-    injection: str            # best injection string (full candidate suffix)
-    target_response: str      # agent's response to the best injection
-    n_queries: int            # approximate forward passes used
-    n_steps: int              # generations completed
+    best_loss: float          # lowest cross-entropy loss reached
+    injection: str            # the best candidate template, goal already substituted
+    target_response: str      # the victim's response to it
+    n_queries: int            # victim calls — one per generation, for the success check
+    n_forward_passes: int     # scoring batches through the model — compute, not queries
+    n_steps: int
     time_seconds: float
     goal: str
     target_str: str
@@ -140,864 +129,477 @@ class AutoDANResult:
     def __repr__(self) -> str:
         return (
             f"AutoDANResult(success={self.success}, best_loss={self.best_loss:.4f}, "
-            f"n_queries={self.n_queries}, n_steps={self.n_steps}, "
-            f"time={self.time_seconds:.1f}s)"
+            f"n_steps={self.n_steps}, n_queries={self.n_queries})"
         )
 
 
 # ---------------------------------------------------------------------------
-# Loss scoring — replaces get_score_autodan()
+# Population
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def _score_candidates(
-    model,
-    tokenizer,
-    device,
-    instruction: str,
+def _make_population(
+    goal: str,
     target_str: str,
-    candidates: list[str],
-    system_prompt: str = "",
-    batch_size: int = 32,
-) -> list[float]:
+    batch_size: int,
+    extra_seeds: Optional[list[str]] = None,
+    seed_variant: str = "ipi",
+    seed: Optional[int] = None,
+) -> AttackDataset:
     """
-    Compute cross-entropy loss(target_str | candidate_suffix + context) for each
-    candidate.  Uses HF tokenizer.apply_chat_template (universal, no FastChat).
+    Generation 0: one ``Instance`` per seed template.
 
-    Returns a list of float losses (one per candidate, lower = better).
+    ``jailbreak_prompt`` is the template *with the goal already substituted*, which is
+    what ``sample_population`` returns. ``reference_responses[0]`` is what
+    ``ReferenceLossSelector`` scores against — the CE-loss target.
     """
-    crit = nn.CrossEntropyLoss(reduction="mean")
-    losses: list[float] = []
+    templates = sample_population(
+        goal, batch_size, prompt_usage="attack", method_list=["AutoDAN"],
+        variant=seed_variant, extra_seeds=extra_seeds, seed=seed)
+    return AttackDataset([
+        Instance(
+            id=f"autodan-{i}",
+            query=goal,
+            jailbreak_prompt=template,
+            reference_responses=[target_str],
+        )
+        for i, template in enumerate(templates)
+    ])
 
-    for b_start in range(0, len(candidates), batch_size):
-        batch = candidates[b_start: b_start + batch_size]
-        batch_losses: list[float] = []
 
-        for cand in batch:
-            # Build: [system?] + user turn (candidate) + assistant start (target)
-            # We want the model to predict target_str after seeing candidate.
-            messages: list[dict] = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            # User turn contains the candidate suffix (which embeds the instruction)
-            user_content = cand if not instruction else f"{cand}\n\n{instruction}"
-            messages.append({"role": "user", "content": user_content})
+def _score(loss_selector: ReferenceLossSelector, population: AttackDataset) -> None:
+    """
+    Write each candidate's fitness into ``eval_results``.
 
-            try:
-                # Encode prompt (up to where the model starts generating)
-                prompt_text: str = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-            except Exception:
-                # Fallback: plain text
-                prompt_text = "\n".join(
-                    (f"[{m['role'].upper()}] {m['content']}" for m in messages)
-                ) + "\n[ASSISTANT] "
-
-            # Full text = prompt + target_str
-            full_text = prompt_text + target_str
-            full_ids = tokenizer.encode(full_text, add_special_tokens=False, return_tensors="pt").to(device)
-            prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False, return_tensors="pt").to(device)
-            prompt_len = prompt_ids.shape[1]
-
-            if full_ids.shape[1] <= prompt_len:
-                batch_losses.append(float("inf"))
-                continue
-
-            # Forward pass
-            try:
-                output = model(input_ids=full_ids, use_cache=False)
-                logits = output.logits  # (1, seq_len, vocab)
-
-                # Target token positions: prompt_len-1 to full_len-2 (predict target tokens)
-                target_len = full_ids.shape[1] - prompt_len
-                logits_slice = logits[0, prompt_len - 1: prompt_len - 1 + target_len, :]  # (T, V)
-                target_slice = full_ids[0, prompt_len: prompt_len + target_len]            # (T,)
-
-                loss = crit(logits_slice, target_slice).item()
-                batch_losses.append(loss)
-            except Exception as exc:
-                log.debug("[AutoDAN] scoring error: %s", exc)
-                batch_losses.append(float("inf"))
-
-        losses.extend(batch_losses)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return losses
+    ``ReferenceLossSelector`` writes ``_loss`` (lower is better); ``GeneticSelectPolicy``
+    reads ``eval_results[-1]`` as higher-is-better. The negation is upstream's own
+    ``score_list = [-x for x in score_list]``, and getting its sign wrong inverts the
+    search silently — which is why it happens in exactly one place.
+    """
+    loss_selector.score(population)
+    for instance in population:
+        instance.eval_results = [-float(instance._loss)]
 
 
 # ---------------------------------------------------------------------------
-# Genetic operators — crossover
+# HGA momentum word dictionary
 # ---------------------------------------------------------------------------
 
-def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences, preserving paragraph structure."""
-    paragraphs = text.split("\n\n")
-    result: list[list[str]] = []
-    for para in paragraphs:
-        sentences = re.split(r"(?<=[,.!?])\s+", para)
-        result.append(sentences)
-    return result   # type: ignore[return-value]  # list[list[str]]
-
-
-def _join_paragraphs(paras: list[list[str]]) -> str:
-    return "\n\n".join(" ".join(p) for p in paras)
-
-
-def _crossover(str1: str, str2: str, num_points: int = 5) -> tuple[str, str]:
-    """
-    Paragraph-level, multi-point sentence crossover.
-    Exact port of AutoDAN crossover() with minor clean-up.
-    """
-    paras1 = _split_sentences(str1)
-    paras2 = _split_sentences(str2)
-
-    new_p1: list[list[str]] = []
-    new_p2: list[list[str]] = []
-
-    for para1, para2 in zip(paras1, paras2):
-        max_swaps = min(len(para1), len(para2)) - 1
-        if max_swaps <= 0:
-            new_p1.append(para1)
-            new_p2.append(para2)
-            continue
-        n_swaps = min(num_points, max_swaps)
-        swap_pts = sorted(random.sample(range(1, max_swaps + 1), n_swaps))
-
-        child1: list[str] = []
-        child2: list[str] = []
-        last = 0
-        for sp in swap_pts:
-            if random.random() < 0.5:
-                child1.extend(para1[last:sp])
-                child2.extend(para2[last:sp])
-            else:
-                child1.extend(para2[last:sp])
-                child2.extend(para1[last:sp])
-            last = sp
-
-        if random.random() < 0.5:
-            child1.extend(para1[last:])
-            child2.extend(para2[last:])
-        else:
-            child1.extend(para2[last:])
-            child2.extend(para1[last:])
-
-        new_p1.append(child1)
-        new_p2.append(child2)
-
-    # Align any unmatched paragraphs
-    for p in paras1[len(paras2):]:
-        new_p1.append(p)
-        new_p2.append(p)
-    for p in paras2[len(paras1):]:
-        new_p1.append(p)
-        new_p2.append(p)
-
-    return _join_paragraphs(new_p1), _join_paragraphs(new_p2)
-
-
-# ---------------------------------------------------------------------------
-# Mutation operators
-# ---------------------------------------------------------------------------
-
-def _synonym_replace(sentence: str, num: int = 5) -> str:
-    """
-    Local synonym-replacement mutation using NLTK WordNet.
-    Lazily imports nltk — only called when no llm_mutator is given.
-    """
-    try:
-        import nltk
-        from nltk.corpus import stopwords, wordnet
-        from nltk.tokenize import word_tokenize
-        # Silently ensure data is available
-        try:
-            stop_words: set[str] = set(stopwords.words("english"))
-        except LookupError:
-            nltk.download("stopwords", quiet=True)
-            nltk.download("wordnet", quiet=True)
-            nltk.download("punkt", quiet=True)
-            nltk.download("punkt_tab", quiet=True)
-            stop_words = set(stopwords.words("english"))
-
-        # Protected tokens we never replace
-        _PROTECTED = {
-            "llama2", "meta", "vicuna", "lmsys", "guanaco", "wizardlm",
-            "mpt", "falcon", "tii", "chatgpt", "replace", "prompt", "model",
-            "keeper",
-        }
-
-        words = word_tokenize(sentence)
-        candidates_idx = [
-            i for i, w in enumerate(words)
-            if w.lower() not in stop_words and w.lower() not in _PROTECTED
-        ]
-        selected = random.sample(candidates_idx, min(num, len(candidates_idx)))
-
-        for idx in selected:
-            word = words[idx]
-            synsets = wordnet.synsets(word.lower())
-            if synsets and synsets[0].lemmas():
-                syn = synsets[0].lemmas()[0].name().replace("_", " ")
-                words[idx] = syn.title() if word.istitle() else syn
-
-        # Reconstruct sentence (simple join — keeps punctuation attached)
-        out = words[0] if words else sentence
-        for w in words[1:]:
-            if w in {",", ".", "!", "?", ":", ";", ")", "]", "}"}:
-                out += w
-            else:
-                out += " " + w
-        return out
-    except Exception as exc:
-        log.debug("[AutoDAN] synonym_replace failed: %s", exc)
-        return sentence
-
-
-def _apply_mutation(
-    candidates: list[str],
-    mutation_rate: float,
-    llm_mutator: Optional[Callable[[str], str]],
-    seed_population: list[str],
-) -> list[str]:
-    """
-    Apply mutation to each candidate with probability `mutation_rate`.
-    If llm_mutator is provided, use it; otherwise fall back to synonym replacement.
-    If llm_mutator returns None, substitute a random seed instead.
-    """
-    out: list[str] = []
-    for cand in candidates:
-        if random.random() < mutation_rate:
-            if llm_mutator is not None:
-                try:
-                    mutated = llm_mutator(cand)
-                    out.append(mutated if mutated else random.choice(seed_population))
-                except Exception as exc:
-                    log.debug("[AutoDAN] llm_mutator error: %s", exc)
-                    out.append(random.choice(seed_population))
-            else:
-                out.append(_synonym_replace(cand))
-        else:
-            out.append(cand)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Roulette-wheel selection
-# ---------------------------------------------------------------------------
-
-def _roulette_select(
-    population: list[str],
-    scores: list[float],   # higher = better (negated losses)
-    n: int,
-) -> list[str]:
-    """Softmax roulette-wheel selection (exact port of original)."""
-    arr = np.array(scores, dtype=np.float64)
-    arr = arr - arr.max()
-    probs = np.exp(arr)
-    probs /= probs.sum()
-    indices = np.random.choice(len(population), size=n, p=probs, replace=True)
-    return [population[i] for i in indices]
-
-
-# ---------------------------------------------------------------------------
-# HGA word-dictionary helpers
-# ---------------------------------------------------------------------------
-
-def _build_word_dict(
+def build_momentum_word_dict(
     word_dict: dict[str, float],
-    population: list[str],
-    scores: list[float],   # higher = better
+    population: AttackDataset,
+    topk: int = -1,
 ) -> dict[str, float]:
     """
-    Build / update a word-score dictionary from the current population.
-    Words in high-scoring candidates get a higher score.
-    Exact port of ``construct_momentum_word_dict``.
+    Accumulate a word -> average-fitness map across generations.
+
+    Port of upstream's ``construct_momentum_word_dict``: a word's score is the mean
+    fitness of the candidates containing it, blended half-and-half with whatever the
+    word already carried, so evidence persists across generations ("momentum"). It is
+    what ``mutation.ReplaceWordsWithSynonyms`` draws its replacement probabilities from.
+
+    Needs nltk for tokenisation and stopwords; without it the dictionary stays as it was
+    and the operator degrades to a pass-through, which is the same failure mode the
+    operator itself has.
     """
     try:
         import nltk
         from nltk.corpus import stopwords
-        from nltk.tokenize import word_tokenize
-        try:
-            stop_words: set[str] = set(stopwords.words("english"))
-        except LookupError:
-            nltk.download("stopwords", quiet=True)
-            nltk.download("punkt", quiet=True)
-            nltk.download("punkt_tab", quiet=True)
-            stop_words = set(stopwords.words("english"))
-    except ImportError:
-        stop_words = set()
+        stop_words = set(stopwords.words("english"))
+    except (ImportError, LookupError):
+        log.debug("[AutoDAN] nltk unavailable — momentum dictionary not updated")
+        return word_dict
 
-    _PROTECTED = {"llama2", "meta", "vicuna", "lmsys", "replace", "prompt", "model"}
     word_scores: dict[str, list[float]] = defaultdict(list)
-
-    for cand, score in zip(population, scores):
+    for instance in population:
+        score = float(instance.eval_results[-1]) if instance.eval_results else 0.0
+        if not np.isfinite(score):
+            continue
         try:
-            import nltk
-            from nltk.tokenize import word_tokenize
-            words_set = set(
-                w for w in word_tokenize(cand)
-                if w.lower() not in stop_words and w.lower() not in _PROTECTED
-            )
-        except Exception:
-            words_set = set(cand.split())
-        for w in words_set:
-            word_scores[w].append(score)
+            tokens = nltk.word_tokenize(instance.jailbreak_prompt or "")
+        except LookupError:
+            return word_dict
+        for word in {
+            w for w in tokens
+            if w.lower() not in stop_words and w.lower() not in _PROTECTED_WORDS
+        }:
+            word_scores[word].append(score)
 
-    for word, sc_list in word_scores.items():
-        avg = sum(sc_list) / len(sc_list)
+    for word, scores in word_scores.items():
+        avg = sum(scores) / len(scores)
         word_dict[word] = (word_dict[word] + avg) / 2 if word in word_dict else avg
 
-    return OrderedDict(sorted(word_dict.items(), key=lambda x: x[1], reverse=True))
+    ordered = OrderedDict(sorted(word_dict.items(), key=lambda kv: kv[1], reverse=True))
+    return dict(list(ordered.items())[:topk] if topk != -1 else ordered.items())
 
 
-def _word_roulette(word: str, word_dict: dict[str, float]) -> str:
-    """Select a synonym weighted by word-dict score (roulette wheel)."""
-    try:
-        from nltk.corpus import wordnet
-        synonyms = set()
-        for syn in wordnet.synsets(word.lower()):
-            for lemma in syn.lemmas():
-                synonyms.add(lemma.name().replace("_", " "))
-        if not synonyms:
-            return word
-        min_sc = min(word_dict.values()) if word_dict else 0.0
-        word_scores = {s: word_dict.get(s, min_sc) for s in synonyms}
-        total = sum(word_scores.values())
-        if total <= 0:
-            return word
-        pick = random.uniform(0, total)
-        curr = 0.0
-        for syn_word, sc in word_scores.items():
-            curr += sc
-            if curr > pick:
-                return syn_word.title() if word.istitle() else syn_word
-        return word
-    except Exception:
-        return word
+# ---------------------------------------------------------------------------
+# One generation
+# ---------------------------------------------------------------------------
 
+def _apply_llm_mutator(
+    parents: list[Instance],
+    mutation_rate: float,
+    llm_mutator: Callable[[str], str],
+    rng: random.Random,
+) -> list[Instance]:
+    """
+    Rewrite a parent's template with probability ``mutation_rate``.
 
-def _hga_word_replace(
-    population: list[str],
-    word_dict: dict[str, float],
-    crossover_prob: float = 0.5,
-) -> list[str]:
-    """Apply word replacement guided by word_dict (HGA step)."""
-    try:
-        import nltk
-        from nltk.corpus import stopwords
-        from nltk.tokenize import word_tokenize
+    The optional LLM-driven branch of upstream's ``apply_gpt_mutation``. Without a
+    mutator the word-level operator does the job instead; the two are alternatives, as
+    upstream's ``if_api`` switch makes them.
+    """
+    for parent in parents:
+        if rng.random() >= mutation_rate:
+            continue
         try:
-            stop_words: set[str] = set(stopwords.words("english"))
-        except LookupError:
-            nltk.download("stopwords", quiet=True)
-            nltk.download("punkt", quiet=True)
-            nltk.download("punkt_tab", quiet=True)
-            stop_words = set(stopwords.words("english"))
-    except ImportError:
-        return population
-
-    _PROTECTED = {"llama2", "meta", "vicuna", "lmsys", "replace", "prompt", "model"}
-    result: list[str] = []
-    min_val = min(word_dict.values()) if word_dict else 0.0
-
-    for sentence in population:
-        paragraphs = sentence.split("\n\n")
-        new_paras: list[str] = []
-        for para in paragraphs:
-            try:
-                words = word_tokenize(para)
-            except Exception:
-                words = para.split()
-            count = 0
-            for i, w in enumerate(words):
-                if w.lower() in stop_words or w.lower() in _PROTECTED:
-                    continue
-                if random.random() < crossover_prob:
-                    rep = _word_roulette(w, word_dict)
-                    if rep and rep != w:
-                        words[i] = rep
-                        count += 1
-                        if count >= 5:
-                            break
-            # Reconstruct
-            out = words[0] if words else para
-            for wrd in words[1:]:
-                if wrd in {",", ".", "!", "?", ":", ";", ")", "]", "}"}:
-                    out += wrd
-                else:
-                    out += " " + wrd
-            new_paras.append(out)
-        result.append("\n\n".join(new_paras))
-    return result
+            mutated = (llm_mutator(parent.jailbreak_prompt) or "").strip()
+        except Exception as exc:
+            log.debug("[AutoDAN] llm_mutator raised: %s", exc)
+            continue
+        if mutated:
+            parent.jailbreak_prompt = mutated
+    return parents
 
 
-# ---------------------------------------------------------------------------
-# GA generation step
-# ---------------------------------------------------------------------------
-
-def _ga_step(
-    population: list[str],
-    scores: list[float],        # higher = better (negated losses)
-    num_elites: int,
-    batch_size: int,
+def _ga_generation(
+    population: AttackDataset,
+    policy: GeneticSelectPolicy,
+    crossover: SentenceCrossOver,
     crossover_prob: float,
-    num_points: int,
     mutation_rate: float,
     llm_mutator: Optional[Callable[[str], str]],
-    seed_population: list[str],
-) -> list[str]:
-    """One generation of the genetic algorithm."""
-    # Sort by score descending
-    sorted_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-    sorted_pop = [population[i] for i in sorted_idx]
+    rng: random.Random,
+    batch_size: int,
+) -> AttackDataset:
+    """Elites + roulette parents, recombined pairwise, then mutated."""
+    elites = policy.elites(population)
+    parents = policy.roulette(population, n=batch_size - len(elites))
 
-    elites = sorted_pop[:num_elites]
-    n_offspring = batch_size - num_elites
-
-    # Roulette-wheel selection for parents
-    parents = _roulette_select(population, scores, n_offspring)
-
-    # Crossover
-    offspring: list[str] = []
+    offspring: list[Instance] = []
     for i in range(0, len(parents), 2):
         p1 = parents[i]
         p2 = parents[i + 1] if i + 1 < len(parents) else parents[0]
-        if random.random() < crossover_prob:
-            c1, c2 = _crossover(p1, p2, num_points)
-            offspring.append(c1)
-            offspring.append(c2)
+        if rng.random() < crossover_prob:
+            # 1-to-2: the operator records both lineage edges for us.
+            offspring.extend(crossover(AttackDataset([p1]), other_instance=p2))
         else:
-            offspring.append(p1)
-            offspring.append(p2)
+            offspring.extend([crossover.new_child(p1), crossover.new_child(p2)])
 
-    offspring = offspring[:n_offspring]
+    offspring = offspring[: batch_size - len(elites)]
+    if llm_mutator is not None:
+        offspring = _apply_llm_mutator(offspring, mutation_rate, llm_mutator, rng)
+    return AttackDataset(elites + offspring)
 
-    # Mutation
-    offspring = _apply_mutation(offspring, mutation_rate, llm_mutator, seed_population)
 
-    return elites + offspring[:n_offspring]
+def _hga_generation(
+    population: AttackDataset,
+    policy: GeneticSelectPolicy,
+    synonym: ReplaceWordsWithSynonyms,
+    word_dict: dict[str, float],
+    mutation_rate: float,
+    llm_mutator: Optional[Callable[[str], str]],
+    rng: random.Random,
+    batch_size: int,
+) -> tuple[AttackDataset, dict[str, float]]:
+    """
+    The word-level half of HGA: refresh the momentum dictionary, then swap synonyms.
+
+    Upstream sorts the population and takes everything past the elites as parents rather
+    than drawing a roulette — the word roulette *inside* the operator is where the
+    fitness weighting happens at this step.
+    """
+    word_dict = build_momentum_word_dict(word_dict, population)
+    synonym.update(word_dict)
+
+    ranked = sorted(population, key=policy._fitness, reverse=True)
+    elites, parents = ranked[: policy.num_elites], ranked[policy.num_elites:]
+    parents = [p for p in parents if (p.jailbreak_prompt or "").strip()]
+    if len(parents) < batch_size - len(elites) and parents:
+        parents += rng.choices(parents, k=batch_size - len(elites) - len(parents))
+
+    # The operator takes no per-call rate: its word roulette already weights every
+    # swap by the momentum score, which is where upstream's `crossover` knob acts.
+    offspring = list(synonym(AttackDataset(parents)))
+    if llm_mutator is not None:
+        offspring = _apply_llm_mutator(offspring, mutation_rate, llm_mutator, rng)
+    offspring = offspring[: batch_size - len(elites)]
+    return AttackDataset(elites + offspring), word_dict
 
 
 # ---------------------------------------------------------------------------
-# Main AutoDAN function (GA variant)
+# The search
 # ---------------------------------------------------------------------------
+
+def _run_autodan(
+    goal: str,
+    target_str: str,
+    target_llm: Victim,
+    *,
+    variant: str,
+    eval_target_fn: Optional[Callable[[str], str]],
+    eval_mode: str,
+    num_steps: int,
+    batch_size: int,
+    num_elites_frac: float,
+    crossover_prob: float,
+    num_points: int,
+    mutation_rate: float,
+    hga_period: int,
+    extra_seeds: Optional[list[str]],
+    seed_variant: str,
+    llm_mutator: Optional[Callable[[str], str]],
+    prompt_builder: Optional[Callable[[str], list[dict]]],
+    score_batch_size: Optional[int],
+    budget_seconds: Optional[float],
+    seed: int,
+    verbose: bool,
+) -> AutoDANResult:
+    """GA and HGA share every line except which operator drives a given generation."""
+    if target_llm.backend != "local":
+        raise ValueError(
+            "AutoDAN requires backend='local' (white-box model access for the loss). "
+            f"Current backend: {target_llm.backend!r}.")
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    rng = random.Random(seed)
+    num_elites = max(1, int(batch_size * num_elites_frac))
+
+    population = _make_population(
+        goal, target_str, batch_size, extra_seeds, seed_variant, seed=seed)
+    loss_selector = ReferenceLossSelector(
+        target_llm, batch_size=score_batch_size, prompt_builder=prompt_builder)
+    policy = GeneticSelectPolicy(num_elites=num_elites, seed=seed)
+    crossover = SentenceCrossOver(num_points=num_points, seed=seed)
+    synonym = ReplaceWordsWithSynonyms(seed=seed)
+
+    start_time = time.time()
+    best_loss = float("inf")
+    best_injection = population[0].jailbreak_prompt
+    best_response = ""
+    n_queries = 0
+    n_forward = 0
+    word_dict: dict[str, float] = {}
+    trace: list[dict] = []
+    step = 0
+
+    for step in range(num_steps):
+        if budget_seconds is not None and (time.time() - start_time) > budget_seconds:
+            log.info("[AutoDAN-%s] budget exhausted at step %d.", variant.upper(), step)
+            break
+
+        # ---- Fitness: one batched forward pass per score_batch_size candidates ----
+        _score(loss_selector, population)
+        size = score_batch_size or len(population) or 1
+        n_forward += (len(population) + size - 1) // size
+
+        fittest = max(population, key=policy._fitness)
+        step_loss = -policy._fitness(fittest)
+        if step_loss < best_loss:
+            best_loss = step_loss
+            best_injection = fittest.jailbreak_prompt
+
+        # ---- Did it work? One victim call per generation, on the fittest candidate ----
+        injection = fittest.jailbreak_prompt
+        response = (
+            eval_target_fn(injection) if eval_target_fn is not None
+            else target_llm(injection))
+        n_queries += 1
+        best_response = response
+        success = check_ipi_success(response, target_str, eval_mode)
+
+        if verbose:
+            log.info("[AutoDAN-%s] step=%3d/%d  best_loss=%.4f  success=%s  t=%.1fs",
+                     variant.upper(), step + 1, num_steps, step_loss, success,
+                     time.time() - start_time)
+
+        trace.append({
+            "step": step + 1, "loss": step_loss, "best_loss": best_loss,
+            "injection": injection[:80], "success": success,
+            "level": fittest.level, "word_dict_size": len(word_dict),
+        })
+
+        if success:
+            log.info("[AutoDAN-%s] success at step %d.", variant.upper(), step + 1)
+            return AutoDANResult(
+                success=True, best_loss=best_loss, injection=injection,
+                target_response=response, n_queries=n_queries,
+                n_forward_passes=n_forward, n_steps=step + 1,
+                time_seconds=time.time() - start_time, goal=goal,
+                target_str=target_str, trace=trace)
+
+        # ---- Breed the next generation ----
+        # HGA alternates: a full GA step every `hga_period` generations, the word-level
+        # operator otherwise. Same polarity as upstream's `if j % args.iter == 0`.
+        if variant == "ga" or step % hga_period == 0:
+            population = _ga_generation(
+                population, policy, crossover, crossover_prob, mutation_rate,
+                llm_mutator, rng, batch_size)
+        else:
+            population, word_dict = _hga_generation(
+                population, policy, synonym, word_dict, mutation_rate,
+                llm_mutator, rng, batch_size)
+
+        gc.collect()
+
+    return AutoDANResult(
+        success=check_ipi_success(best_response, target_str, eval_mode),
+        best_loss=best_loss, injection=best_injection,
+        target_response=best_response, n_queries=n_queries,
+        n_forward_passes=n_forward, n_steps=step + 1,
+        time_seconds=time.time() - start_time, goal=goal,
+        target_str=target_str, trace=trace)
+
+
+_COMMON_DOC = """
+    Args:
+        goal:              Attacker objective — substituted into each seed template.
+        target_str:        The desired agent output. Its tokens are the CE-loss target
+                           and the success check runs against it.
+        target_llm:        Must have ``backend == "local"`` — the loss needs the weights.
+        eval_target_fn:    ``callable(injection) -> response`` used for the success
+                           check. ``AutoDANAttacker`` passes ``harness.make_target_fn``;
+                           without one the victim is called directly, which skips the
+                           IPI carrier.
+        eval_mode:         ``check_ipi_success`` mode. Normally resolved from the
+                           instance by ``AutoDANAttacker``, not chosen here.
+        num_steps:         Generations. Default 100.
+        batch_size:        Population size. Default 64 (upstream uses 256).
+        num_elites_frac:   Fraction carried over unchanged. Default 0.05.
+        crossover_prob:    Probability of recombining a parent pair. Default 0.5.
+        num_points:        Crossover points per candidate. Default 5.
+        mutation_rate:     Probability the LLM mutator rewrites an offspring. Default 0.01.
+        extra_seeds:       Extra templates to seed generation 0 with.
+        seed_variant:      "ipi" (41 IPI templates, default) or "original" (the 128
+                           upstream AutoDAN seeds, for the paper row).
+        llm_mutator:       ``callable(str) -> str``. Upstream's ``if_api`` branch. With
+                           None the word-level operator carries the mutation instead.
+        prompt_builder:    ``callable(injection) -> messages`` — the prompt the fitness
+                           is computed on. Pass ``harness.build_optimization_messages``
+                           bound to the instance, as ``run_scenario`` does; without it
+                           the loss is computed on a bare ``[system][user]`` pair that
+                           the victim is never given.
+        score_batch_size:  Candidates per scoring forward pass. None means the whole
+                           population in one batch, which OOMs on a large one.
+        budget_seconds:    Wall-clock budget. None = unlimited.
+        seed:              RNG seed.
+        verbose:           Log each generation.
+
+    Returns:
+        AutoDANResult.
+"""
+
 
 def run_autodan_ga(
     goal: str,
     target_str: str,
     target_llm: Victim,
-    # Eval
     eval_target_fn: Optional[Callable[[str], str]] = None,
     eval_mode: str = "contains",
-    target_max_n_tokens: int = 200,
-    # GA hyperparams
     num_steps: int = 100,
     batch_size: int = 64,
     num_elites_frac: float = 0.05,
     crossover_prob: float = 0.5,
     num_points: int = 5,
     mutation_rate: float = 0.01,
-    # Population
     extra_seeds: Optional[list[str]] = None,
     seed_variant: str = "ipi",
-    # LLM mutator (optional)
     llm_mutator: Optional[Callable[[str], str]] = None,
-    # Budget
+    prompt_builder: Optional[Callable[[str], list[dict]]] = None,
+    score_batch_size: Optional[int] = 32,
     budget_seconds: Optional[float] = None,
-    # Misc
     seed: int = 20,
     verbose: bool = False,
 ) -> AutoDANResult:
     """
-    AutoDAN-GA attack, IPI-adapted.
-
-    Evolves a population of readable injection strings using a Genetic Algorithm.
-    Fitness = negative cross-entropy loss(target_str | injection).
-    Low loss means the target model is more likely to produce target_str.
-
-    Args:
-        goal:              Attacker objective (used for seeding population and eval).
-        target_str:        Desired agent output / tool call string.
-                           Drives the loss objective and IPI success check.
-        target_llm:        Must be a LocalLLM (backend='local') — white-box access
-                           to model logits is required to compute the loss.
-        eval_target_fn:    Optional callable(injection: str) -> response: str.
-                           Used for full response evaluation. If None, target_llm
-                           is called directly.
-        eval_mode:         check_ipi_success mode (normally resolved from the
-                           instance by AutoDANAttacker, not chosen here).
-        target_max_n_tokens: Max tokens when generating the full response.
-        num_steps:         Number of GA generations. Default 100.
-        batch_size:        Population size. Default 64.
-        num_elites_frac:   Fraction of population kept as elites. Default 0.05.
-        crossover_prob:    Probability of crossover per parent pair. Default 0.5.
-        num_points:        Crossover points per paragraph. Default 5.
-        mutation_rate:     Probability of mutating an individual. Default 0.01.
-        extra_seeds:       Additional seed strings to include in initial population.
-        seed_variant:      Seed pool for generation 0 — "ipi" (41 IPI templates,
-                           default) or "original" (the 128 upstream AutoDAN seeds).
-        llm_mutator:       Callable(sentence: str) -> str for LLM-based mutation.
-                           If None, synonym replacement (NLTK) is used as fallback.
-        budget_seconds:    Wall-clock time budget. None = unlimited.
-        seed:              Random seed for reproducibility.
-        verbose:           Log progress each generation.
-
-    Returns:
-        AutoDANResult with the best injection found.
+    AutoDAN-GA — sentence crossover and mutation, no word-level operator.
     """
-    if target_llm.backend != "local":
-        raise ValueError(
-            "AutoDAN requires backend='local' (white-box model access for loss computation). "
-            f"Current backend: '{target_llm.backend}'."
-        )
+    return _run_autodan(
+        goal, target_str, target_llm, variant="ga",
+        eval_target_fn=eval_target_fn, eval_mode=eval_mode, num_steps=num_steps,
+        batch_size=batch_size, num_elites_frac=num_elites_frac,
+        crossover_prob=crossover_prob, num_points=num_points,
+        mutation_rate=mutation_rate, hga_period=1, extra_seeds=extra_seeds,
+        seed_variant=seed_variant, llm_mutator=llm_mutator,
+        prompt_builder=prompt_builder, score_batch_size=score_batch_size,
+        budget_seconds=budget_seconds, seed=seed, verbose=verbose)
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-    model = target_llm.hf_model
-    tokenizer = target_llm.tokenizer
-    device = target_llm._device
-    system_prompt = getattr(target_llm, "system_prompt", "")
-    num_elites = max(1, int(batch_size * num_elites_frac))
-
-    start_time = time.time()
-    population = _make_seed_population(goal, batch_size, extra_seeds, seed_variant)
-    seed_pop_ref = list(population)  # keep reference for mutation fallback
-
-    best_loss = float("inf")
-    best_injection = population[0]
-    best_response = ""
-    n_queries = 0
-    trace: list[dict] = []
-
-    for step in range(num_steps):
-        if budget_seconds is not None and (time.time() - start_time) > budget_seconds:
-            log.info("[AutoDAN-GA] Budget exhausted at step %d.", step)
-            break
-
-        # ---- Score population ----
-        losses = _score_candidates(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            instruction=goal,
-            target_str=target_str,
-            candidates=population,
-            system_prompt=system_prompt,
-            batch_size=min(batch_size, 32),
-        )
-        n_queries += len(population)
-
-        best_step_idx = int(np.argmin(losses))
-        best_step_loss = losses[best_step_idx]
-        best_step_cand = population[best_step_idx]
-
-        if best_step_loss < best_loss:
-            best_loss = best_step_loss
-            best_injection = best_step_cand
-
-        # ---- Check for success ----
-        if eval_target_fn is not None:
-            response = eval_target_fn(best_step_cand)
-        else:
-            response = target_llm(best_step_cand)
-        n_queries += 1
-        best_response = response
-
-        success = check_ipi_success(response, target_str, eval_mode)
-
-        if verbose:
-            elapsed = time.time() - start_time
-            log.info(
-                "[AutoDAN-GA] step=%3d/%d  best_loss=%.4f  success=%s  time=%.1fs",
-                step + 1, num_steps, best_step_loss, success, elapsed,
-            )
-
-        trace.append({
-            "step": step + 1,
-            "best_loss": best_step_loss,
-            "best_injection": best_step_cand[:80],
-            "success": success,
-        })
-
-        if success:
-            log.info("[AutoDAN-GA] Success at step %d.", step + 1)
-            return AutoDANResult(
-                success=True,
-                best_loss=best_loss,
-                injection=best_injection,
-                target_response=response,
-                n_queries=n_queries,
-                n_steps=step + 1,
-                time_seconds=time.time() - start_time,
-                goal=goal,
-                target_str=target_str,
-                trace=trace,
-            )
-
-        # ---- Evolve next generation ----
-        # scores for selection: higher = better, so negate losses
-        neg_losses = [-l for l in losses]
-        population = _ga_step(
-            population=population,
-            scores=neg_losses,
-            num_elites=num_elites,
-            batch_size=batch_size,
-            crossover_prob=crossover_prob,
-            num_points=num_points,
-            mutation_rate=mutation_rate,
-            llm_mutator=llm_mutator,
-            seed_population=seed_pop_ref,
-        )
-
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return AutoDANResult(
-        success=check_ipi_success(best_response, target_str, eval_mode),
-        best_loss=best_loss,
-        injection=best_injection,
-        target_response=best_response,
-        n_queries=n_queries,
-        n_steps=num_steps,
-        time_seconds=time.time() - start_time,
-        goal=goal,
-        target_str=target_str,
-        trace=trace,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Main AutoDAN function (HGA variant)
-# ---------------------------------------------------------------------------
 
 def run_autodan_hga(
     goal: str,
     target_str: str,
     target_llm: Victim,
-    # Eval
     eval_target_fn: Optional[Callable[[str], str]] = None,
     eval_mode: str = "contains",
-    target_max_n_tokens: int = 200,
-    # HGA hyperparams
     num_steps: int = 100,
     batch_size: int = 64,
     num_elites_frac: float = 0.05,
     crossover_prob: float = 0.5,
     num_points: int = 5,
     mutation_rate: float = 0.01,
-    hga_period: int = 5,          # every this many steps, use HGA word-replacement instead of GA
-    # Population
+    hga_period: int = 5,
     extra_seeds: Optional[list[str]] = None,
     seed_variant: str = "ipi",
-    # LLM mutator (optional)
     llm_mutator: Optional[Callable[[str], str]] = None,
-    # Budget
+    prompt_builder: Optional[Callable[[str], list[dict]]] = None,
+    score_batch_size: Optional[int] = 32,
     budget_seconds: Optional[float] = None,
-    # Misc
     seed: int = 20,
     verbose: bool = False,
 ) -> AutoDANResult:
     """
-    AutoDAN-HGA attack, IPI-adapted.
-
-    Hybrid Genetic Algorithm variant that alternates between:
-      - Standard GA steps (sentence crossover + mutation).
-      - HGA steps (word-dictionary-guided word replacement).
-
-    The word dictionary tracks which words appear in low-loss candidates and
-    uses this signal to guide word-level mutation (preferring words that have
-    historically appeared in successful candidates).
-
-    Args: (same as run_autodan_ga, plus)
-        hga_period: Every `hga_period` steps, use word-dict replacement instead
-                    of sentence crossover. The remaining steps use standard GA.
-                    Default 5 (matching original paper: iter=5).
-
-    Returns:
-        AutoDANResult with the best injection found.
+    AutoDAN-HGA — a GA step every ``hga_period`` generations, word-level replacement
+    driven by the momentum dictionary in between.
     """
-    if target_llm.backend != "local":
-        raise ValueError(
-            "AutoDAN-HGA requires backend='local' (white-box model access). "
-            f"Current backend: '{target_llm.backend}'."
-        )
+    return _run_autodan(
+        goal, target_str, target_llm, variant="hga",
+        eval_target_fn=eval_target_fn, eval_mode=eval_mode, num_steps=num_steps,
+        batch_size=batch_size, num_elites_frac=num_elites_frac,
+        crossover_prob=crossover_prob, num_points=num_points,
+        mutation_rate=mutation_rate, hga_period=hga_period, extra_seeds=extra_seeds,
+        seed_variant=seed_variant, llm_mutator=llm_mutator,
+        prompt_builder=prompt_builder, score_batch_size=score_batch_size,
+        budget_seconds=budget_seconds, seed=seed, verbose=verbose)
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
 
-    model = target_llm.hf_model
-    tokenizer = target_llm.tokenizer
-    device = target_llm._device
-    system_prompt = getattr(target_llm, "system_prompt", "")
-    num_elites = max(1, int(batch_size * num_elites_frac))
-
-    start_time = time.time()
-    population = _make_seed_population(goal, batch_size, extra_seeds, seed_variant)
-    seed_pop_ref = list(population)
-
-    best_loss = float("inf")
-    best_injection = population[0]
-    best_response = ""
-    n_queries = 0
-    word_dict: dict[str, float] = {}
-    trace: list[dict] = []
-
-    for step in range(num_steps):
-        if budget_seconds is not None and (time.time() - start_time) > budget_seconds:
-            log.info("[AutoDAN-HGA] Budget exhausted at step %d.", step)
-            break
-
-        # ---- Score population ----
-        losses = _score_candidates(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            instruction=goal,
-            target_str=target_str,
-            candidates=population,
-            system_prompt=system_prompt,
-            batch_size=min(batch_size, 32),
-        )
-        n_queries += len(population)
-
-        best_step_idx = int(np.argmin(losses))
-        best_step_loss = losses[best_step_idx]
-        best_step_cand = population[best_step_idx]
-
-        if best_step_loss < best_loss:
-            best_loss = best_step_loss
-            best_injection = best_step_cand
-
-        # ---- Check for success ----
-        if eval_target_fn is not None:
-            response = eval_target_fn(best_step_cand)
-        else:
-            response = target_llm(best_step_cand)
-        n_queries += 1
-        best_response = response
-
-        success = check_ipi_success(response, target_str, eval_mode)
-
-        if verbose:
-            elapsed = time.time() - start_time
-            log.info(
-                "[AutoDAN-HGA] step=%3d/%d  best_loss=%.4f  success=%s  time=%.1fs",
-                step + 1, num_steps, best_step_loss, success, elapsed,
-            )
-
-        trace.append({
-            "step": step + 1,
-            "best_loss": best_step_loss,
-            "best_injection": best_step_cand[:80],
-            "success": success,
-            "word_dict_size": len(word_dict),
-        })
-
-        if success:
-            log.info("[AutoDAN-HGA] Success at step %d.", step + 1)
-            return AutoDANResult(
-                success=True,
-                best_loss=best_loss,
-                injection=best_injection,
-                target_response=response,
-                n_queries=n_queries,
-                n_steps=step + 1,
-                time_seconds=time.time() - start_time,
-                goal=goal,
-                target_str=target_str,
-                trace=trace,
-            )
-
-        neg_losses = [-l for l in losses]
-
-        # ---- Evolve next generation (HGA alternation) ----
-        if step % hga_period == 0:
-            # Standard GA step
-            population = _ga_step(
-                population=population,
-                scores=neg_losses,
-                num_elites=num_elites,
-                batch_size=batch_size,
-                crossover_prob=crossover_prob,
-                num_points=num_points,
-                mutation_rate=mutation_rate,
-                llm_mutator=llm_mutator,
-                seed_population=seed_pop_ref,
-            )
-        else:
-            # HGA step: update word dict and apply word replacement
-            word_dict = _build_word_dict(word_dict, population, neg_losses)
-
-            sorted_idx = sorted(range(len(neg_losses)), key=lambda i: neg_losses[i], reverse=True)
-            elites = [population[i] for i in sorted_idx[:num_elites]]
-            parents = [population[i] for i in sorted_idx[num_elites:]]
-
-            # Pad parents if needed
-            if len(parents) < batch_size - num_elites:
-                parents += random.choices(seed_pop_ref, k=batch_size - num_elites - len(parents))
-
-            offspring = _hga_word_replace(parents, word_dict, crossover_prob)
-            offspring = _apply_mutation(offspring, mutation_rate, llm_mutator, seed_pop_ref)
-            population = (elites + offspring)[:batch_size]
-
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return AutoDANResult(
-        success=check_ipi_success(best_response, target_str, eval_mode),
-        best_loss=best_loss,
-        injection=best_injection,
-        target_response=best_response,
-        n_queries=n_queries,
-        n_steps=num_steps,
-        time_seconds=time.time() - start_time,
-        goal=goal,
-        target_str=target_str,
-        trace=trace,
-    )
+run_autodan_ga.__doc__ += _COMMON_DOC
+run_autodan_hga.__doc__ += _COMMON_DOC
+run_autodan_hga.__doc__ += """
+        hga_period:        Generations between full GA steps. Default 5.
+"""
 
 
 # ---------------------------------------------------------------------------
-# AutoDANAttacker — class-based API (mirrors all other attackers)
+# AutoDANAttacker
 # ---------------------------------------------------------------------------
 
 class AutoDANAttacker(AdaptiveAttacker):
     """
-    AutoDAN (Hierarchical Genetic Algorithm) attacker class.
+    AutoDAN attacker — a genetic search over readable injection templates.
 
-    Requires a LocalLLM target (white-box access for loss computation).
-
-    Two variants available via the ``variant`` parameter:
-      "ga"  — pure Genetic Algorithm (sentence crossover + mutation).
-      "hga" — Hybrid GA (alternates GA and word-dictionary-guided word replacement).
+    Requires a local target: fitness is a forward pass through the victim's own weights.
 
     Args:
-        judge:            Guidance Evaluator (owned by this attacker).
-        variant:          "ga" | "hga". Default "hga".
-        num_steps:        GA generations. Default 100.
+        judge:            Guidance Evaluator (owned by this attacker). Annotative —
+                          success comes from ``check_ipi_success``.
+        variant:          "hga" (default) or "ga".
+        num_steps:        Generations. Default 100.
         batch_size:       Population size. Default 64.
-        num_elites_frac:  Elite fraction to preserve each generation. Default 0.05.
-        crossover_prob:   Crossover probability per parent pair. Default 0.5.
-        num_points:       Crossover points per paragraph. Default 5.
-        mutation_rate:    Mutation probability per individual. Default 0.01.
-        hga_period:       HGA word-dict step every N steps (HGA only). Default 5.
-        eval_mode:        IPI success check mode. Default None → read the
-                          instance's own attack_eval_mode.
-        llm_mutator:      Optional callable(str)->str for LLM-based mutation.
-        extra_seeds:      Additional seed strings for the initial population.
-        seed_variant:     Seed pool for generation 0 — "ipi" (41 IPI templates,
-                          default) or "original" (the 128 upstream AutoDAN seeds,
-                          for the paper-reproduction row).
-        budget_seconds:   Wall-clock budget per scenario. None = unlimited.
-        seed:             Random seed for reproducibility. Default 20.
+        num_elites_frac:  Fraction kept as elites. Default 0.05.
+        crossover_prob:   Probability of recombining a parent pair. Default 0.5.
+        num_points:       Crossover points. Default 5.
+        mutation_rate:    Probability the LLM mutator rewrites an offspring. Default 0.01.
+        hga_period:       Generations between GA steps in the HGA variant. Default 5.
+        eval_mode:        IPI success check mode. Default None → read the instance's own
+                          ``attack_eval_mode``.
+        llm_mutator:      ``callable(str) -> str`` for LLM-driven mutation.
+        extra_seeds:      Extra templates for generation 0.
+        seed_variant:     "ipi" (default) or "original".
+        score_batch_size: Candidates per scoring forward pass. Default 32.
+        budget_seconds:   Wall-clock budget per scenario.
+        seed:             RNG seed. Default 20.
     """
 
     def __init__(
@@ -1015,6 +617,7 @@ class AutoDANAttacker(AdaptiveAttacker):
         llm_mutator: Optional[Callable[[str], str]] = None,
         extra_seeds: Optional[list[str]] = None,
         seed_variant: str = "ipi",
+        score_batch_size: Optional[int] = 32,
         budget_seconds: Optional[float] = None,
         seed: int = 20,
     ):
@@ -1024,32 +627,39 @@ class AutoDANAttacker(AdaptiveAttacker):
         if seed_variant not in ("ipi", "original"):
             raise ValueError(
                 f"seed_variant must be 'ipi' or 'original', got {seed_variant!r}")
-        self.variant           = variant
-        self.num_steps         = num_steps
-        self.batch_size        = batch_size
-        self.num_elites_frac   = num_elites_frac
-        self.crossover_prob    = crossover_prob
-        self.num_points        = num_points
-        self.mutation_rate     = mutation_rate
-        self.hga_period        = hga_period
-        self.eval_mode         = eval_mode
-        self.llm_mutator       = llm_mutator
-        self.extra_seeds       = extra_seeds
-        self.seed_variant      = seed_variant
-        self.budget_seconds    = budget_seconds
-        self.seed              = seed
+        self.variant          = variant
+        self.num_steps        = num_steps
+        self.batch_size       = batch_size
+        self.num_elites_frac  = num_elites_frac
+        self.crossover_prob   = crossover_prob
+        self.num_points       = num_points
+        self.mutation_rate    = mutation_rate
+        self.hga_period       = hga_period
+        self.eval_mode        = eval_mode
+        self.llm_mutator      = llm_mutator
+        self.extra_seeds      = extra_seeds
+        self.seed_variant     = seed_variant
+        self.score_batch_size = score_batch_size
+        self.budget_seconds   = budget_seconds
+        self.seed             = seed
 
     @classmethod
     def requires_local_target(cls) -> bool:
         return True
 
     def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
-        from ..harness import make_target_fn
+        from ..harness import build_optimization_messages, make_target_fn
         from ..metrics import ScenarioResult, resolve_attack_target
         target_fn = make_target_fn(instance, target)
         target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
 
-        common_kwargs = dict(
+        # The fitness must be computed on the same prompt the success check sends: the
+        # IPI carrier, plus whatever the defense does to it.
+        def prompt_builder(injection: str) -> list[dict]:
+            return build_optimization_messages(instance, target, injection)
+
+        runner = run_autodan_ga if self.variant == "ga" else run_autodan_hga
+        kwargs = dict(
             goal=instance.query,
             target_str=target_str,
             target_llm=target,
@@ -1061,24 +671,24 @@ class AutoDANAttacker(AdaptiveAttacker):
             crossover_prob=self.crossover_prob,
             num_points=self.num_points,
             mutation_rate=self.mutation_rate,
-            llm_mutator=self.llm_mutator,
             extra_seeds=self.extra_seeds,
             seed_variant=self.seed_variant,
+            llm_mutator=self.llm_mutator,
+            prompt_builder=prompt_builder,
+            score_batch_size=self.score_batch_size,
             budget_seconds=self.budget_seconds,
             seed=self.seed,
             verbose=verbose,
         )
-
-        if self.variant == "ga":
-            r = run_autodan_ga(**common_kwargs)
-        else:
-            r = run_autodan_hga(**common_kwargs, hga_period=self.hga_period)
+        if self.variant == "hga":
+            kwargs["hga_period"] = self.hga_period
+        r = runner(**kwargs)
 
         return ScenarioResult(
             scenario_id=instance.id,
             goal=instance.query,
             success=r.success,
-            score=max(0, int(10 - r.best_loss)),   # rough 0-10 scale from loss
+            score=max(0, int(10 - r.best_loss)),   # rough 0-10 scale from the loss
             injection=r.injection,
             target_response=r.target_response,
             n_queries=r.n_queries,
@@ -1086,6 +696,7 @@ class AutoDANAttacker(AdaptiveAttacker):
             extra={
                 "best_loss": r.best_loss,
                 "n_steps": r.n_steps,
+                "n_forward_passes": r.n_forward_passes,
                 "time_seconds": r.time_seconds,
             },
         )

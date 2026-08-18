@@ -907,41 +907,19 @@ class LocalLLM(UnifiedLLM):
             msgs.append({"role": "user", "content": messages})
             messages = msgs
 
-        # A lone {"role": "raw"} turn carries a fully pre-rendered prompt — used
-        # by the structured-query defenses (StruQ / SecAlign), whose models are
-        # fine-tuned on bare Alpaca-format strings and must NOT be wrapped in a
-        # chat template. See ipi/defenses/channels.py:RAW_ROLE.
-        if len(messages) == 1 and messages[0].get("role") == "raw":
-            return self._tokenizer_obj.encode(
-                messages[0].get("content", ""), add_special_tokens=True,
-            )
-
-        try:
-            # Always use tokenize=False — returns a plain str on every tokenizer
-            # version. Then encode separately, which always returns list[int].
-            # Using tokenize=True is unreliable: some versions return str,
-            # some return list[int], causing downstream torch.tensor() failures.
-            rendered = self._tokenizer_obj.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-            return self._tokenizer_obj.encode(rendered, add_special_tokens=False)
-        except ValueError:
-            # Tokenizer has no chat_template (older models like Vicuna v1.3,
-            # base LLaMA, etc.) — fall back to a simple human/assistant format.
-            parts: list[str] = []
-            for m in messages:
-                role    = m.get("role", "user")
-                content = m.get("content", "")
-                if role == "system":
-                    parts.append(content)
-                elif role == "user":
-                    parts.append(f"USER: {content}")
-                elif role == "assistant":
-                    parts.append(f"ASSISTANT: {content}")
-            parts.append("ASSISTANT:")
-            text = "\n\n".join(parts)
-            log.debug("[LocalLLM] No chat template — using plain USER/ASSISTANT format")
-            return self._tokenizer_obj.encode(text, add_special_tokens=True)
+        # Rendering lives in ``render_messages`` so the white-box attacks, which have
+        # to tokenize this same prompt themselves, cannot drift from it. It handles
+        # all three shapes: the lone {"role": "raw"} turn of the structured-query
+        # defenses (StruQ / SecAlign, whose models are fine-tuned on bare Alpaca
+        # strings and must NOT be wrapped in a chat template — see
+        # ipi/defenses/channels.py:RAW_ROLE), the chat template, and the plain
+        # USER/ASSISTANT fallback for tokenizers with no template at all.
+        #
+        # tokenize=False + a separate encode() is deliberate: tokenize=True returns
+        # str on some transformers versions and list[int] on others, which surfaces
+        # as a torch.tensor() failure much further downstream.
+        text, add_special = render_messages(self._tokenizer_obj, messages)
+        return self._tokenizer_obj.encode(text, add_special_tokens=add_special)
 
     def _local_generate(
         self,
@@ -991,6 +969,105 @@ class LocalLLM(UnifiedLLM):
 # ---------------------------------------------------------------------------
 # Standalone helpers
 # ---------------------------------------------------------------------------
+
+#: Marker a white-box attack puts where its adversarial tokens will go, so the
+#: victim's *whole* prompt can be rendered once and split around that span. Private
+#: Use Area codepoints — no tokenizer template and no dataset text contains them.
+ADV_SENTINEL = "\ue100ADVSPAN\ue100"
+
+
+def render_messages(tokenizer, messages: list[dict],
+                    add_generation_prompt: bool = True) -> tuple[str, bool]:
+    """
+    Render a messages list to the exact prompt text a local model is fed.
+
+    The three branches mirror ``LocalLLM._build_local_prompt_ids`` — which now calls
+    this — so a white-box attack that tokenizes the result is optimizing the same
+    string the victim will actually be given. Keeping them in one place is the point:
+    a second renderer that drifts is how an attack ends up optimizing a prompt shape
+    the victim never sees.
+
+    Returns:
+        (text, add_special_tokens) — the flag to pass to ``tokenizer.encode``. It is
+        ``False`` for the chat-template branch, whose output already carries BOS.
+    """
+    if isinstance(messages, str):
+        messages = [{"role": "user", "content": messages}]
+
+    # A lone {"role": "raw"} turn carries a fully pre-rendered prompt (StruQ / SecAlign).
+    if len(messages) == 1 and messages[0].get("role") == "raw":
+        return messages[0].get("content", ""), True
+
+    try:
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=add_generation_prompt,
+        )
+        return text, False
+    except ValueError:
+        parts: list[str] = []
+        for m in messages:
+            role, content = m.get("role", "user"), m.get("content", "")
+            if role == "system":
+                parts.append(content)
+            elif role == "user":
+                parts.append(f"USER: {content}")
+            elif role == "assistant":
+                parts.append(f"ASSISTANT: {content}")
+        if add_generation_prompt:
+            parts.append("ASSISTANT:")
+        log.debug("[render_messages] No chat template — using plain USER/ASSISTANT format")
+        return "\n\n".join(parts), True
+
+
+def split_prompt_around(tokenizer, messages: list[dict],
+                        marker: str = ADV_SENTINEL) -> tuple[str, str, bool]:
+    """
+    Render ``messages`` and split the result on ``marker``.
+
+    ``messages`` must contain the marker exactly once, in one content field. The
+    result is the decomposition every token-level attack needs:
+
+        full_ids = encode(head) + <adversarial token ids> + encode(tail) [+ target]
+
+    ``tail`` is what BEAST calls ``end_inst_token`` — the close of the user turn plus
+    the generation prompt. Rendering once and splitting is what keeps the adversarial
+    span *inside* the user message: building the prompt with
+    ``add_generation_prompt=True`` and appending tokens after it puts them in the
+    assistant turn instead, which optimizes a continuation of the model's own reply.
+
+    Returns:
+        (head_text, tail_text, add_special_tokens)
+
+    Raises:
+        ValueError: if the marker is absent or repeated after rendering.
+    """
+    text, add_special = render_messages(tokenizer, messages)
+    count = text.count(marker)
+    if count != 1:
+        raise ValueError(
+            f"adversarial marker appears {count} times in the rendered prompt, expected 1"
+        )
+    head, _, tail = text.partition(marker)
+    return head, tail, add_special
+
+
+def bare_prompt_split(tokenizer, injection_prefix: str, injection_suffix: str = "",
+                      system_prompt: str = "") -> tuple[str, str, bool]:
+    """
+    ``split_prompt_around`` for a plain ``[system][user]`` prompt, with no IPI carrier.
+
+    What a white-box attack falls back to when it is called as a bare function rather
+    than through ``run_scenario``. Against a real scenario use
+    ``harness.split_optimization_prompt`` instead — this shape is not the one the
+    victim is given.
+    """
+    messages: list[dict] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append(
+        {"role": "user", "content": f"{injection_prefix}{ADV_SENTINEL}{injection_suffix}"})
+    return split_prompt_around(tokenizer, messages, ADV_SENTINEL)
+
 
 def _extract_logprob(logprob_dict: dict[str, float], target_token: str) -> float:
     """
