@@ -128,10 +128,28 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   fixed (`keep_last_n`, default 3), but the default `on_topic_prune=False`, `width=5`,
   `branching=2` is *not* paper-TAP. For a row labelled "TAP" set `on_topic_prune=True`,
   `width=10`, `branching=4`. See `docs/easyjailbreak-audit.md`.
-- **Four recipes are carrier-native** (`gptfuzzer`, `tap`, `pair`, `renellm`): their candidates
-  are `Instance`s and they compose `mutation/ selector/ constraint/ metrics/` instead of
-  inlining a candidate type or a selection rule. The four static one-shots need nothing (no
-  candidate type, no selector); `autodan`/`beast`/`gcg` are still to do.
+- **Every search recipe is carrier-native.** `gptfuzzer`, `tap`, `pair`, `renellm`,
+  `autodan`, `beast` and `gcg` all carry `Instance` candidates and compose
+  `mutation/ selector/ constraint/ metrics/` instead of inlining a candidate type or a
+  selection rule. The four static one-shots need nothing (no candidate type, no selector).
+  AutoDAN's swap cost almost nothing because its operators already existed —
+  `mutation.SentenceCrossOver` and `mutation.ReplaceWordsWithSynonyms` had been ported and
+  the recipe simply never imported them; its fitness is now
+  `selector.ReferenceLossSelector.score` (batched — it was one forward pass *per candidate*)
+  and its selection `selector.GeneticSelectPolicy`.
+- **Token-level candidates carry their span in `attack_attrs["adv_ids"]`** (`selector.ADV_IDS`)
+  and are scored by `selector.TokenLossSelector`, not `ReferenceLossSelector`. That is what
+  made the carrier affordable for `beast`/`gcg` after it was declined once: the objection was
+  never the `Instance` wrapper, it was the *text* selector re-rendering and re-tokenizing a
+  prompt per candidate, 512 times a step. `TokenLossSelector` keeps head/tail/target as fixed
+  id lists and builds a batch by concatenation. It refuses a batch of mixed adversarial
+  lengths rather than padding — padding a span that sits before the target shifts the target
+  slice per row and silently scores the wrong positions. `mutation.gradient` gained the two
+  operators that feed it: `TokenGradientMutation` (GCG, 1→B) and `BeamTokenExpansion`
+  (BEAST, 1→k2, batched across the whole beam in one forward pass).
+- **BEAST and GCG's objectives are one number with opposite signs.** BEAST maximises
+  `-perplexity(target | prompt)`, GCG minimises cross-entropy of the same span; that is why
+  both read `TokenLossSelector`'s `_loss` directly. `BEASTResult.score` is `-best_loss`.
   `docs/refactor-handoff.md` §8 tracks which is which. Two behaviour notes: GPTFuzzer's search
   reward is now **binary success**, not the judge's score (its `judge=` only annotates the
   trace), and RS/Beam-RS finally *use* the `judge=` their classes always accepted — to gate
@@ -178,6 +196,11 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   Deliberately not ported: the four cipher experts, MJPChoices, Artificial, Inception — they
   serve recipes we decided not to add. `gradient/` lands with the GCG migration, extracted from
   our own GCG (upstream's needs their `WhiteBoxModelBase` stack, which our `Victim` replaces).
+- **`GeneticSelectPolicy` reads fitness as higher-is-better; the loss selector writes
+  lower-is-better.** `ReferenceLossSelector.score()` sets `instance._loss`; AutoDAN negates
+  it into `eval_results` in exactly one place (`attacks/autodan.py:_score`), which is
+  upstream's own `score_list = [-x for x in score_list]`. Getting the sign wrong inverts the
+  search and raises nothing.
 - **A selector's reward tells you which evaluator it needs.** The bandits (`UCB`, `EXP3`,
   `MCTSExplore`) reward with `Instance.num_jailbreak` = `sum(eval_results)`, so they require a
   **binary** evaluator; `SelectBasedOnScores` reads `eval_results[-1]` as a magnitude and wants a
@@ -254,7 +277,25 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   avg_queries column stops meaning anything.
 - **BEAST's `prompt_prefix` is framing, not the whole prompt.** `run_scenario` appends
   `instance.query` to it. Passing it alone — which the code did until this was found —
-  means BEAST optimises tokens for an instruction the victim never sees.
+  means BEAST optimises tokens for an instruction the victim never sees. GCG had the
+  identical defect (`adv_prefix` alone) and now composes `adv_prefix + instance.query`
+  the same way.
+- **A white-box attack must build its prompt through `harness`, never itself.** GCG,
+  BEAST and AutoDAN each rolled their own `[system][user]` prompt while success was
+  judged through `make_target_fn`'s IPI carrier — they were optimising a string the
+  victim never saw. They now go through `harness.split_optimization_prompt` (GCG, BEAST)
+  or `harness.build_optimization_messages` (AutoDAN), which render the *victim's* prompt
+  — carrier plus the defense's own `preprocess_messages` — and split it around the
+  adversarial span. The split is what keeps those tokens **inside the user turn**:
+  building with `add_generation_prompt=True` and appending after it puts them in the
+  assistant turn, so the objective becomes a continuation of the model's own reply.
+  `tail_text` is upstream BEAST's `end_inst_token`. Rendering lives in one place,
+  `llm_unified.render_messages`, which `LocalLLM._build_local_prompt_ids` also calls.
+  The bare `run_gcg` / `run_beast` / `run_autodan_*` functions still work without a
+  scenario, but they log a warning that the prompt is not the victim's.
+- **AutoDAN's seed templates already carry the goal.** `sample_population` substitutes
+  `{query}`, so `_score_candidates` must not append the instruction again — it did, and
+  the goal appeared twice in the scored prompt and once in the evaluated one.
 - **PISanitizer is the closest published peer to our own defense** — attention-based, and
   prevention rather than detection. It is the only baseline that also defends an *API* victim,
   since only the sanitizer needs local weights. `PISanitizerDefense` subclasses `DefendedVictim`

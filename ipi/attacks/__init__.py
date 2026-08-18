@@ -44,12 +44,18 @@ from .multilingual import MultilingualAttacker, MultilingualResult, run_multilin
 from .renellm      import ReNeLLMAttacker,   ReNeLLMResult,   run_renellm
 from .gptfuzzer    import GPTFuzzerAttacker, GPTFuzzerResult, run_gptfuzzer
 
-# Optional local white-box attacks (require torch)
+# Optional local white-box attacks. BEAST and GCG import ``mutation.gradient``, which
+# imports torch, so without it these names are None and a notebook finds out at import
+# rather than mid-run.
 try:
     from .beast import BEASTAttacker, BEASTResult, run_beast
 except ImportError:
     BEASTAttacker = BEASTResult = run_beast = None
 
+# AutoDAN survives a torch-free import since the swap onto the component families: its
+# only torch is inside ``ReferenceLossSelector``, which imports lazily. It still needs a
+# local victim — ``requires_local_target()`` is True and ``run_autodan_*`` raises on a
+# non-local backend — so the guard stays, it just no longer fires here.
 try:
     from .autodan import AutoDANAttacker, AutoDANResult, run_autodan_ga, run_autodan_hga
 except ImportError:
