@@ -21,9 +21,9 @@ class SecAlignDefense(StructuredChannelDefense):
     is how the model got there — preference optimisation (DPO) against a
     rejected response that follows the injection, rather than SFT.
 
-    The instruction/data split is recovered from the harness messages list (see
-    ``ipi/defenses/channels.py``); call :meth:`set_channels` when the caller
-    knows it exactly.
+    The instruction/data split travels with the prompt (see ``ipi/channels.py``)
+    rather than being parsed back out of it; call :meth:`set_channels` for a
+    prompt built by hand.
 
     Args:
         target:                 Underlying Victim carrying the SecAlign model.

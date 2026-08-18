@@ -36,8 +36,10 @@ File layout
                   — EasyJailbreak ports
   datasets/       — Instance (the carrier every component speaks) · AttackDataset
                     · DualVerifiableDataset
+  channels.py     — ChanneledPrompt: the trusted instruction / untrusted data split,
+                    carried with the prompt (StruQ's model) instead of parsed out of it
   harness.py      — the Instance-to-Victim plumbing: make_target_fn · attack_context
-                    · resolve_optimization_target
+                    · resolve_optimization_target · build_channeled_prompt
   runner.py       — run_attack / run_experiment (target_fn-level convenience API)
   target.py       — TargetLLM (Victim wrapping UnifiedLLM) + make_target factory
 
@@ -79,6 +81,9 @@ Custom defense
 
 # ---- Victim interface (implement this for custom defenses) ----
 from .victim import Victim
+
+# ---- Instruction / data channels ----
+from .channels import ChanneledPrompt, ChanneledMessages, channels_of
 
 # ---- Core LLM interface ----
 from .llm_unified import (
@@ -169,7 +174,10 @@ from .metrics import (
 )
 
 # ---- Harness helpers (Instance -> Victim plumbing) ----
-from .harness import make_target_fn, attack_context, resolve_optimization_target
+from .harness import (
+    make_target_fn, attack_context, resolve_optimization_target,
+    build_channeled_prompt, build_victim_messages,
+)
 
 # ---- Defenses ----
 from .defenses import (
@@ -253,8 +261,11 @@ __all__ = [
     "EvaluatorPrefixExactMatch", "EvaluatorPatternJudge", "EvaluatorKeywordJudge",
     # Metrics — runner
     "ScenarioResult", "EvalResult", "AttackEvaluator",
+    # Channels
+    "ChanneledPrompt", "ChanneledMessages", "channels_of",
     # Harness helpers
     "make_target_fn", "attack_context", "resolve_optimization_target",
+    "build_channeled_prompt", "build_victim_messages",
     # Simple API
     "run_attack", "run_experiment", "ExperimentResult",
 ]

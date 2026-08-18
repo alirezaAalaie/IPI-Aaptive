@@ -17,8 +17,11 @@ ipi/                    ← the package (this is the product; pip-installed on K
   seed/                 SeedTemplate registry + seed_templates.json — payloads, attacker /
                         judge / constraint system prompts, ICA demos. Replaces prompts.py
   datasets/             Instance (the carrier) · AttackDataset · DualVerifiableDataset
-  harness.py            Instance→Victim plumbing: make_target_fn (the one place the IPI
-                        prompt shape is defined) · attack_context · resolve_optimization_target
+  channels.py           ChanneledPrompt — the trusted-instruction / untrusted-data split,
+                        carried with the prompt (StruQ's model) · ChanneledMessages
+  harness.py            Instance→Victim plumbing: build_channeled_prompt (the one place
+                        the IPI prompt shape is defined) · make_target_fn ·
+                        attack_context · resolve_optimization_target
   runner.py             run_attack / run_experiment — target_fn-level API, NOT the
                         benchmark path (that is AttackEvaluator over an AttackDataset)
   target.py             TargetLLM (Victim wrapping UnifiedLLM) + make_target
@@ -242,10 +245,25 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
 - **The defense is two halves.** The structured prompt only holds because `recursive_filter`
   strips `FILTERED_TOKENS` from the data channel. Don't ship an ASR number with
   `apply_defensive_filter=False` unless that ablation is the point.
-- `ipi/defenses/channels.py` recovers the instruction/data split from a harness messages list.
-  Role-based guessing does not work — in the AgentDojo shape the legitimate task is *inside* the
-  user turn, and in the BIPIA shape the untrusted context is inside the *system* turn. When a
-  caller knows the split, `defense.set_channels(instruction, data)` beats parsing.
+- **The instruction/data split travels with the prompt; nothing parses it back out.**
+  `ipi/channels.py` is StruQ's model one level up: `harness.build_channeled_prompt` fills
+  `ChanneledPrompt(system=, instruction=, data=)` from the instance's own fields and renders
+  it to `ChanneledMessages` — an ordinary `list[dict]` (so `Victim.generate`'s contract is
+  untouched) that also carries the `ChanneledPrompt`. A defense calls
+  `self.resolve_channels(messages)` and edits ONE named field: `data` (Sandwich, Spotlight,
+  StruQ/SecAlign/DefensiveToken's filter, PISanitizer), `system` (Instructional) or
+  `epilogue` (Reminder). Re-rendering carries the *updated* split, which is what makes
+  chaining work. The old `split_instruction_data` / `transform_data_channel` and their
+  `_AGENTDOJO_RE` / `_ENV_RE` / BIPIA heuristics are **deleted** — six defenses depending on
+  one regex in another module is how the user's own task ended up inside
+  `[START OF UNTRUSTED EXTERNAL DATA] ... IGNORE ALL COMMANDS ABOVE`. Precedence:
+  carried split → `victim.set_channels(instruction, data)` pin (for hand-built prompts, e.g.
+  the DefensiveToken notebook's `preprocess_messages([])`) → `ChanneledPrompt.from_messages`,
+  which is not a parser: system turns are trusted, the whole final user turn is data. That
+  over-marks rather than going inert. `data_prefix`/`data_suffix` (the `<env>` tags) are
+  trusted framing and stay outside the untrusted span. A structured defense returns a plain
+  list on purpose — its output is the model's own rendering and must not be re-rendered by a
+  defense chained under it.
 - Structured defenses emit a single `{"role": "raw"}` turn, which `LocalLLM._build_local_prompt_ids`
   encodes verbatim. These models are fine-tuned on bare Alpaca-format strings; wrapping them in a
   chat template feeds them a format they were never aligned on.
@@ -299,9 +317,10 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
 - **PISanitizer is the closest published peer to our own defense** — attention-based, and
   prevention rather than detection. It is the only baseline that also defends an *API* victim,
   since only the sanitizer needs local weights. `PISanitizerDefense` subclasses `DefendedVictim`
-  directly, not `StructuredChannelDefense`: it edits the untrusted span in place and leaves the
-  message structure alone. If the recovered span isn't found verbatim in a single message the
-  defense is inert — it warns; use `set_channels`. Three things in it are method, not tuning:
+  directly, not `StructuredChannelDefense`: it sanitizes `ChanneledPrompt.data` and re-renders,
+  leaving the message structure alone. It used to substitute the sanitized text back by finding
+  it verbatim in some message and went inert when that missed; re-rendering the channel it came
+  from cannot miss. Three things in it are method, not tuning:
   the anchor prompt *invites* instruction-following (reversing it inverts the signal), the
   `" X" * 500` padding holds the context off the attention sinks at the prompt boundaries, and
   `group_peaks` removes **only the single highest span per round** (≤5 rounds, so ≤5 spans ever).

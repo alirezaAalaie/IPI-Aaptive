@@ -7,8 +7,8 @@ DefensiveToken is a *test-time* defense: five special tokens with optimised
 embeddings are prepended to the prompt. Everything else — weights, tokenizer
 vocabulary beyond those five entries — is the public model. That gives it the
 same instruction/data channel structure as StruQ and SecAlign, so it reuses
-:class:`~ipi.defenses.channels.StructuredChannelDefense`: recover the split,
-filter the data channel, hand the model one pre-rendered string.
+:class:`~ipi.defenses.channels.StructuredChannelDefense`: read the split off the
+prompt, filter the data channel, hand the model one pre-rendered string.
 
 What differs from StruQ/SecAlign is the rendering. Those models are fine-tuned
 on bare Alpaca-format strings; DefensiveToken's models keep a chat template
@@ -19,10 +19,10 @@ turn.
 IPI adaptations vs original
 ---------------------------
 * Upstream's demo hands the defense a hand-written ``(instruction, data)`` pair.
-  Here the split is recovered from the harness messages list via
-  ``split_instruction_data``, or pinned with ``set_channels`` when the caller
-  knows it. Same recovery StruQ/SecAlign use, so a defense-vs-defense row is
-  comparing defenses and not prompt-parsing luck.
+  Here the same pair travels with the prompt as a ``ChanneledPrompt``
+  (``ipi/channels.py``), or is pinned with ``set_channels`` when the caller
+  builds messages by hand. Same split StruQ/SecAlign read, so a
+  defense-vs-defense row compares defenses and not prompt-parsing luck.
 * Upstream filters ``tokenizer.all_special_tokens`` out of the concatenated
   untrusted string. Same set here, but applied to the recovered data channel
   and via ``recursive_filter`` (repeat-until-fixpoint) rather than a single
@@ -32,7 +32,7 @@ IPI adaptations vs original
 * ``enabled=False`` renders the *same* prompt without the five tokens. That is
   the paper's "skip DefensiveTokens" mode and the correct undefended control —
   it isolates the tokens, not the prompt format.
-* Prompts with no recoverable data channel are emitted as a system turn only,
+* Prompts carrying no data channel are emitted as a system turn only,
   rather than routing the whole prompt into the untrusted ``user`` turn.
 
 Preserved upstream quirk

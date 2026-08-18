@@ -6,6 +6,7 @@ Nothing here decides success.
 
     make_target_fn(instance, victim)      the ``target_fn(injection) -> response``
                                           callable every recipe is written against
+    build_channeled_prompt(...)           the instruction/data split for one injection
     build_victim_messages(...)            the messages ``target_fn`` would send
     build_optimization_messages(...)      the same, plus the defense's own preprocessing
     split_optimization_prompt(...)        that prompt, split around the adversarial span,
@@ -34,6 +35,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
+from .channels import ChanneledPrompt
 from .datasets import Instance
 from .victim import Victim
 
@@ -41,8 +43,8 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "make_target_fn", "attack_context", "resolve_optimization_target",
-    "build_victim_messages", "build_optimization_messages",
-    "split_optimization_prompt",
+    "build_channeled_prompt", "build_victim_messages",
+    "build_optimization_messages", "split_optimization_prompt",
 ]
 
 
@@ -116,11 +118,6 @@ def make_target_fn(
     Returns:
         Callable[[str], str] — target_fn(injection_string) -> response_string.
     """
-    attrs        = instance.attack_attrs
-    user_task    = attrs.get("user_task", "")
-    tool_schema  = attrs.get("tool_schema", "")
-    context      = attrs.get("pipeline_context", "")
-
     def target_fn(injection: str) -> str:
         messages = build_victim_messages(
             instance, victim, injection, system_prompt_template, data_separator)
@@ -133,21 +130,27 @@ def make_target_fn(
     return target_fn
 
 
-def build_victim_messages(
+def build_channeled_prompt(
     instance: Instance,
     victim: Victim,
     injection: str,
     system_prompt_template: str = "",
     data_separator: str = "\n\n",
-) -> list[dict]:
+) -> ChanneledPrompt:
     """
-    The messages list ``make_target_fn`` hands to ``victim.generate``.
+    The prompt for one injection, with the trust boundary kept as structure.
 
-    Split out of ``make_target_fn`` so the white-box attacks can see the same prompt
-    shape without calling the victim. This is the *undefended* list: a
-    ``DefendedVictim`` applies its own ``preprocess_messages`` inside ``generate``,
-    so applying it here too would double it. Use ``build_optimization_messages`` when
-    you want the post-defense shape.
+    This is where the IPI prompt shape is *defined*; ``build_victim_messages`` only
+    renders it. The two channels are read straight off the instance —
+    ``user_task`` is trusted, ``pipeline_context`` plus the injection are not — so
+    no defense downstream has to work out which is which. Before this existed,
+    six defenses re-derived the split from the rendered text with a regex, and one
+    prompt-shape change silently put the user's own task in the untrusted channel.
+
+    ``data_separator`` is what sits between the legitimate content and the
+    injection *inside* the data channel; the OPI static attacks override it,
+    because for them the separator is the attack (``naive`` differs from
+    ``escape`` by one space versus one newline).
     """
     attrs       = instance.attack_attrs
     user_task   = attrs.get("user_task", "")
@@ -160,24 +163,52 @@ def build_victim_messages(
     else:
         system_prompt = victim.system_prompt
 
-    messages: list[dict] = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+    if not user_task:
+        # No user task (hand-built instance) — the injection is the whole user turn,
+        # and all of it is untrusted.
+        return ChanneledPrompt(system=system_prompt, instruction="", data=injection)
 
-    if user_task:
-        # User Task + Data in a single user message (Instruction -> User Task -> Data).
-        # Two consecutive 'user' turns are rejected by most chat APIs.
-        data_str = (
-            f"{context}{data_separator}{injection}" if context
-            else f"<env>\n{injection}\n</env>"
+    # User Task + Data in a single user message (Instruction -> User Task -> Data).
+    # Two consecutive 'user' turns are rejected by most chat APIs, which is why the
+    # split has to travel beside the text rather than in it.
+    if context:
+        return ChanneledPrompt(
+            system=system_prompt,
+            instruction=user_task,
+            data=f"{context}{data_separator}{injection}",
         )
-        user_content = f"User Task:\n{user_task}\n\nContext:\n{data_str}"
-        messages.append({"role": "user", "content": user_content})
-    else:
-        # No user task (hand-built instance) — inject directly.
-        messages.append({"role": "user", "content": injection})
+    return ChanneledPrompt(
+        system=system_prompt,
+        instruction=user_task,
+        data=injection,
+        data_prefix="<env>\n",
+        data_suffix="\n</env>",
+    )
 
-    return messages
+
+def build_victim_messages(
+    instance: Instance,
+    victim: Victim,
+    injection: str,
+    system_prompt_template: str = "",
+    data_separator: str = "\n\n",
+) -> list[dict]:
+    """
+    The messages list ``make_target_fn`` hands to ``victim.generate``.
+
+    A ``ChanneledMessages`` — an ordinary ``list[dict]`` that additionally carries
+    the ``ChanneledPrompt`` it was rendered from, so a defense reads the
+    instruction/data split instead of parsing for it.
+
+    Split out of ``make_target_fn`` so the white-box attacks can see the same prompt
+    shape without calling the victim. This is the *undefended* list: a
+    ``DefendedVictim`` applies its own ``preprocess_messages`` inside ``generate``,
+    so applying it here too would double it. Use ``build_optimization_messages`` when
+    you want the post-defense shape.
+    """
+    return build_channeled_prompt(
+        instance, victim, injection, system_prompt_template, data_separator,
+    ).to_messages()
 
 
 def build_optimization_messages(

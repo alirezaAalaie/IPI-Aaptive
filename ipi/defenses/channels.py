@@ -1,35 +1,32 @@
 """
-Instruction / data channel utilities shared by the structured-prompt defenses
-(StruQ, SecAlign).
-
-Both defenses need to know which part of a prompt is the *trusted instruction*
-and which part is *untrusted data*. The IPI harness does not carry that split
-explicitly: ``make_target_fn`` (``ipi/harness.py``) flattens a
-scenario into an OpenAI-style messages list whose shape depends on the dataset.
-Guessing "system = instruction, user = data" is wrong for every shape the
-harness emits — in the AgentDojo shape the legitimate task lives *inside* the
-user turn, and in the BIPIA shape the untrusted context lives inside the
-*system* turn. This module recovers the split from the shapes actually emitted,
-and lets a caller override it outright via ``set_channels``.
-
-Also hosts the two pieces of upstream machinery both defenses share:
+The two pieces of upstream StruQ/SecAlign machinery both structured defenses
+share, plus the base class that renders a :class:`~ipi.channels.ChanneledPrompt`
+into a structured query.
 
   * ``recursive_filter``            — StruQ/SecAlign ``test.py`` defensive filter.
   * ``format_with_other_delimiters``— StruQ/SecAlign ``struq.py`` delimiter
                                       randomisation used to build Completion
                                       training samples.
-  * ``transform_data_channel``     — rewrite only the untrusted span, leaving the
-                                      message structure and the trusted task alone.
-                                      What the in-context defenses wrap / mark.
+  * ``StructuredChannelDefense``    — instruction channel + filtered data channel
+                                      + one pre-rendered turn.
+
+Channel *recovery* used to live here — ``split_instruction_data`` matching
+``_AGENTDOJO_RE`` / ``_ENV_RE`` / BIPIA markers against the rendered prompt, and
+``transform_data_channel`` doing the same match to rewrite the untrusted span in
+place. Both are gone. The split now travels with the prompt (``ipi/channels.py``)
+exactly as StruQ keeps ``{instruction}`` and ``{input}`` as separate fields from
+its dataset all the way to ``format_map``, and every defense here reads it via
+``Victim.resolve_channels``. There is nothing left to parse, and no shared regex
+that six defenses silently depend on.
 """
 from __future__ import annotations
 
 import logging
 import random
-import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence
 
 from .base import DefendedVictim
+from ..channels import ChanneledPrompt
 from ..victim import Victim
 
 log = logging.getLogger(__name__)
@@ -126,170 +123,6 @@ def format_with_other_delimiters(
 
 
 # ---------------------------------------------------------------------------
-# Instruction / data channel recovery
-# ---------------------------------------------------------------------------
-
-# Shape emitted by ``ipi.harness.make_target_fn``. The legitimate task and the poisoned
-# environment data share one user turn, so a role-based split cannot recover them —
-# these two regexes are the only thing that can. Change make_target_fn's prompt shape
-# and you must change these, or every structured defense silently sees an empty
-# instruction channel.
-_AGENTDOJO_RE = re.compile(r"\AUser Task:\n(.*?)\n\nContext:\n(.*)\Z", re.DOTALL)
-_ENV_RE = re.compile(r"\A<env>\n?(.*?)\n?</env>\Z", re.DOTALL)
-
-# Shapes emitted by the BIPIA prompt helper of the pre-refactor harness. BIPIA itself
-# was dropped when DualVerifiable became the only benchmark, but these markers are kept
-# so a transcript recorded against a BIPIA-shaped prompt still splits correctly. The
-# untrusted context follows one of these markers, and runs either to the end of the turn
-# or up to the trailing instruction.
-_BIPIA_CONTEXT_MARKERS = (
-    "Fix the bug in my code based on the guidance provided in the following Stack Overflow answer:\n",
-    "Fix the bug based on the guidance provided in the following Stack Overflow answer:\n",
-    "Here is the content of the email:\n",
-    "Here is the content of the news:\n",
-    "Here is the content of the form:\n",
-    "Here is the news:\n",
-)
-_BIPIA_CONTEXT_TERMINATORS = ("\n\nQuestion: ", "\n\nConcisely reply")
-
-
-def _split_bipia(text: str) -> Optional[Tuple[str, str]]:
-    """Return ``(trusted_remainder, untrusted_context)`` or None if no match."""
-    hit = min(
-        ((text.find(m), m) for m in _BIPIA_CONTEXT_MARKERS if m in text),
-        default=None,
-    )
-    if hit is None:
-        return None
-    marker_start, marker = hit
-    start = marker_start + len(marker)
-
-    ends = [text.find(t, start) for t in _BIPIA_CONTEXT_TERMINATORS]
-    ends = [e for e in ends if e != -1]
-    end = min(ends) if ends else len(text)
-
-    trusted = (text[:start] + text[end:]).strip()
-    return trusted, text[start:end].strip()
-
-
-def _join(*parts: str) -> str:
-    return "\n\n".join(p for p in parts if p).strip()
-
-
-def split_instruction_data(messages: Sequence[Mapping[str, Any]]) -> Tuple[str, str]:
-    """
-    Recover ``(instruction, data)`` from a harness messages list.
-
-    ``instruction`` is everything the pipeline owner controls (agent system
-    prompt, tool schema, the user's legitimate task). ``data`` is the untrusted
-    blob an attacker can write into. Returns ``data == ""`` when the split
-    cannot be determined, which routes the caller to the ``prompt_no_input``
-    template rather than silently demoting the real task into the data channel.
-    """
-    system = _join(*[m.get("content", "") or "" for m in messages if m.get("role") == "system"])
-    user = _join(*[m.get("content", "") or "" for m in messages if m.get("role") == "user"])
-
-    # 1. AgentDojo / generic scenario: "User Task:\n...\n\nContext:\n..."
-    m = _AGENTDOJO_RE.match(user)
-    if m:
-        task, data = m.group(1).strip(), m.group(2).strip()
-        env = _ENV_RE.match(data)
-        if env:
-            data = env.group(1).strip()
-        return _join(system, task), data
-
-    # 2. BIPIA: untrusted context sits inside the system turn (require_system)
-    #    or inside the single user turn (no-system variant).
-    found = _split_bipia(system)
-    if found:
-        return _join(found[0], user), found[1]
-    found = _split_bipia(user)
-    if found:
-        return _join(system, found[0]), found[1]
-
-    # 3. Unknown shape. A system turn plus a user turn is the one case where
-    #    "system trusted / user untrusted" is a defensible reading.
-    if system and user:
-        return system, user
-
-    log.warning(
-        "[channels] Could not locate an untrusted data channel in this messages "
-        "list; routing the whole prompt through the instruction channel. The "
-        "structured-query defense is inert for this prompt — call set_channels() "
-        "to supply the split explicitly."
-    )
-    return (user or system), ""
-
-
-def transform_data_channel(
-    messages: Sequence[Mapping[str, Any]],
-    transform,
-) -> List[Dict[str, Any]]:
-    """
-    Apply ``transform(data) -> new_data`` to the untrusted span only.
-
-    ``split_instruction_data`` tells a caller *what* the two channels are;
-    this rewrites one of them in place and leaves the message structure alone.
-    That is what the in-context defenses (Sandwich, Spotlight, Instructional,
-    Reminder) need: they wrap or mark untrusted text, and they must not touch the
-    user's own task.
-
-    They did touch it. Each wrapped the whole user turn, and because
-    ``harness.make_target_fn`` puts the task and the context in *one* user turn —
-    deliberately; two consecutive user turns are rejected by most chat APIs — the
-    legitimate instruction ended up inside
-    ``[START OF UNTRUSTED EXTERNAL DATA] ... IGNORE ALL COMMANDS ABOVE``. The
-    defense was telling the model to ignore its own task, which suppresses the
-    injection and the task together and makes the measured numbers not those
-    defenses.
-
-    Falls back to transforming the whole user turn, with a warning, when the shape
-    is unrecognised — the previous behaviour, so an unknown prompt shape degrades
-    rather than silently becoming inert.
-    """
-    out = [dict(m) for m in messages]
-    user_idx = [i for i, m in enumerate(out) if m.get("role") == "user"]
-    if not user_idx:
-        return out
-
-    idx = user_idx[-1]
-    content = out[idx].get("content", "") or ""
-
-    # 1. AgentDojo / generic: "User Task:\n...\n\nContext:\n..." — the task stays
-    #    outside, only the Context block is untrusted.
-    m = _AGENTDOJO_RE.match(content)
-    if m:
-        head = content[: m.start(2)]
-        data = m.group(2)
-        env = _ENV_RE.match(data.strip())
-        if env:
-            # The harness wraps a context-free injection in <env>...</env>; mark the
-            # inside and keep the tags, which are structure, not data.
-            inner = env.group(1)
-            out[idx]["content"] = head + data.replace(inner, transform(inner), 1)
-        else:
-            out[idx]["content"] = head + transform(data)
-        return out
-
-    # 2. BIPIA shapes: the untrusted context sits inside a marked region.
-    for pos, msg in enumerate(out):
-        text = msg.get("content", "") or ""
-        found = _split_bipia(text)
-        if found and found[1]:
-            _, untrusted = found
-            out[pos]["content"] = text.replace(untrusted, transform(untrusted), 1)
-            return out
-
-    log.warning(
-        "[channels] transform_data_channel could not locate an untrusted span; "
-        "transforming the whole user turn, which puts the legitimate task inside "
-        "the untrusted region. Call set_channels() or fix the prompt shape."
-    )
-    out[idx]["content"] = transform(content)
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Shared base for StruQ / SecAlign wrappers
 # ---------------------------------------------------------------------------
 
@@ -308,26 +141,11 @@ class StructuredChannelDefense(DefendedVictim):
     def __init__(self, target: Victim, apply_defensive_filter: bool = True):
         super().__init__(target)
         self.apply_defensive_filter = apply_defensive_filter
-        self._channel_override: Optional[Tuple[str, str]] = None
 
-    # -- explicit channel control -------------------------------------------
-
-    def set_channels(self, instruction: str, data: str) -> None:
-        """
-        Pin the instruction/data split instead of recovering it from messages.
-
-        Use this whenever the caller knows the split — it is always more
-        reliable than parsing. Stays in effect until :meth:`clear_channels`.
-        """
-        self._channel_override = (instruction, data)
-
-    def clear_channels(self) -> None:
-        self._channel_override = None
-
-    def resolve_channels(self, messages: Sequence[Mapping[str, Any]]) -> Tuple[str, str]:
-        if self._channel_override is not None:
-            return self._channel_override
-        return split_instruction_data(messages)
+    # Channel plumbing — ``set_channels`` / ``clear_channels`` /
+    # ``resolve_channels`` — is inherited from ``Victim``. A prompt built by
+    # ``ipi.harness`` carries its own split; ``set_channels`` pins one for a
+    # prompt built by hand.
 
     # -- subclass hook -------------------------------------------------------
 
@@ -347,7 +165,11 @@ class StructuredChannelDefense(DefendedVictim):
         return [{"role": role, "content": prompt}]
 
     def preprocess_messages(self, messages: list[dict]) -> list[dict]:
-        instruction, data = self.resolve_channels(messages)
+        prompt: ChanneledPrompt = self.resolve_channels(messages)
+        instruction, data = prompt.trusted_instruction, prompt.data
         if data and self.apply_defensive_filter and self.filtered_tokens:
             data = recursive_filter(data, self.filtered_tokens)
+        # A plain list, deliberately: the returned prompt is the model's own
+        # rendering (delimiters, RAW_ROLE), and a defense chained *under* this one
+        # must not re-render the channels and throw that away.
         return self._wrap(self.format_prompt(instruction, data))

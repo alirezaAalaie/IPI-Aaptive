@@ -20,6 +20,15 @@ Required for BEAST (white-box local access):
   apply_chat_template()        — chat template formatting.
   All raise LocalOnlyError by default.
 
+Instruction / data channels
+---------------------------
+  set_channels(instruction, data)  — pin the trusted/untrusted split for prompts
+                                     built by hand. Prompts built by ``ipi.harness``
+                                     carry their own split (``ipi/channels.py``),
+                                     and that one wins. No defense parses a prompt
+                                     to find the untrusted span.
+  resolve_channels(messages)       — what a defense calls to get it.
+
 Attributes
 ----------
   system_prompt  (str)  — prepended as a system turn in every messages list.
@@ -62,8 +71,9 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import ClassVar, Optional
+from typing import Any, ClassVar, Mapping, Optional, Sequence
 
+from .channels import ChanneledPrompt, channels_of
 from .llm_unified import LogprobNotSupportedError, LocalOnlyError
 
 log = logging.getLogger(__name__)
@@ -180,6 +190,71 @@ class Victim(ABC):
         raise LocalOnlyError(
             f"{type(self).__name__} does not implement apply_chat_template()."
         )
+
+    # ------------------------------------------------------------------
+    # Instruction / data channels
+    # ------------------------------------------------------------------
+    #
+    # A defense that reformats, filters, wraps, marks or sanitizes the untrusted
+    # span needs to know where that span is. It is never recovered from the
+    # rendered text: ``harness`` builds a ``ChanneledPrompt`` and renders it to
+    # ``ChanneledMessages``, which carry the split with them all the way into
+    # ``preprocess_messages``. See ``ipi/channels.py``.
+
+    _pinned_channels: Optional[ChanneledPrompt] = None
+    _channel_pin_shadowed: bool = False
+    _channel_guess_warned: bool = False
+
+    def set_channels(self, instruction: str, data: str, system: str = "") -> None:
+        """
+        Pin the split for prompts that carry none — hand-built messages, or an
+        empty list plus ``preprocess_messages([])`` (what the DefensiveToken
+        notebook does to render a prompt without generating).
+
+        A prompt that carries its own split wins over this pin: the carried one
+        is per-prompt, this one is sticky and would otherwise apply the first
+        scenario's data to all 360.
+        """
+        self.set_channeled_prompt(
+            ChanneledPrompt(system=system, instruction=instruction, data=data))
+
+    def set_channeled_prompt(self, prompt: Optional[ChanneledPrompt]) -> None:
+        """``set_channels`` for a fully-specified prompt (framing, epilogue, ...)."""
+        self._pinned_channels = prompt
+        self._channel_pin_shadowed = False
+
+    def clear_channels(self) -> None:
+        self._pinned_channels = None
+        self._channel_pin_shadowed = False
+
+    def resolve_channels(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        warn: bool = True,
+    ) -> ChanneledPrompt:
+        """
+        The instruction/data split for ``messages``. Never returns None: the
+        last resort is ``ChanneledPrompt.from_messages``, which treats the whole
+        final user turn as data rather than leaving a defense inert.
+
+        Both warnings here fire **once per victim**. A search attack calls this a
+        few thousand times per scenario, and a per-call warning would be a log
+        flood that everyone learns to ignore — which is the same as no warning.
+        """
+        carried = channels_of(messages)
+        if carried is not None:
+            if self._pinned_channels is not None and not self._channel_pin_shadowed:
+                self._channel_pin_shadowed = True
+                log.warning(
+                    "[channels] %s has channels pinned by set_channels(), but this "
+                    "prompt carries its own split — using the carried one. Call "
+                    "clear_channels() if the pin is stale.", type(self).__name__)
+            return carried
+        if self._pinned_channels is not None:
+            return self._pinned_channels
+        first = warn and not self._channel_guess_warned
+        self._channel_guess_warned = True
+        return ChanneledPrompt.from_messages(messages, warn=first)
 
     # ------------------------------------------------------------------
     # Concrete helpers

@@ -52,6 +52,23 @@ class DefendedVictim(Victim):
     def max_bs(self) -> int:
         return getattr(self.target, "max_bs", 50)
 
+    # -- channels ------------------------------------------------------
+    #
+    # A pin has to reach every layer: in a CompositeDefense the wrappers each
+    # resolve the split for themselves, and the innermost one is the model's.
+
+    def set_channeled_prompt(self, prompt) -> None:
+        super().set_channeled_prompt(prompt)
+        setter = getattr(self.target, "set_channeled_prompt", None)
+        if callable(setter):
+            setter(prompt)
+
+    def clear_channels(self) -> None:
+        super().clear_channels()
+        clearer = getattr(self.target, "clear_channels", None)
+        if callable(clearer):
+            clearer()
+
     # Hooks for subclasses
     def preprocess_messages(self, messages: list[dict]) -> list[dict]:
         """Transform input messages before passing to the target model."""
