@@ -186,6 +186,12 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   that adds a candidate must go through `MutationBase.new_child()` (sets both) and
   `SelectPolicy.register()` (assigns `index`, the policy's reward slot) — upstream leaves index
   assignment to the recipe and a miss reads another node's reward.
+- **`ReferenceLossSelector` batches, and its `_build_batch` is torch-free on purpose.**
+  Scoring is one forward pass per `batch_size` candidates, with `-100`-masked labels
+  outside the reference span. The padding/label index arithmetic is split into a pure
+  Python method so `smoke_check.py` can verify it without a GPU — keep that split. Its
+  `batch_size=None` means one batch for the *whole* dataset (upstream's default); set it
+  explicitly for gradient-scale candidate sets or it OOMs.
 - **A constraint filters, a mutation rewrites, an evaluator scores.** `ipi/constraint/` only
   drops candidates, and every one it drops is a victim query saved — that is the whole point.
   `PerplexityConstraint` is the odd one: perplexity filtering is a published *defense*, used

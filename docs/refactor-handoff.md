@@ -322,9 +322,24 @@ that from the instance's own ground truth. That is precisely why all four surviv
    `n_queries` is 1 by construction. Recorded so nobody reads its flat query count as a
    bug.
 
-Still open, deliberately: **`ReferenceLossSelector.batch_size` is accepted and never
-used** (see 3 in the plan above). Fix it there before anyone reconsiders the gcg/beast
-conversion, since it is what makes that conversion expensive.
+5. **`ReferenceLossSelector.batch_size` was accepted, stored and never used.** `select()`
+   ran one unbatched forward per instance — for a gradient attack, 512 forward passes
+   where 8 would do, which is most of why the gcg/beast conversion looked prohibitive.
+   **Fixed** — candidates are now padded, stacked and scored one batch per forward pass
+   using upstream's masked-label formulation (`labels` = `-100` outside the reference
+   span, shift by one, per-row mean over the unmasked positions). That is mathematically
+   identical to the per-instance slice: with right padding and causal attention no real
+   position can attend to a pad. `batch_size=None` still means "one batch for the whole
+   dataset", as upstream documents — set it explicitly at gradient scale or it OOMs.
+
+   The index arithmetic lives in a pure-Python `_build_batch`, deliberately split from the
+   forward pass so `smoke_check.py` can verify padding, label masking, the shift-by-one
+   and the degenerate empty-span row **with no torch and no GPU**. Both the batching and
+   an off-by-one in the label span were mutation-tested: breaking either fails the check.
+
+Note the plan item 3 above is now cheaper than the audit found it, but still not free —
+GCG's scoring is token-level and shares a prompt prefix across candidates, which the
+text-level selector cannot exploit. Re-measure before converting.
 
 #### Scope call: the structural migration stops here
 

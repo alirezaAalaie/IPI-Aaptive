@@ -14,6 +14,20 @@ contract, the same one ``attacks/{gcg,autodan,beast}.py`` optimise against — a
 the trace with ``tokenizer.apply_chat_template``, so it works with any modern HF model
 rather than a hard-coded conversation template.
 
+Batching
+--------
+``batch_size`` is honoured: candidates are padded, stacked and scored in one forward
+pass per batch, using upstream's masked-label formulation (``labels`` = ``-100``
+everywhere except the reference span, then per-row mean over the unmasked positions).
+That is mathematically identical to slicing each sequence on its own — with right
+padding and causal attention, no real position can attend to a pad — so a batched score
+and a one-at-a-time score are the same number.
+
+This matters because the selector was written for GCG- and BEAST-scale candidate sets.
+Scoring 512 candidates one at a time is ~512 forward passes; batching them at 64 is 8.
+``batch_size=None`` means "one batch for the whole dataset", which is upstream's default
+and will OOM on a large candidate set — set it explicitly for anything gradient-scale.
+
 ``torch`` is imported lazily: ``import ipi`` must work without it.
 
 Universal vs per-instance
@@ -42,7 +56,9 @@ class ReferenceLossSelector(SelectPolicy):
 
     Args:
         victim:       A local ``Victim`` (``hf_model`` + ``tokenizer``, ``backend == "local"``).
-        batch_size:   Candidates scored per forward batch. ``None`` = one batch.
+        batch_size:   Candidates scored per forward batch. ``None`` (upstream's default)
+                      means one batch for the whole dataset — fine for a handful of
+                      candidates, an OOM for a gradient-scale set. Set it explicitly there.
         is_universal: Score each ``jailbreak_prompt`` across the whole dataset rather
                       than within each parent's group.
     """
@@ -81,14 +97,23 @@ class ReferenceLossSelector(SelectPolicy):
             return "\n".join(f"[{m['role'].upper()}] {m['content']}"
                              for m in messages) + "\n[ASSISTANT] "
 
-    def _loss(self, instance: Instance) -> float:
-        """Mean cross-entropy of the reference response given the prompt."""
-        import torch
+    def _pad_id(self) -> int:
+        """A token id safe to pad with. Value is irrelevant — pads are masked out."""
+        tok = self.victim.tokenizer
+        for candidate in (tok.pad_token_id, tok.eos_token_id):
+            if candidate is not None:
+                return int(candidate)
+        return 0
 
+    def _encode(self, instance: Instance) -> tuple[list[int], int, int]:
+        """
+        ``(full_ids, prompt_len, target_len)`` for one instance.
+
+        ``target_len == 0`` marks a degenerate instance (the reference response encodes
+        to nothing after the prompt); the caller scores it ``inf`` rather than dividing
+        by zero.
+        """
         tokenizer = self.victim.tokenizer
-        model = self.victim.hf_model
-        device = next(model.parameters()).device
-
         if not instance.reference_responses:
             raise ValueError(
                 f"instance {instance.id!r} has no reference_responses to score against")
@@ -100,22 +125,85 @@ class ReferenceLossSelector(SelectPolicy):
         prompt_text = self._prompt_text(instance)
         full_text = prompt_text + instance.reference_responses[0]
 
-        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False,
-                                      return_tensors="pt").to(device)
-        full_ids = tokenizer.encode(full_text, add_special_tokens=False,
-                                    return_tensors="pt").to(device)
-        prompt_len = prompt_ids.shape[1]
-        if full_ids.shape[1] <= prompt_len:
-            return float("inf")
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        full_ids = tokenizer.encode(full_text, add_special_tokens=False)
+        prompt_len = len(prompt_ids)
+        return full_ids, prompt_len, max(0, len(full_ids) - prompt_len)
+
+    def _build_batch(self, instances: list[Instance]):
+        """
+        Pad and label a batch — the index arithmetic, with no torch in sight.
+
+        Split out from ``_score_batch`` on purpose: this is the part that gets the
+        off-by-one wrong, and keeping it pure Python means ``smoke_check.py`` can verify
+        it on a machine with no GPU and no torch installed.
+
+        Returns ``(rows, input_rows, label_rows, mask_rows)`` where ``rows`` are the
+        indices into ``instances`` that are actually scorable. A row whose reference span
+        encodes to nothing is left out and scored ``inf`` by the caller — including it
+        would divide by a zero token count.
+
+        ``labels`` is ``-100`` everywhere except the reference span, upstream's
+        formulation: ``cross_entropy`` ignores ``-100``, so neither the prompt nor the
+        padding contributes to the loss.
+        """
+        pad_id = self._pad_id()
+        encoded = [self._encode(instance) for instance in instances]
+        rows = [i for i, (_, _, target_len) in enumerate(encoded) if target_len > 0]
+        if not rows:
+            return [], [], [], []
+
+        max_len = max(len(encoded[i][0]) for i in rows)
+        input_rows, label_rows, mask_rows = [], [], []
+        for i in rows:
+            full_ids, prompt_len, target_len = encoded[i]
+            pad = max_len - len(full_ids)
+            input_rows.append(full_ids + [pad_id] * pad)
+            labels = [-100] * (len(full_ids) + pad)
+            labels[prompt_len: prompt_len + target_len] = \
+                full_ids[prompt_len: prompt_len + target_len]
+            label_rows.append(labels)
+            mask_rows.append([1] * len(full_ids) + [0] * pad)
+        return rows, input_rows, label_rows, mask_rows
+
+    def _score_batch(self, instances: list[Instance]) -> None:
+        """
+        Score a batch in one forward pass, writing ``instance._loss`` on each.
+
+        Shift by one, then a per-row mean over the unmasked positions — identical to
+        slicing each sequence individually, because right padding plus causal attention
+        means no real position can attend to a pad.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        rows, input_rows, label_rows, mask_rows = self._build_batch(instances)
+
+        scorable = set(rows)
+        for i, instance in enumerate(instances):
+            if i not in scorable:
+                instance._loss = float("inf")
+        if not rows:
+            return
+
+        model = self.victim.hf_model
+        device = next(model.parameters()).device
+        input_ids = torch.tensor(input_rows, dtype=torch.long, device=device)
+        labels    = torch.tensor(label_rows, dtype=torch.long, device=device)
+        attention = torch.tensor(mask_rows,  dtype=torch.long, device=device)
 
         with torch.no_grad():
-            logits = model(input_ids=full_ids, use_cache=False).logits
+            logits = model(input_ids=input_ids, attention_mask=attention,
+                           use_cache=False).logits
 
-        target_len = full_ids.shape[1] - prompt_len
-        logits_slice = logits[0, prompt_len - 1: prompt_len - 1 + target_len, :]
-        target_slice = full_ids[0, prompt_len: prompt_len + target_len]
-        loss = torch.nn.functional.cross_entropy(logits_slice, target_slice)
-        return float(loss.item())
+        shift_logits = logits[:, :-1, :].transpose(1, 2)      # B x V x (L-1)
+        shift_labels = labels[:, 1:]                          # B x (L-1)
+        per_token = F.cross_entropy(shift_logits, shift_labels, reduction="none")
+        valid = (shift_labels != -100)
+        losses = (per_token * valid).sum(dim=1) / valid.sum(dim=1)
+
+        for row, i in enumerate(rows):
+            instances[i]._loss = float(losses[row].item())
 
     # ------------------------------------------------------------------
 
@@ -127,8 +215,11 @@ class ReferenceLossSelector(SelectPolicy):
                 for group in dataset.group_by_parents().values()
             ])
 
-        for instance in dataset:
-            instance._loss = self._loss(instance)
+        instances = list(dataset)
+        # `or 1` guards the empty dataset: range(0, 0, 0) raises rather than doing nothing.
+        size = self.batch_size or len(instances) or 1
+        for start in range(0, len(instances), size):
+            self._score_batch(instances[start: start + size])
 
         best_group = None
         best_loss = None

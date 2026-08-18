@@ -611,6 +611,94 @@ def _selector_policies():
     assert len(SelectBasedOnScores(tree_width=3, seed=0).select(one)) == 1
 
 
+@check("selector: ReferenceLossSelector batches, and its labels line up")
+def _reference_loss_batching():
+    """
+    The selector's ``batch_size`` was accepted, stored and never used — every candidate
+    got its own forward pass. For a gradient attack that is the difference between 8
+    forward passes and 512, which is why the GCG/BEAST migration looked prohibitive.
+
+    ``_build_batch`` is pure Python by design so the index arithmetic — the part that
+    gets the off-by-one wrong — can be verified with no torch and no GPU. What must hold:
+    every row padded to the same length; ``labels`` masked to ``-100`` everywhere except
+    the reference span; the unmasked span equal to the reference tokens themselves; and
+    a degenerate row (empty reference span) excluded rather than dividing by zero.
+    """
+    from ipi.datasets import Instance
+    from ipi.selector import ReferenceLossSelector
+
+    class _FakeTokenizer:
+        """One token per character — makes the arithmetic checkable by eye."""
+        pad_token_id = 7
+        eos_token_id = 9
+
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            return "|" + messages[-1]["content"] + ">"
+
+    class _FakeVictim:
+        backend = "local"
+        system_prompt = ""
+        hf_model = object()          # never touched by _build_batch
+        tokenizer = _FakeTokenizer()
+
+    sel = ReferenceLossSelector(_FakeVictim(), batch_size=2)
+
+    def inst(iid, query, ref):
+        return Instance(id=iid, query=query, reference_responses=[ref])
+
+    short = inst("a", "ab", "XY")        # prompt "|ab>" = 4 tokens, ref 2
+    long_ = inst("b", "abcdef", "ZZZZ")  # prompt "|abcdef>" = 8 tokens, ref 4
+    empty = inst("c", "ab", "")          # zero-length reference span
+
+    rows, inputs, labels, masks = sel._build_batch([short, long_, empty])
+
+    assert rows == [0, 1], f"degenerate row not excluded: {rows}"
+    assert len({len(r) for r in inputs}) == 1, "rows are not padded to a common length"
+    assert len(inputs[0]) == 12, f"expected pad to len(|abcdef>ZZZZ)=12, got {len(inputs[0])}"
+
+    # Row 0 is the short one: 6 real tokens then 6 pads, and the pads use pad_token_id.
+    assert masks[0] == [1] * 6 + [0] * 6, masks[0]
+    assert inputs[0][6:] == [_FakeTokenizer.pad_token_id] * 6
+    assert masks[1] == [1] * 12
+
+    # Labels: -100 everywhere but the reference span, and the span is the reference itself.
+    for row, (prompt_len, ref) in enumerate([(4, "XY"), (8, "ZZZZ")]):
+        lab = labels[row]
+        span = lab[prompt_len: prompt_len + len(ref)]
+        assert span == [ord(c) for c in ref], (row, span)
+        assert all(v == -100 for v in lab[:prompt_len]), f"prompt not masked in row {row}"
+        assert all(v == -100 for v in lab[prompt_len + len(ref):]), \
+            f"tail not masked in row {row}"
+        assert len(lab) == len(inputs[row])
+
+    # The shift-by-one the loss applies must leave exactly len(ref) scored positions.
+    for row, ref in enumerate(["XY", "ZZZZ"]):
+        shifted = labels[row][1:]
+        assert sum(1 for v in shifted if v != -100) == len(ref), row
+
+    # batch_size actually chunks: 5 candidates at batch_size=2 -> 3 forward passes.
+    seen = []
+    sel5 = ReferenceLossSelector(_FakeVictim(), batch_size=2)
+    sel5._score_batch = lambda batch: seen.append(len(batch))
+    pool = [inst(str(i), "ab", "XY") for i in range(5)]
+    from ipi.datasets import AttackDataset
+    for i in pool:
+        i.jailbreak_prompt = "{query}"
+        i._loss = 0.0
+    sel5.select(AttackDataset(pool))
+    assert seen == [2, 2, 1], f"batch_size ignored — batches were {seen}"
+
+    # None means one batch, as upstream documents.
+    seen.clear()
+    sel_all = ReferenceLossSelector(_FakeVictim(), batch_size=None)
+    sel_all._score_batch = lambda batch: seen.append(len(batch))
+    sel_all.select(AttackDataset(pool))
+    assert seen == [5], f"batch_size=None should be a single batch, got {seen}"
+
+
 @check("constraint: filters prune before a query is spent")
 def _constraints():
     from ipi.datasets import AttackDataset, Instance
