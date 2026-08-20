@@ -1,11 +1,14 @@
 """
 IPI Defenses Package.
 """
-from ..channels import ChanneledPrompt, channels_of
+from ..channels import (
+    ChanneledPrompt, PreRenderedMessages, PreRenderedPromptError, channels_of,
+)
 from .base import DefendedVictim
 from .channels import (
     RAW_ROLE,
     StructuredChannelDefense,
+    assert_innermost,
     recursive_filter,
 )
 from .in_context import (
@@ -43,6 +46,9 @@ from .struq import (
 __all__ = [
     "ChanneledPrompt",
     "channels_of",
+    "PreRenderedMessages",
+    "PreRenderedPromptError",
+    "assert_innermost",
     "DefendedVictim",
     "StructuredChannelDefense",
     "recursive_filter",

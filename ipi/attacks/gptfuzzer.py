@@ -42,12 +42,28 @@ IPI adaptations vs original
 ---------------------------
   reward source: upstream trains a RoBERTa classifier on jailbreak/no-jailbreak pairs.
       We have deterministic ground truth per scenario, so ``EvaluatorIPISuccess`` replaces
-      it. A guidance evaluator (``judge=``) is now **optional and annotative** — it scores
-      the trace and breaks ties for the reported best candidate, but no longer drives
-      selection. Before the MCTS port it did (normalised to [0,1]), which was a workaround
-      for not shipping the classifier, not a property of the algorithm.
+      it. A guidance evaluator (``judge=``) is **optional and annotative**: it grades the
+      candidate that ends up being reported, so the row carries a 1-10 score rather than
+      a bare 10/1, and it does not drive selection. Before the MCTS port it did
+      (normalised to [0,1]), which was a workaround for not shipping the classifier, not
+      a property of the algorithm. It is now one judge call per scenario rather than one
+      per candidate — the per-candidate scores only ever fed a trace that stopped at the
+      ``ScenarioResult`` boundary.
   budget:  the reference fuzzes to a fixed iteration count over a whole question set; we
       budget by target queries per scenario, which is the scarce resource here.
+
+Composition
+-----------
+One round is::
+
+    parent  = self.selector.select()[0]          # MCTSExploreSelectPolicy
+    child   = mutator(AttackDataset([parent]))   # one of GPTFUZZER_MUTATORS
+    batch   = query(AttackDataset([child]))      # harness.VictimQuery (budgeted)
+    self.evaluator(batch)                        # EvaluatorIPISuccess
+    self.selector.update(tried)                  # back-propagate up the path
+
+The query budget lives on ``VictimQuery``, so the loop condition is
+``while not query.exhausted`` rather than a hand-kept counter.
 
 Report of differences from the reference is in docs/easyjailbreak-audit.md.
 """
@@ -56,20 +72,21 @@ from __future__ import annotations
 
 import logging
 import random
-from dataclasses import dataclass, field
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
-from ..attacker import AdaptiveAttacker
-from ..config import ATTACK_TEMP, ATTACK_TOP_P, ATTACK_MAX_TOKENS
+from ..attacker import AdaptiveAttacker, as_attacker_llm
 from ..datasets import AttackDataset, Instance
-from ..llm_unified import APILLM, UnifiedLLM
-from ..metrics import Evaluator, EvaluatorIPISuccess
+from ..harness import VictimQuery
+from ..llm_unified import APILLM
+from ..metrics import Evaluator, EvaluatorIPISuccess, resolve_attack_target
 from ..mutation import GPTFUZZER_MUTATORS
 from ..seed import SeedTemplate, render
 from ..selector import MCTSExploreSelectPolicy
 from ..victim import Victim
 
 log = logging.getLogger(__name__)
+
+__all__ = ["GPTFuzzerAttacker"]
 
 
 def _load_seeds() -> list[str]:
@@ -79,178 +96,22 @@ def _load_seeds() -> list[str]:
     )
 
 
-@dataclass
-class GPTFuzzerResult:
-    success: bool
-    score: int
-    injection: str          # best rendered injection
-    target_response: str
-    n_queries: int
-    goal: str
-    iterations: int = 0
-    best_template: str = ""
-    trace: list[dict] = field(default_factory=list)
-
-    def __repr__(self) -> str:
-        return (
-            f"GPTFuzzerResult(success={self.success}, score={self.score}, "
-            f"n_queries={self.n_queries})"
-        )
-
-
-def _seed_pool(goal: str, templates: list[str], target_str: str,
-               eval_mode: str) -> AttackDataset:
-    """The initial population: one root ``Instance`` per seed template."""
-    return AttackDataset([
-        Instance(
-            id=f"seed-{i}",
-            query=goal,
-            jailbreak_prompt=template,
-            reference_responses=[target_str],
-            attack_attrs={"target_str": target_str, "attack_eval_mode": eval_mode},
-        )
-        for i, template in enumerate(templates)
-    ])
-
-
-def run_gptfuzzer(
-    goal: str,
-    target_fn: Callable[[str], str],
-    attacker_model: Union[str, UnifiedLLM],
-    judge: Optional[Evaluator] = None,
-    max_queries: int = 40,
-    energy: int = 1,
-    seed_templates: Optional[list[str]] = None,
-    eval_mode: str = "contains",
-    target_str: str = "",
-    seed: Optional[int] = None,
-) -> GPTFuzzerResult:
-    """
-    Run the GPTFuzzer fuzzing loop.
-
-    Args:
-        goal:           Attacker injection goal.
-        target_fn:      Callable(injection: str) -> response: str.
-        attacker_model: LLM (or model string) used for the mutation operators.
-        judge:          Optional guidance Evaluator. Annotates the trace and breaks ties
-                        for the reported best candidate; it does **not** drive selection —
-                        see "IPI adaptations vs original".
-        max_queries:    Target-query budget (the stopping criterion). Default 40.
-        energy:         Mutants generated per selected seed each round. Default 1.
-        seed_templates: Override the seed pool (default: 77 verbatim GPTFuzzer seeds).
-        eval_mode:      check_ipi_success mode (usually resolved from the scenario).
-        target_str:     Expected success string (falls back to goal).
-        seed:           Optional RNG seed for reproducibility.
-
-    Returns:
-        GPTFuzzerResult.
-    """
-    rng = random.Random(seed)
-    attacker = (
-        APILLM(model=attacker_model, temperature=ATTACK_TEMP, top_p=ATTACK_TOP_P,
-               max_tokens=ATTACK_MAX_TOKENS)
-        if isinstance(attacker_model, str) else attacker_model
-    )
-
-    templates = seed_templates or _load_seeds()
-    check_str = target_str or goal
-
-    pool = _seed_pool(goal, templates, check_str, eval_mode)
-    roots = AttackDataset(list(pool))          # snapshot: MCTS descends from these
-    policy = MCTSExploreSelectPolicy(
-        dataset=pool, initial_prompt_pool=roots, questions=1, seed=seed)
-    # Operators rewrite the *template*, not the goal; CrossOver draws from the seed pool.
-    mutators = GPTFUZZER_MUTATORS(attacker, seed_pool=templates,
-                                  attr_name="jailbreak_prompt")
-    evaluator = EvaluatorIPISuccess(mode=eval_mode)
-
-    best = GPTFuzzerResult(
-        success=False, score=0, injection="", target_response="",
-        n_queries=0, goal=goal,
-    )
-    iteration = 0
-
-    while best.n_queries < max_queries:
-        iteration += 1
-        parent = policy.select()[0]
-
-        tried = AttackDataset([])
-        for _ in range(energy):
-            if best.n_queries >= max_queries:
-                break
-
-            mutator = rng.choice(mutators)
-            # The dataset path records the parent/child edge and the level MCTS needs.
-            child = mutator(AttackDataset([parent]))[0]
-            # A mutant has not been tried yet; it inherits the parent's transcript
-            # through copy(), which HistoricalInsight wants and we do not.
-            child.target_responses = []
-            child.eval_results = []
-            policy.register(child)
-
-            injection = render(child.jailbreak_prompt, goal)
-            try:
-                response = target_fn(injection)
-            except Exception as exc:
-                log.warning("[GPTFuzzer] target_fn raised: %s", exc)
-                response = ""
-            best.n_queries += 1
-            child.target_responses = [response]
-            tried.add(child)
-
-            evaluator(AttackDataset([child]))
-            success = bool(child.eval_results and child.eval_results[-1])
-
-            score = 10 if success else 1
-            if judge is not None:
-                try:
-                    score = judge.score(injection, response, attacker_goal=goal)
-                except Exception as exc:
-                    log.debug("[GPTFuzzer] judge.score failed: %s", exc)
-
-            best.trace.append({
-                "iteration": iteration, "template": child.jailbreak_prompt,
-                "injection": injection, "response": response,
-                "success": success, "score": score, "level": child.level,
-            })
-
-            if (success and not best.success) or (score > best.score) or not best.injection:
-                best.success = best.success or success
-                best.score = max(best.score, score)
-                best.injection = injection
-                best.target_response = response
-                best.best_template = child.jailbreak_prompt
-
-            if success:
-                best.success = True
-                break
-
-        # Back-propagate up the selected path.
-        policy.update(tried)
-
-        best.iterations = iteration
-        if best.success:
-            break
-
-    return best
-
-
 class GPTFuzzerAttacker(AdaptiveAttacker):
     """
-    GPTFuzzer attacker — budgeted seed-template fuzzing with MCTS selection (API-compatible).
-
-    From: Yu et al. (2023), "GPTFUZZER: Red Teaming Large Language Models with
-    Auto-Generated Jailbreak Prompts".
+    Budgeted seed-template fuzzing with MCTS selection.
 
     Args:
-        attacker_llm: LLM (or model string) driving the mutation operators.
-        judge:        Optional guidance Evaluator. Annotates the trace; the search reward
-                      is binary success against the scenario's ground truth.
-        max_queries:  Target-query budget (stopping criterion). Default 40.
-        energy:       Mutants per selected seed each round. Default 1.
-        eval_mode:    check_ipi_success mode. Default None → auto-detect from the scenario's
-                      ``attack_eval_mode``.
-        seed:         Optional RNG seed for reproducibility.
+        attacker_llm:   LLM (or model string) driving the five mutation operators.
+        judge:          Optional guidance Evaluator. Grades the reported candidate so
+                        the row carries a 1-10 score; the *search* reward is binary
+                        success against the scenario's ground truth either way.
+        max_queries:    Victim-query budget, the stopping criterion. Default 40.
+        energy:         Mutants generated per selected seed each round. Default 1.
+        eval_mode:      ``check_ipi_success`` mode. Default None → read the scenario's
+                        own ``attack_eval_mode``. Pass a string only to force a
+                        deliberate deviation.
+        seed_templates: Override the seed pool (default: the 77 upstream seeds).
+        seed:           RNG seed, for reproducibility.
     """
 
     _ATTACK_NAME = "gptfuzzer"
@@ -262,59 +123,131 @@ class GPTFuzzerAttacker(AdaptiveAttacker):
         max_queries: int = 40,
         energy: int = 1,
         eval_mode: Optional[str] = None,
+        seed_templates: Optional[list[str]] = None,
         seed: Optional[int] = None,
     ):
         super().__init__(judge)
-        self.attacker_llm = (
-            APILLM(model=attacker_llm, temperature=ATTACK_TEMP, top_p=ATTACK_TOP_P,
-                   max_tokens=ATTACK_MAX_TOKENS)
-            if isinstance(attacker_llm, str) else attacker_llm
-        )
+        self.attacker_llm = as_attacker_llm(attacker_llm)
         self.max_queries = max_queries
-        self.energy      = energy
-        self.eval_mode   = eval_mode
-        self.seed        = seed
+        self.energy = energy
+        self.eval_mode = eval_mode
+        self.seed = seed
+        self.templates = seed_templates or _load_seeds()
+        # Operators rewrite the *template*, not the goal; CrossOver draws from the pool.
+        self.mutators = GPTFUZZER_MUTATORS(
+            self.attacker_llm, seed_pool=self.templates, attr_name="jailbreak_prompt")
 
-    @classmethod
-    def requires_local_target(cls) -> bool:
-        return False
+    # ------------------------------------------------------------------
+    # The attack
+    # ------------------------------------------------------------------
 
-    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
-        from ..harness import make_target_fn
-        from ..metrics import ScenarioResult, resolve_attack_target
-        target_fn = make_target_fn(instance, target)
+    def single_attack(self, target: Victim, instance: Instance,
+                      verbose: bool = False) -> AttackDataset:
+        """
+        Fuzz until the query budget runs out, or a mutant succeeds.
+
+        The selector, the mutation pool and the evaluator are the components; the loop
+        only decides *when* to call them. Every mutant is registered with the policy
+        (which assigns its reward slot) and reached through a mutation operator (which
+        records the parent/child edge and the level MCTS descends).
+        """
+        goal = instance.query or ""
         target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
+        rng = random.Random(self.seed)
 
-        r = run_gptfuzzer(
-            goal=instance.query,
-            target_fn=target_fn,
-            attacker_model=self.attacker_llm,
-            judge=self.judge,
-            max_queries=self.max_queries,
-            energy=self.energy,
-            eval_mode=eval_mode,
-            target_str=target_str,
-            seed=self.seed,
+        pool = self._seed_pool(goal, target_str, eval_mode)
+        selector = MCTSExploreSelectPolicy(
+            dataset=pool, initial_prompt_pool=AttackDataset(list(pool)),
+            questions=1, seed=self.seed)
+        evaluator = EvaluatorIPISuccess(mode=eval_mode)
+        # The template still carries {query}; render it at query time so the reported
+        # attack_str is the string the victim saw, not the template behind it.
+        query = VictimQuery(
+            instance, target, budget=self.max_queries,
+            render=lambda candidate: render(candidate.jailbreak_prompt, goal))
+
+        best: Optional[Instance] = None
+        succeeded = False
+        iterations = 0
+
+        while not query.exhausted and not succeeded:
+            iterations += 1
+            parent = selector.select()[0]
+            tried = AttackDataset([])
+
+            for _ in range(self.energy):
+                if query.exhausted:
+                    break
+                child = rng.choice(self.mutators)(AttackDataset([parent]))[0]
+                # A mutant has not been tried yet; it inherited the parent's transcript
+                # through copy(), which HistoricalInsight wants and we do not.
+                child.target_responses = []
+                child.eval_results = []
+                selector.register(child)
+
+                batch = query(AttackDataset([child]))
+                if not len(batch):
+                    break
+                evaluator(batch)
+                tried.add(child)
+                best = self.keep_best(best, batch)
+
+                if child.eval_results and child.eval_results[-1]:
+                    succeeded = True
+                    if verbose:
+                        log.info("[GPTFuzzer] success at iteration=%d after %d queries",
+                                 iterations, query.n_queries)
+                    break
+
+            selector.update(tried)                    # back-propagate up the path
+
+        return self.report(
+            best, query,
+            success=succeeded,
+            score=self._grade(best, goal),
+            iterations=iterations,
+            best_template=best.jailbreak_prompt if best is not None else "",
+            # How far MCTS descended the mutation tree. 1 means it only ever re-rolled
+            # roots — which is all flat UCB1 could do before the carrier existed.
+            max_level=max((node.level for node in selector.dataset), default=0),
         )
 
-        if verbose:
-            log.info("[gptfuzzer] scenario=%s success=%s score=%d n_queries=%d",
-                     instance.id, r.success, r.score, r.n_queries)
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-        return ScenarioResult(
-            scenario_id=instance.id,
-            goal=instance.query,
-            success=r.success,
-            score=r.score,
-            injection=r.injection,
-            target_response=r.target_response,
-            n_queries=r.n_queries,
-            attack=self._ATTACK_NAME,
-            extra={"iterations": r.iterations, "best_template": r.best_template},
-        )
+    def _seed_pool(self, goal: str, target_str: str, eval_mode: str) -> AttackDataset:
+        """The initial population: one root ``Instance`` per seed template."""
+        return AttackDataset([
+            Instance(
+                id=f"seed-{i}",
+                query=goal,
+                jailbreak_prompt=template,
+                reference_responses=[target_str],
+                attack_attrs={"target_str": target_str, "attack_eval_mode": eval_mode},
+            )
+            for i, template in enumerate(self.templates)
+        ])
+
+    def _grade(self, best: Optional[Instance], goal: str) -> Optional[int]:
+        """
+        The reported 1-10 score: the judge's if there is one, else the binary verdict.
+
+        ``None`` lets ``build_result`` fall back to ``eval_results[-1]`` — the binary
+        success mapped through ``Evaluator.as_score`` (10 or 1).
+        """
+        if best is None or self.judge is None:
+            return None
+        try:
+            return self.judge.score(
+                best.attack_attrs.get("injection", "") or best.jailbreak_prompt or "",
+                best.target_responses[-1] if best.target_responses else "",
+                attacker_goal=goal,
+            )
+        except Exception as exc:
+            log.debug("[GPTFuzzer] judge.score failed: %s", exc)
+            return None
 
     def __repr__(self) -> str:
-        return (
-            f"GPTFuzzerAttacker(attacker={self.attacker_llm.model_name!r}, "
-            f"max_queries={self.max_queries}, energy={self.energy})"
-        )
+        return (f"GPTFuzzerAttacker(attacker={self.attacker_llm.model_name!r}, "
+                f"max_queries={self.max_queries}, energy={self.energy})")

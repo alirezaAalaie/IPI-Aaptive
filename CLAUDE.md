@@ -20,10 +20,9 @@ ipi/                    ← the package (this is the product; pip-installed on K
   channels.py           ChanneledPrompt — the trusted-instruction / untrusted-data split,
                         carried with the prompt (StruQ's model) · ChanneledMessages
   harness.py            Instance→Victim plumbing: build_channeled_prompt (the one place
-                        the IPI prompt shape is defined) · make_target_fn ·
-                        attack_context · resolve_optimization_target
-  runner.py             run_attack / run_experiment — target_fn-level API, NOT the
-                        benchmark path (that is AttackEvaluator over an AttackDataset)
+                        the IPI prompt shape is defined) · VictimQuery (the victim as a
+                        dataset→dataset component) · make_target_fn · attack_context ·
+                        resolve_optimization_target
   target.py             TargetLLM (Victim wrapping UnifiedLLM) + make_target
   config.py             shared hyperparameter defaults
   mutation/             MutationBase ops — generation.py (LLM-driven: GPTFuzzer 5,
@@ -89,13 +88,25 @@ attacks (GCG, AutoDAN, BEAST) additionally need `hf_model` + `tokenizer` exposed
 **An attack is a `BaseAttacker`.** The single method that matters:
 
 ```python
-def run_scenario(self, target: Victim, instance: Instance, verbose=False) -> ScenarioResult
+def single_attack(self, target: Victim, instance: Instance, verbose=False) -> AttackDataset
 ```
 
-Every attack module also exports a bare `run_*()` function (the algorithm, no class ceremony)
-plus a `*Result` dataclass. `run_scenario` is a thin adapter over it via
-`harness.make_target_fn(instance, target)`. Follow this shape for new attacks — the notebooks
-use both entry points. `instance.query` is the attacker's goal; everything IPI-specific
+It returns the candidate(s) to report, normally one, built with
+`self.report(best, query, **extra)`. `BaseAttacker.run_scenario` is concrete and turns that
+into the `ScenarioResult` `AttackEvaluator` consumes — **do not override it.** The base class
+also owns `keep_best` (replacing the `best_score`/`best_injection`/`best_response` triple),
+`normalise_scores`, `as_attacker_llm` and the `current_*` counters, and `__init__` raises if a
+subclass defines neither `single_attack` nor `run_scenario`.
+
+The victim is a component, not a closure: `harness.VictimQuery(instance, target)` is
+`dataset -> dataset`, the same shape as mutation / constraint / evaluator, and owns the
+try/except, the query count and the budget. A recipe never calls the victim by hand.
+See `docs/single-attack-migration.md`.
+
+There is **no `*Result` dataclass and no bare `run_*()` function** any more, with one
+deliberate exception: `gcg`, `beast` and `autodan` keep theirs as a standalone
+(non-scenario) entry point, because the structural swap that would remove them is deferred
+in `docs/next-session.md` §4a. `instance.query` is the attacker's goal; everything IPI-specific
 (`user_task`, `tool_schema`, `pipeline_context`, `target_str`, `optimization_target`) is in
 `instance.attack_attrs` and is read through `harness` / `metrics.resolve_attack_target`, never
 by hand — `attack_attrs.get` returns `None` on a typo where an attribute would have raised.
@@ -228,9 +239,30 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
 - **PAIR has no JSON prefill.** The reference implementation prefills the attacker's reply with
   `{"improvement": "", "prompt": "` for local HF attacker models. Without it, local attacker
   models fail JSON parsing often. Fine for API attackers.
-- On parse failure PAIR does `continue` (skips the stream, **does not count a query**), whereas
+- On parse failure PAIR skips the stream for that round and **does not count a query**, whereas
   the reference falls back to attacking with the raw goal. Query counts are therefore not
-  directly comparable to published PAIR numbers.
+  directly comparable to published PAIR numbers. `IntrospectBranching` drops a branch whose
+  attacker never produced valid JSON — right for TAP's tree, wrong for a fixed set of streams —
+  so `pair._stalled` re-attaches the parents it dropped. A parse failure costs a stream one
+  round, not its life.
+- **TAP and PAIR branch through one operator, `mutation.IntrospectBranching`.** They are the
+  same conversational refinement at different branching factors: a tree that fans out
+  `branching_factor` ways versus independent chains that fan out one. Upstream splits them
+  across `IntrospectGeneration` (which needs `fastchat`) and `HistoricalInsight`, duplicating
+  the ask / retry / JSON-parse loop in both recipes.
+- **The attacker transcript's head is two messages, not one.** `IntrospectBranching.truncate`
+  keeps the system prompt **and the opening user turn**. In the IPI framings the system prompt
+  is generic and the goal, user task and tool schema live in that first user message. PAIR's
+  old inline `conv[:1] + conv[-12:]` dropped it past thirteen messages, so from roughly the
+  sixth iteration the attacker was refining toward an objective it could no longer see. Fixed
+  by adopting the shared operator; PAIR's `keep_last_n=6` reproduces the old twelve-message
+  tail. **This moves PAIR's numbers** — re-baseline it.
+- **GPTFuzzer's `judge=` now costs one call per scenario, not one per candidate.** It grades
+  only the candidate that gets reported, so the row carries a 1-10 score instead of a bare
+  10/1. The search reward was already binary success and is unchanged. The per-candidate judge
+  scores only ever fed a `trace` that stopped at the `ScenarioResult` boundary — that trace is
+  gone; the lineage is on the `Instance`s (`parents`/`children`/`level`) instead, and
+  `extra["max_level"]` reports how far the search actually descended.
 - StruQ/SecAlign training lives under `ipi/defenses/{struq,secalign}/trainer.py` and has had
   repeated multi-GPU / TRL-compat breakage (see recent commits). Their notebooks are separate:
   `experiments/{struq,secalign}_defense_notebook.ipynb`.
@@ -261,9 +293,25 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   the DefensiveToken notebook's `preprocess_messages([])`) → `ChanneledPrompt.from_messages`,
   which is not a parser: system turns are trusted, the whole final user turn is data. That
   over-marks rather than going inert. `data_prefix`/`data_suffix` (the `<env>` tags) are
-  trusted framing and stay outside the untrusted span. A structured defense returns a plain
-  list on purpose — its output is the model's own rendering and must not be re-rendered by a
-  defense chained under it.
+  trusted framing and stay outside the untrusted span.
+- **A structured defense must be the innermost one, and that is now enforced.** StruQ /
+  SecAlign / DefensiveToken return a `PreRenderedMessages` — an ordinary `list[dict]` to
+  every backend, but `Victim.resolve_channels` raises `PreRenderedPromptError` on it rather
+  than guessing a split for a prompt that is already the model's own rendering. Guessing put
+  the outer defense's text *after* `[MARK] [RESP][COLN]`, i.e. in the model's answer position,
+  silently. `defenses.assert_innermost` catches the same mistake at construction —
+  `StruQDefense(ReminderDefense(t))` raises, and so does `CompositeDefense(t, [Reminder, StruQ])`
+  (the list is innermost-first, so the structured defense goes **first**). `CompositeDefense`
+  also re-checks after rebinding a pre-built instance's `.target`, which bypasses `__init__`.
+- **`StructuredChannelDefense` folds the fields its format has no slot for**
+  (`_fold_channels`): `epilogue` joins the *instruction* channel — trusted text, and putting
+  it in the data channel would hand it to the attacker's span and to the delimiter filter —
+  and `data_prefix`/`data_suffix` are re-applied *after* filtering, only when the data channel
+  is non-empty (framing alone would flip StruQ from `prompt_no_input` to `prompt_input`).
+  Before this, both were dropped: `ReminderDefense(StruQDefense(t))` rendered byte-identically
+  to StruQ alone, so a row labelled "StruQ + Reminder" measured StruQ. The mapping is ours —
+  upstream never composes a structured defense with an in-context one — so say "composite" when
+  reporting it.
 - Structured defenses emit a single `{"role": "raw"}` turn, which `LocalLLM._build_local_prompt_ids`
   encodes verbatim. These models are fine-tuned on bare Alpaca-format strings; wrapping them in a
   chat template feeds them a format they were never aligned on.
@@ -280,7 +328,7 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   transfer; only the four models in `SUPPORTED_MODELS` have released weights.
 - **`eval_mode` is owned by the data.** Every `*Attacker` defaults to `eval_mode=None` and
   resolves it with `metrics.resolve_attack_target(instance, self.eval_mode)`; the benchmark
-  is 180 `startswith` + 180 `contains` and never `function_name` (that is the AgentDojo
+  is 240 `startswith` + 120 `contains` and never `function_name` (that is the AgentDojo
   convention). Pass a string only to force a deliberate deviation, and never add a
   hard-coded default — a smoke check fails if you do.
 - **The optimisation target and the eval target are two different strings.** GCG, RS and
@@ -298,6 +346,23 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   means BEAST optimises tokens for an instruction the victim never sees. GCG had the
   identical defect (`adv_prefix` alone) and now composes `adv_prefix + instance.query`
   the same way.
+- **`build_optimization_messages` applies the WHOLE chain, not the outermost hook.** It
+  called `victim.preprocess_messages` once; `CompositeDefense`'s own hook is a no-op (its
+  work happens in the defenses it chains underneath, reached through nested `generate`
+  calls), so a white-box attack against a composite was handed a prompt with **none** of
+  the defenses applied — the undefended shape under a defended label. `harness.apply_defense_pipeline`
+  now walks `.target` the way `generate` nests it. Any GCG/BEAST/AutoDAN number measured
+  against a `CompositeDefense` before this is void.
+- **`final_prompt` is rebuilt from the reported injection, not read off the last call.**
+  `AttackEvaluator` used `last_input_messages`, which is whichever query ran last — and
+  every search attack reports its *best* candidate while its final query was a later,
+  worse one, so the `final_prompt` printed beside `attack_str` was a different injection's.
+  `harness.rebuild_victim_prompt` replays the carrier with the `TargetFnSpec`
+  `make_target_fn` recorded (so an attack's own `data_separator` is honoured — the OPI
+  one-shots differ by one space versus one newline) and re-runs the defense chain, without
+  querying the model. `extra["final_prompt_source"]` is `rebuilt` / `last_call` /
+  `unavailable`; `_innermost_prompt` is now only the fallback. ASR was never affected — the
+  audit trail was.
 - **A white-box attack must build its prompt through `harness`, never itself.** GCG,
   BEAST and AutoDAN each rolled their own `[system][user]` prompt while success was
   judged through `make_target_fn`'s IPI carrier — they were optimising a string the
@@ -324,6 +389,8 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   the anchor prompt *invites* instruction-following (reversing it inverts the signal), the
   `" X" * 500` padding holds the context off the attention sinks at the prompt boundaries, and
   `group_peaks` removes **only the single highest span per round** (≤5 rounds, so ≤5 spans ever).
+  Note it is also the one defense whose `preprocess_messages` runs a model, so
+  `final_prompt`'s rebuild costs one extra sanitizer pass per scenario.
   `attention.py` reconstructs attention from hidden states because SDPA/flash never materialise
   it — that couples it to transformers internals (upstream pins 4.56.2). Needs scipy:
   `pip install ipi-adaptive[pisanitizer]`. `scripts/check_pisanitizer_fidelity.py` differentially
@@ -337,14 +404,22 @@ The architecture refactor onto EasyJailbreak's component families (carrier objec
 A–I. Six defects found while auditing the white-box recipes are fixed; the structural swap for
 `autodan`/`beast`/`gcg` was declined with reasons rather than done.
 
-**Three docs, three jobs:**
+**The `single_attack` migration is done — all twelve recipes.** No recipe overrides
+`run_scenario`; `ipi/runner.py` is deleted. `adaptive`, `beast`, `gcg` and `autodan` keep
+their bare `run_*` functions as a standalone entry point, because their searches have no
+per-candidate `victim.generate` for `VictimQuery` to own. `docs/single-attack-migration.md`
+records the rules, the three behaviour changes needing re-baselining, and what was and was
+not executed. `ipi_attack_benchmark.ipynb` gained a defense x attack sweep at the end.
+
+**Four docs, four jobs:**
 - `docs/next-session.md` — **the to-do list.** Start here. Nothing is pushed to GitHub, so no
   Kaggle notebook can see any of this; the white-box edits have never been executed for want of
   a GPU; nine behaviour changes mean published numbers need re-baselining, and BEAST's are void.
 - `docs/refactor-handoff.md` — the state of `ipi/` and 21 traps. Read before touching `ipi/`.
 - `docs/ipi-refactor-plan.md` — the design doc and the locked decisions.
+- `docs/single-attack-migration.md` — the `single_attack` spine, the rules, and what is left.
 
-Green check (all six pass):
+Green check (all six pass; smoke_check is 42 checks):
 `scripts/{smoke_check,check_seed_fidelity,check_metrics_fidelity,check_defensivetoken_fidelity,check_pisanitizer_fidelity}.py`
 plus `python3 -m compileall -q ipi`.
 

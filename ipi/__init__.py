@@ -40,7 +40,6 @@ File layout
                     carried with the prompt (StruQ's model) instead of parsed out of it
   harness.py      — the Instance-to-Victim plumbing: make_target_fn · attack_context
                     · resolve_optimization_target · build_channeled_prompt
-  runner.py       — run_attack / run_experiment (target_fn-level convenience API)
   target.py       — TargetLLM (Victim wrapping UnifiedLLM) + make_target factory
 
 Quick start
@@ -83,7 +82,10 @@ Custom defense
 from .victim import Victim
 
 # ---- Instruction / data channels ----
-from .channels import ChanneledPrompt, ChanneledMessages, channels_of
+from .channels import (
+    ChanneledPrompt, ChanneledMessages, channels_of,
+    PreRenderedMessages, PreRenderedPromptError,
+)
 
 # ---- Core LLM interface ----
 from .llm_unified import (
@@ -121,12 +123,9 @@ from .seed import (
 )
 
 # ---- Attack classes + low-level functions ----
-from .attacks.tap import TAPAttacker, TAPResult, run_tap
-from .attacks.pair import PAIRAttacker, PAIRResult, run_pair
-from .attacks.adaptive import (
-    RSAttacker, BeamRSAttacker, AdaptiveResult,
-    run_adaptive_rs, run_adaptive_beam,
-)
+from .attacks.tap import TAPAttacker
+from .attacks.pair import PAIRAttacker
+from .attacks.adaptive import RSAttacker, BeamRSAttacker
 from .attacks import (
     BEASTAttacker, BEASTResult, run_beast,
     AutoDANAttacker, AutoDANResult, run_autodan_ga, run_autodan_hga,
@@ -134,17 +133,13 @@ from .attacks import (
 )
 from .attacks.static_injection import (
     NaiveAttacker, EscapeAttacker, IgnoreAttacker,
-    FakeCompletionAttacker, CombinedAttacker,
-    StaticInjectionResult, run_static_injection, create_static_attacker,
+    FakeCompletionAttacker, CombinedAttacker, create_static_attacker,
     build_naive_injection, build_escape_injection, build_ignore_injection,
     build_fake_completion_injection, build_combined_injection,
 )
 from .attacks import (
-    DeepInceptionAttacker, DeepInceptionResult, run_deepinception,
-    ICAAttacker, ICAResult, run_ica,
-    MultilingualAttacker, MultilingualResult, run_multilingual,
-    ReNeLLMAttacker, ReNeLLMResult, run_renellm,
-    GPTFuzzerAttacker, GPTFuzzerResult, run_gptfuzzer,
+    DeepInceptionAttacker, ICAAttacker, MultilingualAttacker,
+    ReNeLLMAttacker, GPTFuzzerAttacker,
 )
 
 # ---- Dataset (the carrier) ----
@@ -192,7 +187,6 @@ from .defenses import (
 )
 
 # ---- Simple high-level API ----
-from .runner import ExperimentResult, run_attack, run_experiment
 
 # ---- Subpackage namespaces ----
 from . import (datasets, defenses, attacks, seed, mutation, selector,
@@ -237,15 +231,14 @@ __all__ = [
     # Template / iterative attacks (EasyJailbreak ports)
     "DeepInceptionAttacker", "ICAAttacker", "MultilingualAttacker",
     "ReNeLLMAttacker", "GPTFuzzerAttacker",
-    # Low-level attack functions
-    "run_tap", "TAPResult",
-    "run_pair", "PAIRResult",
-    "run_adaptive_rs", "run_adaptive_beam", "AdaptiveResult",
+    # Low-level attack functions. Only the white-box three keep one: they are a
+    # documented standalone (non-scenario) entry point, and the structural swap that
+    # would remove them is deferred in docs/next-session.md 4a.
     "run_beast", "BEASTResult",
     "run_autodan_ga", "run_autodan_hga", "AutoDANResult",
     "run_gcg", "GCGResult",
     # Static injection (OPI) low-level
-    "run_static_injection", "StaticInjectionResult", "create_static_attacker",
+    "create_static_attacker",
     "build_naive_injection", "build_escape_injection", "build_ignore_injection",
     "build_fake_completion_injection", "build_combined_injection",
     # Dataset — the carrier
@@ -263,11 +256,11 @@ __all__ = [
     "ScenarioResult", "EvalResult", "AttackEvaluator",
     # Channels
     "ChanneledPrompt", "ChanneledMessages", "channels_of",
+    "PreRenderedMessages", "PreRenderedPromptError",
     # Harness helpers
     "make_target_fn", "attack_context", "resolve_optimization_target",
     "build_channeled_prompt", "build_victim_messages",
     # Simple API
-    "run_attack", "run_experiment", "ExperimentResult",
 ]
 
 

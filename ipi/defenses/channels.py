@@ -26,7 +26,9 @@ import random
 from typing import Dict, List, Mapping, Optional, Sequence
 
 from .base import DefendedVictim
-from ..channels import ChanneledPrompt
+from ..channels import (
+    ChanneledPrompt, PreRenderedMessages, PreRenderedPromptError,
+)
 from ..victim import Victim
 
 log = logging.getLogger(__name__)
@@ -123,6 +125,32 @@ def format_with_other_delimiters(
 
 
 # ---------------------------------------------------------------------------
+# Composition guard
+# ---------------------------------------------------------------------------
+
+def assert_innermost(defense: object, target: object) -> None:
+    """
+    A structured defense must sit directly on the model, with no defense beneath it.
+
+    It emits the model's own rendered string, so anything underneath receives a prompt
+    with no split left to read. ``resolve_channels`` catches that at run time; this
+    catches it at construction, which is where the mistake is legible.
+
+    ``CompositeDefense`` calls this too, because it rebinds ``.target`` after
+    construction and would otherwise slip past ``__init__``.
+    """
+    if isinstance(target, DefendedVictim):
+        raise PreRenderedPromptError(
+            f"{type(defense).__name__} is a structured defense and must be the "
+            f"innermost one, but it was given {type(target).__name__} as its target. "
+            "It renders the model's final prompt, so a defense beneath it gets a "
+            "string with no instruction/data channels left — the inner defense would "
+            "guess, and append its text after the response delimiter. Invert the "
+            f"nesting: {type(target).__name__}({type(defense).__name__}(model))."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Shared base for StruQ / SecAlign wrappers
 # ---------------------------------------------------------------------------
 
@@ -139,6 +167,7 @@ class StructuredChannelDefense(DefendedVictim):
     filtered_tokens: Sequence[str] = ()
 
     def __init__(self, target: Victim, apply_defensive_filter: bool = True):
+        assert_innermost(self, target)
         super().__init__(target)
         self.apply_defensive_filter = apply_defensive_filter
 
@@ -160,16 +189,52 @@ class StructuredChannelDefense(DefendedVictim):
         so the chat template is bypassed (these models are fine-tuned on bare
         Alpaca-format strings); API backends get a normal user turn, since they
         have no way to consume a raw prompt.
+
+        The list is a :class:`~ipi.channels.PreRenderedMessages`, which is an
+        ordinary ``list[dict]`` to every backend but makes ``resolve_channels``
+        raise rather than invent a split for an already-rendered prompt.
         """
         role = RAW_ROLE if self.backend == "local" else "user"
-        return [{"role": role, "content": prompt}]
+        return PreRenderedMessages(
+            [{"role": role, "content": prompt}], rendered_by=type(self).__name__)
+
+    def _fold_channels(self, prompt: ChanneledPrompt) -> tuple[str, str]:
+        """
+        Collapse a :class:`ChanneledPrompt` onto the two channels this format has.
+
+        ``epilogue`` and ``data_prefix`` / ``data_suffix`` have no slot in an
+        Alpaca-style structured query, and reading only ``trusted_instruction`` and
+        ``data`` **dropped** them: ``ReminderDefense(StruQDefense(t))`` rendered a
+        prompt byte-identical to StruQ alone, so a row labelled "StruQ + Reminder"
+        measured StruQ. They are folded instead:
+
+        * ``epilogue`` is trusted text (ReminderDefense's safety reminder) and joins
+          the **instruction** channel. Not the data channel — that would hand the
+          attacker's span the reminder to edit, and the filter would then strip
+          delimiters out of our own framing.
+        * ``data_prefix`` / ``data_suffix`` are trusted framing that renders *around*
+          the untrusted span, so they go back on after filtering — filtering framing
+          we wrote ourselves is pointless, and doing it before would let a token
+          spliced across the boundary escape.
+
+        This mapping is ours, not either paper's: upstream StruQ/SecAlign never
+        compose with an in-context defense. A row using it is a composite row.
+        """
+        instruction = prompt.trusted_instruction
+        epilogue = prompt.epilogue.strip()
+        if epilogue:
+            instruction = f"{instruction}\n\n{epilogue}" if instruction else epilogue
+
+        data = prompt.data
+        if data and self.apply_defensive_filter and self.filtered_tokens:
+            data = recursive_filter(data, self.filtered_tokens)
+        if data and (prompt.data_prefix or prompt.data_suffix):
+            # Only when there is data: framing alone would flip StruQ's template
+            # from ``prompt_no_input`` to ``prompt_input`` over an empty channel.
+            data = f"{prompt.data_prefix}{data}{prompt.data_suffix}"
+        return instruction, data
 
     def preprocess_messages(self, messages: list[dict]) -> list[dict]:
         prompt: ChanneledPrompt = self.resolve_channels(messages)
-        instruction, data = prompt.trusted_instruction, prompt.data
-        if data and self.apply_defensive_filter and self.filtered_tokens:
-            data = recursive_filter(data, self.filtered_tokens)
-        # A plain list, deliberately: the returned prompt is the model's own
-        # rendering (delimiters, RAW_ROLE), and a defense chained *under* this one
-        # must not re-render the channels and throw that away.
+        instruction, data = self._fold_channels(prompt)
         return self._wrap(self.format_prompt(instruction, data))

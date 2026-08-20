@@ -4,8 +4,13 @@ The plumbing between an ``Instance`` and a ``Victim`` — what an attack needs t
 The symmetric half of ``ipi.metrics``, which owns what an attack needs to be *judged*.
 Nothing here decides success.
 
+    VictimQuery(instance, victim)         the victim as a *component* —
+                                          ``dataset -> dataset``, the same shape as
+                                          mutation / constraint / evaluator, so a
+                                          recipe's loop reads as one pipeline
     make_target_fn(instance, victim)      the ``target_fn(injection) -> response``
-                                          callable every recipe is written against
+                                          callable the unconverted recipes are written
+                                          against; ``VictimQuery`` wraps it
     build_channeled_prompt(...)           the instruction/data split for one injection
     build_victim_messages(...)            the messages ``target_fn`` would send
     build_optimization_messages(...)      the same, plus the defense's own preprocessing
@@ -33,19 +38,68 @@ silently empty prompt: ``Instance.__getattr__`` raises, but ``attack_attrs.get``
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 from .channels import ChanneledPrompt
-from .datasets import Instance
+from .datasets import AttackDataset, Instance
 from .victim import Victim
 
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "VictimQuery",
     "make_target_fn", "attack_context", "resolve_optimization_target",
     "build_channeled_prompt", "build_victim_messages",
     "build_optimization_messages", "split_optimization_prompt",
+    "apply_defense_pipeline", "rebuild_victim_prompt", "TargetFnSpec",
 ]
+
+
+@dataclass(frozen=True)
+class TargetFnSpec:
+    """
+    How a ``target_fn`` builds its prompt — enough to rebuild any one of its calls.
+
+    ``make_target_fn`` records this on the victim so the reporting layer can
+    reconstruct the prompt for the injection an attack finally *reported*, rather
+    than reading back whichever call happened to be last. The two differ for every
+    search attack: TAP's last query is its last candidate, not its best one.
+
+    Deliberately the build parameters and not the prompts themselves — a search
+    attack makes thousands of calls, and retaining a rendered prompt per call is
+    tens of MB per scenario for an audit trail that only ever needs one of them.
+    """
+    instance_id: str
+    system_prompt_template: str
+    data_separator: str
+
+
+def apply_defense_pipeline(victim: Victim, messages: list[dict]) -> list[dict]:
+    """
+    Run ``messages`` through every ``preprocess_messages`` in a defense chain.
+
+    Mirrors what ``DefendedVictim.generate`` does by nesting: each wrapper
+    preprocesses, then hands the result to its target, which preprocesses again.
+    Calling ``victim.preprocess_messages`` once — what ``build_optimization_messages``
+    used to do — only applies the **outermost** hook, and ``CompositeDefense``'s own
+    hook is a no-op (its work happens in the defenses it chains underneath). So a
+    white-box attack against ``CompositeDefense(t, [Instructional, Sandwich, Reminder])``
+    was handed a prompt with none of the three applied — the undefended shape, under a
+    defended label, silently.
+
+    Stops at the first node with no ``target`` (``TargetLLM`` holds its model in
+    ``llm`` and has no hook), and guards against a cycle.
+    """
+    seen: set[int] = set()
+    node = victim
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        pre = getattr(node, "preprocess_messages", None)
+        if callable(pre):
+            messages = pre(messages)
+        node = getattr(node, "target", None)
+    return messages
 
 
 def attack_context(instance: Instance) -> dict:
@@ -118,6 +172,18 @@ def make_target_fn(
     Returns:
         Callable[[str], str] — target_fn(injection_string) -> response_string.
     """
+    # Recorded so the reporting layer can rebuild the prompt for the injection the
+    # attack finally reports, instead of reading back whichever call was last.
+    try:
+        victim.last_target_fn_spec = TargetFnSpec(
+            instance_id=instance.id,
+            system_prompt_template=system_prompt_template,
+            data_separator=data_separator,
+        )
+    except Exception:  # pragma: no cover — a victim with __slots__ and no such slot
+        log.debug("[make_target_fn] could not record the build spec on %s",
+                  type(victim).__name__)
+
     def target_fn(injection: str) -> str:
         messages = build_victim_messages(
             instance, victim, injection, system_prompt_template, data_separator)
@@ -128,6 +194,166 @@ def make_target_fn(
             return ""
 
     return target_fn
+
+
+class VictimQuery:
+    """
+    The victim as a component: ``AttackDataset -> AttackDataset``.
+
+    The fifth member of the family ``mutation`` / ``constraint`` / ``selector`` /
+    ``metrics`` already form, and the reason a recipe's main loop can now be read as
+    one pipeline instead of a loop with plumbing inlined in it::
+
+        dataset = self.mutator(dataset)      # branch
+        dataset = self.constraint(dataset)   # prune before spending queries
+        dataset = self.query(dataset)        # ← this: ask the victim
+        self.evaluator(dataset)              # score
+        dataset = self.selector.select(dataset)
+
+    Before this existed the third line was six lines of ``try``/``except`` plus a
+    ``n_queries += 1``, hand-written in eleven recipes, each with its own idea of what
+    to do when the victim raised.
+
+    What it owns
+    ------------
+    * **The prompt.** It wraps ``make_target_fn``, so every query goes through the one
+      place the IPI carrier is defined. A recipe never assembles messages.
+    * **The query count.** ``n_queries`` is calls to the victim, the definition the
+      whole results table uses. Model forward/backward passes are *not* counted here;
+      they belong in ``n_forward_passes``.
+    * **The budget.** ``budget`` caps queries. ``__call__`` returns only the candidates
+      it actually reached, so a half-spent budget truncates the batch rather than
+      handing the evaluator instances with no response on them.
+    * **Failure.** ``make_target_fn``'s callable already turns an exception into ``""``
+      and logs it; nothing downstream sees a partially-filled dataset.
+
+    Args:
+        instance:  The *scenario* being attacked — the source of the IPI context
+                   (user_task, pipeline_context, tool_schema). Not to be confused with
+                   the candidate instances flowing through ``__call__``, which carry
+                   the injections.
+        victim:    The Victim (TargetLLM or any defense wrapping one).
+        attr_name: Which candidate field holds the injection. ``"jailbreak_prompt"``,
+                   matching the mutation family's default for template-rewriting ops.
+        render:    Optional ``Callable[[Instance], str]`` producing the string actually
+                   sent, when the candidate field is a *template* rather than a finished
+                   injection (GPTFuzzer's seeds carry ``{query}``). The rendered string
+                   is written back to ``attack_attrs["injection"]`` so the reported
+                   ``attack_str`` is what the victim saw, not the template behind it.
+        budget:    Max victim queries, or ``None`` for unlimited.
+        system_prompt_template / data_separator:
+                   Passed straight to ``make_target_fn``. The separator is the attack
+                   for the OPI one-shots (one space versus one newline), so it is a
+                   per-recipe choice, not a house constant.
+    """
+
+    def __init__(
+        self,
+        instance: Instance,
+        victim: Victim,
+        *,
+        attr_name: str = "jailbreak_prompt",
+        render: Optional[Callable[[Instance], str]] = None,
+        budget: Optional[int] = None,
+        system_prompt_template: str = "",
+        data_separator: str = "\n\n",
+    ):
+        self.instance = instance
+        self.victim = victim
+        self.attr_name = attr_name
+        self.render = render
+        self.budget = budget
+        self.n_queries = 0
+        self.target_fn = make_target_fn(
+            instance, victim, system_prompt_template, data_separator)
+
+    # ------------------------------------------------------------------
+    # The seam
+    # ------------------------------------------------------------------
+
+    def __call__(self, dataset: AttackDataset, **kwargs) -> AttackDataset:
+        """
+        Query the victim once per candidate, writing the reply to
+        ``target_responses`` and the string actually sent to
+        ``attack_attrs["injection"]``.
+
+        Returns the candidates that were reached — the whole dataset unless the budget
+        ran out mid-batch. Returning the short list rather than the full one is
+        deliberate: an instance with an empty ``target_responses`` scored by an
+        evaluator reads as a failed attack rather than as an unasked question.
+        """
+        reached = []
+        for candidate in dataset:
+            if self.exhausted:
+                break
+            injection = self.injection_of(candidate)
+            candidate.attack_attrs["injection"] = injection
+            candidate.target_responses = [self.ask(injection)]
+            reached.append(candidate)
+        return AttackDataset(reached)
+
+    def ask(self, injection: str) -> str:
+        """One query, counted. ``""`` if the victim raised (``target_fn`` logs it)."""
+        self.n_queries += 1
+        return self.target_fn(injection)
+
+    def injection_of(self, candidate: Instance) -> str:
+        """The string to send for ``candidate`` — ``render`` if given, else the field."""
+        if self.render is not None:
+            return self.render(candidate)
+        return getattr(candidate, self.attr_name, "") or ""
+
+    # ------------------------------------------------------------------
+    # Budget
+    # ------------------------------------------------------------------
+
+    @property
+    def exhausted(self) -> bool:
+        """True once the query budget is spent. Always False when there is no budget."""
+        return self.budget is not None and self.n_queries >= self.budget
+
+    @property
+    def remaining(self) -> Optional[int]:
+        """Queries left, or ``None`` when unbudgeted."""
+        if self.budget is None:
+            return None
+        return max(0, self.budget - self.n_queries)
+
+    def __repr__(self) -> str:
+        budget = "unbudgeted" if self.budget is None else f"{self.n_queries}/{self.budget}"
+        return (f"VictimQuery(victim={type(self.victim).__name__}, "
+                f"instance={self.instance.id!r}, queries={budget})")
+
+
+def rebuild_victim_prompt(
+    instance: Instance,
+    victim: Victim,
+    injection: str,
+) -> Optional[list[dict]]:
+    """
+    Rebuild the exact prompt the model saw for ``injection`` — carrier plus the
+    whole defense chain.
+
+    Uses the ``TargetFnSpec`` ``make_target_fn`` left on the victim, so the
+    separator an attack chose is honoured (the OPI static attacks differ from each
+    other by exactly that: one space versus one newline). Falls back to the house
+    defaults when the spec is absent or belongs to a different instance.
+
+    Returns ``None`` if the prompt cannot be rebuilt — a caller reporting an audit
+    trail should then fall back to what the victim recorded, and say which it used.
+    Rebuilding runs the defenses' preprocessing again but never queries the model.
+    """
+    spec = getattr(victim, "last_target_fn_spec", None)
+    tmpl, sep = "", "\n\n"
+    if isinstance(spec, TargetFnSpec) and spec.instance_id == instance.id:
+        tmpl, sep = spec.system_prompt_template, spec.data_separator
+    try:
+        return build_optimization_messages(instance, victim, injection, tmpl, sep)
+    except Exception as e:
+        log.warning(
+            "[rebuild_victim_prompt] instance=%s could not rebuild the reported "
+            "prompt (%s)", instance.id, e)
+        return None
 
 
 def build_channeled_prompt(
@@ -216,27 +442,33 @@ def build_optimization_messages(
     victim: Victim,
     injection: str,
     system_prompt_template: str = "",
+    data_separator: str = "\n\n",
 ) -> list[dict]:
     """
-    The messages the victim's *model* actually sees — carrier plus any defense.
+    The messages the victim's *model* actually sees — carrier plus **every** defense.
 
-    ``build_victim_messages`` then the victim's own ``preprocess_messages`` hook, which
-    is where a ``DefendedVictim`` rewrites the channels. GCG / BEAST / AutoDAN optimize
-    against this, so a white-box row measures the attack against the defense's real
-    prompt rather than the undefended one.
+    ``build_victim_messages`` then ``apply_defense_pipeline``. GCG / BEAST / AutoDAN
+    optimize against this, so a white-box row measures the attack against the defense's
+    real prompt rather than the undefended one.
+
+    It used to call ``victim.preprocess_messages`` once, which applies only the
+    outermost hook — and ``CompositeDefense``'s own hook is a no-op, so a chain of three
+    in-context defenses contributed *nothing* and the attack optimized the undefended
+    prompt under a defended label. ``apply_defense_pipeline`` walks the chain the way
+    ``generate`` nests it.
 
     A defense whose preprocessing is input-dependent makes this a snapshot, not an
     invariant: the attacks build it once per scenario.
     """
-    messages = build_victim_messages(instance, victim, injection, system_prompt_template)
-    pre = getattr(victim, "preprocess_messages", None)
-    if callable(pre):
-        try:
-            return pre(messages)
-        except Exception as e:
-            log.warning(
-                "[build_optimization_messages] instance=%s preprocess_messages raised "
-                "(%s) — optimizing against the undefended prompt shape", instance.id, e)
+    messages = build_victim_messages(
+        instance, victim, injection, system_prompt_template, data_separator)
+    try:
+        return apply_defense_pipeline(victim, messages)
+    except Exception as e:
+        log.warning(
+            "[build_optimization_messages] instance=%s a defense's preprocess_messages "
+            "raised (%s) — optimizing against the undefended prompt shape",
+            instance.id, e)
     return messages
 
 

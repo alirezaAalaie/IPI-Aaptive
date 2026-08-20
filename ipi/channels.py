@@ -59,8 +59,47 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "ChanneledPrompt", "ChanneledMessages", "channels_of",
+    "PreRenderedMessages", "PreRenderedPromptError",
     "INSTRUCTION_HEADER", "DATA_HEADER",
 ]
+
+
+class PreRenderedPromptError(RuntimeError):
+    """
+    Raised when a defense is asked for the instruction/data split of a prompt that
+    another defense has already rendered for the model.
+
+    A structured defense (StruQ / SecAlign / DefensiveToken) emits the model's own
+    string — delimiters, chat template, the lot. There is no split left to read, and
+    ``ChanneledPrompt.from_messages`` would happily *guess* one: it would call the
+    whole rendered prompt untrusted data, re-render it, and append the outer defense's
+    text after the response delimiter — i.e. into the model's answer position. That is
+    silent, so it raises instead. A structured defense must be the innermost one.
+    """
+
+
+class PreRenderedMessages(list):
+    """
+    A messages list that is already the model's prompt — do not re-render it.
+
+    Emitted by :class:`~ipi.defenses.channels.StructuredChannelDefense`. Behaves as
+    the plain ``list[dict]`` every backend expects; the only thing it adds is the
+    refusal, in ``Victim.resolve_channels``, to invent a split for it.
+    """
+
+    __slots__ = ("rendered_by",)
+
+    def __init__(self, items: Iterable[Mapping[str, Any]] = (), rendered_by: str = ""):
+        super().__init__(items)
+        self.rendered_by = rendered_by
+
+    def __deepcopy__(self, memo):
+        import copy as _copy
+        out = PreRenderedMessages(
+            (_copy.deepcopy(dict(m), memo) for m in self), rendered_by=self.rendered_by)
+        memo[id(self)] = out
+        return out
+
 
 #: The house IPI carrier shape. These two strings are the *only* place the
 #: rendered framing lives; nothing parses them back out any more.

@@ -73,7 +73,9 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Mapping, Optional, Sequence
 
-from .channels import ChanneledPrompt, channels_of
+from .channels import (
+    ChanneledPrompt, PreRenderedMessages, PreRenderedPromptError, channels_of,
+)
 from .llm_unified import LogprobNotSupportedError, LocalOnlyError
 
 log = logging.getLogger(__name__)
@@ -240,7 +242,21 @@ class Victim(ABC):
         Both warnings here fire **once per victim**. A search attack calls this a
         few thousand times per scenario, and a per-call warning would be a log
         flood that everyone learns to ignore — which is the same as no warning.
+
+        Raises:
+            PreRenderedPromptError: if ``messages`` is already a structured defense's
+                rendered prompt. Guessing a split for it puts this defense's text
+                after the response delimiter; see ``PreRenderedMessages``.
         """
+        if isinstance(messages, PreRenderedMessages):
+            raise PreRenderedPromptError(
+                f"{type(self).__name__} is chained under "
+                f"{messages.rendered_by or 'a structured defense'}, whose output is "
+                "already rendered for the model — there is no instruction/data split "
+                "left to read. Put the structured defense innermost, e.g. "
+                f"{type(self).__name__}({messages.rendered_by or 'StruQDefense'}(target)) "
+                f"rather than {messages.rendered_by or 'StruQDefense'}({type(self).__name__}(target))."
+            )
         carried = channels_of(messages)
         if carried is not None:
             if self._pinned_channels is not None and not self._channel_pin_shadowed:

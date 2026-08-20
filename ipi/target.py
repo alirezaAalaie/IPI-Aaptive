@@ -132,6 +132,7 @@ class TargetLLM(Victim):
         messages: list[dict],
         n_top: int = 20,
     ) -> dict[str, float]:
+        self.last_input_messages = messages
         return self.llm.get_first_token_logprobs(messages, n_top=n_top)
 
     # ------------------------------------------------------------------

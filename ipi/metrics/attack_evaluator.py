@@ -84,8 +84,14 @@ class EvalResult:
         avg_queries:     Average target queries per scenario.
         n_success:       Number of successful attacks.
         n_total:         Total scenarios evaluated.
-        utility_rate:    Optional User Utility success rate (n_utility_success / n_total).
-        n_utility:       Optional count of scenarios where legitimate user task succeeded.
+        utility_rate:    Optional User Utility success rate, over the scenarios that
+                         actually carry a ``user_target`` — NOT over n_total. A
+                         scenario with no utility label, or one whose attack raised,
+                         has no utility verdict and stays out of both sides.
+        n_utility:       Count of those scenarios where the legitimate user task succeeded.
+        n_utility_total: How many scenarios had a utility verdict at all — the
+                         denominator of ``utility_rate``. Equals n_total on the
+                         packaged benchmark (all 360 carry a user_target).
         results:         Per-scenario ScenarioResult list.
     """
     attack:       str
@@ -94,9 +100,10 @@ class EvalResult:
     avg_queries:  float
     n_success:    int
     n_total:      int
-    utility_rate: Optional[float] = None
-    n_utility:    Optional[int] = None
-    results:      list[ScenarioResult] = field(default_factory=list)
+    utility_rate:    Optional[float] = None
+    n_utility:       Optional[int] = None
+    n_utility_total: Optional[int] = None
+    results:         list[ScenarioResult] = field(default_factory=list)
 
     def summary(self) -> str:
         s = (
@@ -104,7 +111,13 @@ class EvalResult:
             f"ASR:          {self.asr:.1%}  ({self.n_success}/{self.n_total})\n"
         )
         if self.utility_rate is not None and self.n_utility is not None:
-            s += f"Utility Rate: {self.utility_rate:.1%}  ({self.n_utility}/{self.n_total})\n"
+            # The denominator is the labelled subset, not n_total — printing n_total
+            # here made the percentage and the fraction disagree on any dataset where
+            # some scenarios carry no user_target.
+            denom = self.n_utility_total if self.n_utility_total is not None else self.n_total
+            s += f"Utility Rate: {self.utility_rate:.1%}  ({self.n_utility}/{denom})\n"
+            if denom != self.n_total:
+                s += f"              ({self.n_total - denom} of {self.n_total} scenarios had no utility verdict)\n"
         s += (
             f"Avg score:    {self.avg_score:.2f}/10\n"
             f"Avg queries:  {self.avg_queries:.1f}"
@@ -130,6 +143,7 @@ class EvalResult:
         if self.utility_rate is not None:
             d["utility_rate"] = self.utility_rate
             d["n_utility"] = self.n_utility
+            d["n_utility_total"] = self.n_utility_total
 
         results_list = []
         for r in self.results:
@@ -143,6 +157,7 @@ class EvalResult:
                 "optimization_target": r.extra.get("optimization_target", ""),
                 "attack_str": r.injection,
                 "final_prompt": r.final_prompt if r.final_prompt is not None else r.extra.get("final_prompt"),
+                "final_prompt_source": r.extra.get("final_prompt_source", ""),
                 "model_response": r.target_response,
                 "attack_success": r.success,
                 "utility_success": r.utility_success,
@@ -210,6 +225,10 @@ def _innermost_prompt(victim):
     it chains underneath. The result was a ``final_prompt`` showing an untouched prompt
     for a defense that had in fact rewritten it. The ASR was right; the audit trail was
     not, which is worse than an obvious failure.
+
+    This is the **fallback** for ``final_prompt``, not the primary: it is whatever call
+    ran last, which for any search attack is its last candidate rather than the best one
+    it reports. See ``_final_prompt``.
     """
     seen = set()
     best = None
@@ -221,6 +240,39 @@ def _innermost_prompt(victim):
             best = found
         node = getattr(node, "target", None) or getattr(node, "llm", None)
     return best
+
+
+def _final_prompt(victim, instance: Instance, result: "ScenarioResult"):
+    """
+    The prompt that goes in the audit trail, and where it came from.
+
+    Returns ``(messages, source)`` with ``source`` in ``"rebuilt"`` / ``"last_call"`` /
+    ``"unavailable"``, recorded alongside so a reader never has to guess how literal
+    the record is.
+
+    ``"rebuilt"`` is the one that answers the question actually being asked — *what
+    prompt produced the response this row reports?* Reading ``last_input_messages``
+    answers a different one: what did the victim see on its final call. Those coincide
+    only for the one-shot attacks. TAP, PAIR, GCG, RS and Beam-RS all report their
+    **best** candidate while their last query was some later, worse one, so the
+    ``final_prompt`` beside ``attack_str`` was a different injection's prompt.
+
+    Rebuilding replays ``harness`` with the separator and template the attack used and
+    runs the defense chain again; it never queries the model. A defense whose
+    preprocessing is nondeterministic (a sanitizer that samples) yields an equivalent
+    prompt rather than a byte-identical one — still the right injection, which the
+    recorded last call was not.
+    """
+    from ..harness import rebuild_victim_prompt
+
+    if result.injection:
+        rebuilt = rebuild_victim_prompt(instance, victim, result.injection)
+        if rebuilt is not None:
+            return rebuilt, "rebuilt"
+    recorded = _innermost_prompt(victim)
+    if recorded is not None:
+        return recorded, "last_call"
+    return None, "unavailable"
 
 
 class AttackEvaluator:
@@ -320,8 +372,9 @@ class AttackEvaluator:
                 r.success = self._check_success(r.target_response, instance)
                 r.utility_success = self._check_utility(r.target_response, instance)
 
-                # The exact messages the model saw, after every defense transformation.
-                final_prompt = _innermost_prompt(self.target)
+                # The messages the model saw for the injection this row reports —
+                # rebuilt from that injection, not read back off the last call.
+                final_prompt, prompt_source = _final_prompt(self.target, instance, r)
 
                 def_label = defense_name or type(self.target).__name__
 
@@ -334,6 +387,7 @@ class AttackEvaluator:
                 r.extra["target_str"] = attrs.get("target_str", "")
                 r.extra["optimization_target"] = attrs.get("optimization_target", "")
                 r.extra["final_prompt"] = final_prompt
+                r.extra["final_prompt_source"] = prompt_source
                 r.extra["defense_name"] = def_label
 
                 results.append(r)
@@ -343,7 +397,11 @@ class AttackEvaluator:
                 results.append(ScenarioResult(
                     scenario_id=instance.id, goal=instance.query or "",
                     success=False, score=0, injection="", target_response="",
-                    n_queries=0, attack=attack_name, utility_success=False,
+                    # utility_success stays None: an attack that crashed produced no
+                    # response to judge, and False here would enter the utility
+                    # denominator as a failure — on a dataset with no utility labels
+                    # that turns "no utility line" into "Utility Rate: 0.0%".
+                    n_queries=0, attack=attack_name, utility_success=None,
                     extra={
                         "error": str(e),
                         "user_task": attrs.get("user_task", ""),
@@ -372,13 +430,16 @@ class AttackEvaluator:
         utility_list = [r.utility_success for r in results if r.utility_success is not None]
         if utility_list:
             n_utility = sum(1 for u in utility_list if u)
-            utility_rate = n_utility / len(utility_list)
+            n_utility_total = len(utility_list)
+            utility_rate = n_utility / n_utility_total
         else:
             n_utility = None
+            n_utility_total = None
             utility_rate = None
 
         return EvalResult(
             attack=attack, asr=asr, avg_score=avg_score, avg_queries=avg_queries,
             n_success=n_success, n_total=n_total,
-            utility_rate=utility_rate, n_utility=n_utility, results=results,
+            utility_rate=utility_rate, n_utility=n_utility,
+            n_utility_total=n_utility_total, results=results,
         )

@@ -59,7 +59,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from ..attacker import AdaptiveAttacker
-from ..datasets import Instance
+from ..datasets import AttackDataset, Instance
 from ..harness import resolve_optimization_target
 from ..metrics import Evaluator, check_ipi_success
 from ..llm_unified import _extract_logprob
@@ -556,6 +556,39 @@ class AdaptiveResult:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _logprob_score(logprob: float) -> int:
+    """
+    Map a target-token log-probability onto the 1-10 scale ``ScenarioResult`` reports.
+
+    Unchanged from the two ``run_scenario`` adapters this replaced. The raw value is
+    kept in ``extra["best_logprob"]``, which is the one to read: this mapping saturates
+    at 0 for anything below logprob -10, and ASR has never depended on it.
+    """
+    return max(0, int(logprob + 10))
+
+
+def _reported(instance: Instance, eval_target: str, eval_mode: str,
+              result: "AdaptiveResult") -> Instance:
+    """
+    The ``Instance`` the reporting layer wants, built from an ``AdaptiveResult``.
+
+    ``jailbreak_prompt`` is the full injection (original message plus the adversarial
+    suffix), not the suffix alone — that is the string the victim was actually sent,
+    and the one the audit trail has to be able to replay.
+    """
+    return Instance(
+        id=instance.id,
+        query=instance.query,
+        jailbreak_prompt=result.injection,
+        reference_responses=[eval_target],
+        target_responses=[result.target_response],
+        attack_attrs={
+            "target_str": eval_target,
+            "attack_eval_mode": eval_mode,
+            "adv": result.adv,
+        },
+    )
+
 
 def _build_victim_messages(victim: Victim, prompt_str: str) -> list[dict]:
     """Wrap a plain prompt string as OpenAI-format messages with victim system prompt."""
@@ -1116,6 +1149,10 @@ class RSAttacker(AdaptiveAttacker):
         seed:                Random seed. Default 1.
     """
 
+    # BaseAttacker.name would derive "rs" from the class name;
+    # the results table has always said "rs".
+    _ATTACK_NAME = "rs"
+
     def __init__(
         self,
         judge: Optional[Evaluator] = None,
@@ -1140,11 +1177,27 @@ class RSAttacker(AdaptiveAttacker):
         self.adv_init             = adv_init
         self.seed                 = seed
 
-    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
-        from ..metrics import ScenarioResult, resolve_attack_target
-        # Two different strings, deliberately: the optimization target drives the
-        # logprob search (it must be a real token sequence), while success is judged
-        # against the instance's own target_str and eval_mode. The data decides both.
+    def single_attack(self, target: Victim, instance: Instance,
+                      verbose: bool = False) -> AttackDataset:
+        """
+        Run the logprob search against one scenario and report its best suffix.
+
+        The loop itself is ``run_adaptive_rs``; this is the scenario adapter. There is no
+        search dataset to hand back — the runner owns its candidates and returns an
+        ``AdaptiveResult`` — so the reported ``Instance`` is built here. Only
+        ``run_scenario`` was deleted; the standalone function and its result type stay,
+        for the same reason the white-box three keep theirs: the algorithm is a
+        first-token-logprob search over token positions, which has no per-candidate
+        ``generate`` call for ``harness.VictimQuery`` to own and does not decompose
+        into the mutation / selector / evaluator families.
+
+        Two different target strings, deliberately: the optimisation target drives the
+        logprob search and must be a real token sequence, while success is judged
+        against the instance's own ``target_str`` and ``eval_mode``. They differ on 120
+        of the 360 benchmark scenarios, and collapsing them makes the search stop on a
+        partial match. The data decides both.
+        """
+        from ..metrics import resolve_attack_target
         eval_target, eval_mode = resolve_attack_target(instance, self.eval_mode)
         r = run_adaptive_rs(
             goal=instance.query,
@@ -1165,16 +1218,14 @@ class RSAttacker(AdaptiveAttacker):
             seed=self.seed,
             verbose=verbose,
         )
-        return ScenarioResult(
-            scenario_id=instance.id,
-            goal=instance.query,
+        return self.report(
+            _reported(instance, eval_target, eval_mode, r),
+            r.n_queries,
             success=r.success,
-            score=max(0, int((r.logprob + 10) * 1)),  # map logprob to rough 0-10 range
-            injection=r.injection,
-            target_response=r.target_response,
-            n_queries=r.n_queries,
-            attack="rs",
-            extra={"best_logprob": r.logprob, "target_token": r.target_token},
+            score=_logprob_score(r.logprob),
+            best_logprob=r.logprob,
+            target_token=r.target_token,
+            n_iterations_done=r.n_iterations_done,
         )
 
     def __repr__(self) -> str:
@@ -1212,6 +1263,10 @@ class BeamRSAttacker(AdaptiveAttacker):
         seed:                Random seed. Default 1.
     """
 
+    # BaseAttacker.name would derive "beamrs" from the class name;
+    # the results table has always said "beam".
+    _ATTACK_NAME = "beam"
+
     def __init__(
         self,
         judge: Optional[Evaluator] = None,
@@ -1238,11 +1293,27 @@ class BeamRSAttacker(AdaptiveAttacker):
         self.adv_init             = adv_init
         self.seed                 = seed
 
-    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
-        from ..metrics import ScenarioResult, resolve_attack_target
-        # Two different strings, deliberately: the optimization target drives the
-        # logprob search (it must be a real token sequence), while success is judged
-        # against the instance's own target_str and eval_mode. The data decides both.
+    def single_attack(self, target: Victim, instance: Instance,
+                      verbose: bool = False) -> AttackDataset:
+        """
+        Run the logprob search against one scenario and report its best suffix.
+
+        The loop itself is ``run_adaptive_beam``; this is the scenario adapter. There is no
+        search dataset to hand back — the runner owns its candidates and returns an
+        ``AdaptiveResult`` — so the reported ``Instance`` is built here. Only
+        ``run_scenario`` was deleted; the standalone function and its result type stay,
+        for the same reason the white-box three keep theirs: the algorithm is a
+        first-token-logprob search over token positions, which has no per-candidate
+        ``generate`` call for ``harness.VictimQuery`` to own and does not decompose
+        into the mutation / selector / evaluator families.
+
+        Two different target strings, deliberately: the optimisation target drives the
+        logprob search and must be a real token sequence, while success is judged
+        against the instance's own ``target_str`` and ``eval_mode``. They differ on 120
+        of the 360 benchmark scenarios, and collapsing them makes the search stop on a
+        partial match. The data decides both.
+        """
+        from ..metrics import resolve_attack_target
         eval_target, eval_mode = resolve_attack_target(instance, self.eval_mode)
         r = run_adaptive_beam(
             goal=instance.query,
@@ -1262,16 +1333,14 @@ class BeamRSAttacker(AdaptiveAttacker):
             seed=self.seed,
             verbose=verbose,
         )
-        return ScenarioResult(
-            scenario_id=instance.id,
-            goal=instance.query,
+        return self.report(
+            _reported(instance, eval_target, eval_mode, r),
+            r.n_queries,
             success=r.success,
-            score=max(0, int((r.logprob + 10) * 1)),
-            injection=r.injection,
-            target_response=r.target_response,
-            n_queries=r.n_queries,
-            attack="beam",
-            extra={"best_logprob": r.logprob, "k_beam": self.k_beam},
+            score=_logprob_score(r.logprob),
+            best_logprob=r.logprob,
+            k_beam=self.k_beam,
+            n_iterations_done=r.n_iterations_done,
         )
 
     def __repr__(self) -> str:

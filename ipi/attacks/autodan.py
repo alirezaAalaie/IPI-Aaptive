@@ -629,6 +629,9 @@ class AutoDANAttacker(AdaptiveAttacker):
             raise ValueError(
                 f"seed_variant must be 'ipi' or 'original', got {seed_variant!r}")
         self.variant          = variant
+        # BaseAttacker.name reads this; the row label carries the variant,
+        # as the old run_scenario's attack= did.
+        self._ATTACK_NAME     = f"autodan_{variant}"
         self.num_steps        = num_steps
         self.batch_size       = batch_size
         self.num_elites_frac  = num_elites_frac
@@ -648,9 +651,29 @@ class AutoDANAttacker(AdaptiveAttacker):
     def requires_local_target(cls) -> bool:
         return True
 
-    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
+    def single_attack(self, target: Victim, instance: Instance,
+                      verbose: bool = False) -> AttackDataset:
+        """
+        Run the genetic search against one scenario and report its best template.
+
+        The loop itself is ``run_autodan_ga`` / ``run_autodan_hga``; this is the
+        scenario adapter. It does the two things the bare functions cannot do on their
+        own — hand the fitness a ``prompt_builder`` that renders the *victim's* prompt,
+        and hand the eval a ``target_fn`` that delivers the injection through the IPI
+        carrier — then wraps the one candidate the search returns in the ``Instance``
+        the reporting layer wants.
+
+        There is no surviving search dataset to hand back: the runners own their
+        population and return an ``AutoDANResult``. Only ``run_scenario`` was deleted —
+        the standalone functions and the result type stay (see the module docstring and
+        ``docs/next-session.md`` 4a).
+
+        Counters: ``n_queries`` is victim calls; the genetic search's compute is in
+        ``n_forward_passes``, reported through ``extra``. Keep them distinct or the
+        avg_queries column stops meaning anything.
+        """
         from ..harness import build_optimization_messages, make_target_fn
-        from ..metrics import ScenarioResult, resolve_attack_target
+        from ..metrics import resolve_attack_target
         target_fn = make_target_fn(instance, target)
         target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
 
@@ -685,21 +708,23 @@ class AutoDANAttacker(AdaptiveAttacker):
             kwargs["hga_period"] = self.hga_period
         r = runner(**kwargs)
 
-        return ScenarioResult(
-            scenario_id=instance.id,
-            goal=instance.query,
+        best = Instance(
+            id=instance.id,
+            query=instance.query,
+            jailbreak_prompt=r.injection,
+            reference_responses=[target_str],
+            target_responses=[r.target_response],
+            attack_attrs={"target_str": target_str, "attack_eval_mode": eval_mode},
+        )
+        return self.report(
+            best,
+            r.n_queries,
             success=r.success,
             score=max(0, int(10 - r.best_loss)),   # rough 0-10 scale from the loss
-            injection=r.injection,
-            target_response=r.target_response,
-            n_queries=r.n_queries,
-            attack=f"autodan_{self.variant}",
-            extra={
-                "best_loss": r.best_loss,
-                "n_steps": r.n_steps,
-                "n_forward_passes": r.n_forward_passes,
-                "time_seconds": r.time_seconds,
-            },
+            best_loss=r.best_loss,
+            n_steps=r.n_steps,
+            n_forward_passes=r.n_forward_passes,
+            time_seconds=r.time_seconds,
         )
 
     def __repr__(self) -> str:

@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Optional, Sequence
 from .base import DefendedVictim
+from .channels import StructuredChannelDefense, assert_innermost
 from ..victim import Victim
 
 log = logging.getLogger(__name__)
@@ -173,11 +174,24 @@ class CompositeDefense(DefendedVictim):
     """
     Composite Defense — Pipeline wrapper for applying multiple defenses in sequence.
 
+    Each entry may be a class (constructed with the chain so far as its target) or
+    an already-configured instance (**rebound** onto the chain so far). Rebinding is
+    the point: assigning the instance without rebinding — the previous behaviour —
+    silently discarded every defense listed before it, so
+    ``[InstructionalDefense, SandwichDefense(target)]`` ran Sandwich alone and
+    reported it as a two-defense row.
+
     Example:
         defended_target = CompositeDefense(target, [
             InstructionalDefense,
             SandwichDefense,
             ReminderDefense,
+        ])
+
+        # a pre-configured instance is fine too — it is rebound onto the chain
+        defended_target = CompositeDefense(target, [
+            InstructionalDefense,
+            SandwichDefense(target, header="...", footer="..."),
         ])
     """
     def __init__(
@@ -189,6 +203,18 @@ class CompositeDefense(DefendedVictim):
         for d in defenses:
             if isinstance(d, type):
                 current_target = d(current_target)
-            else:
-                current_target = d
+                continue
+            if isinstance(d, StructuredChannelDefense):
+                # __init__ already refuses this, but the rebind below bypasses it.
+                assert_innermost(d, current_target)
+            existing = getattr(d, "target", None)
+            if existing is not None and existing is not current_target:
+                log.warning(
+                    "[CompositeDefense] %s was built over %s; rebinding it onto %s so "
+                    "it sits in this chain. Pass the class instead of an instance to "
+                    "avoid the rebind.",
+                    type(d).__name__, type(existing).__name__,
+                    type(current_target).__name__)
+            d.target = current_target
+            current_target = d
         super().__init__(current_target)

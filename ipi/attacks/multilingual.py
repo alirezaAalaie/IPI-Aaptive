@@ -16,7 +16,7 @@ is the sharpest test we have of the English-centric defenses in this repo (StruQ
 SecAlign), whose training data is English delimiter text.
 
 Multi-query static attack: one injection per language, best-of aggregation
-(`n_queries` = number of languages attempted). No attacker LLM required for the
+(`n_queries` = number of languages actually queried). No attacker LLM required for the
 search itself, but a translator is needed.
 
 Two scenarios, as in the paper
@@ -32,16 +32,36 @@ Two scenarios, as in the paper
       the registry already carried the wrapper, unused, so the row labelled
       "Multilingual" was measuring the weaker of the two.
 
+Composition
+-----------
+Best-of-N over languages, one component pipeline per language::
+
+    batch = query(AttackDataset([candidate]))      # harness.VictimQuery
+    evaluator(batch)                               # EvaluatorIPISuccess
+    best  = self.keep_best(best, batch)            # attacker.keep_best
+
+``keep_best`` replaces the hand-rolled ``best_score`` / ``best_injection`` /
+``best_response`` triple the deleted ``MultilingualResult`` carried. Ties go to the
+earliest language, which is what the old ``not best.injection`` guard did.
+
 IPI adaptation vs original
 --------------------------
   delivery: the translated instruction is injected through the data channel via
-            ``harness.make_target_fn`` (untrusted document), not sent as a user turn.
+            ``harness.VictimQuery`` (untrusted document), not sent as a user turn.
   success:  ``check_ipi_success`` is run on the response **in whatever language it comes
             back**. Because the success check looks for the target tool-call / action
             string (e.g. ``send_email(...)``), which is code-like and language-agnostic,
             no back-translation of the response is needed for function-name / exact-call
             modes. For ``contains`` mode against a natural-language target, supply a
             ``response_translator`` to normalize the response to English first.
+  best-of:  which language is reported is now decided by the scenario's **ground truth**
+            (``EvaluatorIPISuccess``), not by the judge. The deleted ``run_multilingual``
+            ranked languages by judge score, so with ``stop_on_success=False`` a later,
+            *failing* language with a higher judge score overwrote the reported
+            injection and response while ``success`` stayed True — the row then named an
+            injection that had not worked. A ``judge=`` now annotates the reported
+            candidate only: one judge call per scenario instead of one per language, and
+            ``per_language`` carries the binary verdict rather than a score.
 
 Translation backends (in priority order)
 -----------------------------------------
@@ -57,12 +77,12 @@ import json
 import logging
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 from ..attacker import StaticAttacker
-from ..datasets import Instance
-from ..metrics import Evaluator, check_ipi_success
+from ..datasets import AttackDataset, Instance
+from ..harness import VictimQuery
+from ..metrics import Evaluator, EvaluatorIPISuccess, resolve_attack_target
 from ..llm_unified import APILLM, UnifiedLLM
 from ..victim import Victim
 
@@ -164,117 +184,6 @@ def _make_translator(
     return _translate
 
 
-# ---------------------------------------------------------------------------
-# Result
-# ---------------------------------------------------------------------------
-
-@dataclass
-class MultilingualResult:
-    success: bool               # any language succeeded
-    score: int                  # best judge score across languages (0 if no judge)
-    injection: str              # best (successful, else last) translated injection
-    target_response: str        # response to the best injection
-    n_queries: int              # number of languages actually queried
-    goal: str
-    best_language: str = ""     # language code that produced the best result
-    per_language: dict = field(default_factory=dict)  # lang -> {success, score}
-    trace: list[dict] = field(default_factory=list)
-
-    def __repr__(self) -> str:
-        return (
-            f"MultilingualResult(success={self.success}, score={self.score}, "
-            f"best_language={self.best_language!r}, n_queries={self.n_queries})"
-        )
-
-
-def run_multilingual(
-    goal: str,
-    target_fn: Callable[[str], str],
-    judge: Optional[Evaluator] = None,
-    languages: Optional[dict[str, str]] = None,
-    translator: Optional[Callable[[str, str], str]] = None,
-    translator_llm: Optional[Union[str, UnifiedLLM]] = None,
-    eval_mode: str = "contains",
-    target_str: str = "",
-    stop_on_success: bool = True,
-    scenario: str = DEFAULT_SCENARIO,
-) -> MultilingualResult:
-    """
-    Run the multilingual attack: translate the goal into each language, inject, best-of.
-
-    Args:
-        goal:           Attacker injection goal (English).
-        target_fn:      Callable(injection: str) -> response: str.
-        judge:          Optional guidance Evaluator (ipi.metrics) for scoring.
-        languages:      {code: name} map. Default: the nine from Deng et al.
-        translator:     Optional Callable(text, dest_code) -> translated text.
-        translator_llm: Optional LLM (or model string) translator. Used if ``translator``
-                        is not given.
-        eval_mode:      check_ipi_success mode.
-        target_str:     Expected action string for the check (falls back to goal).
-        stop_on_success: Stop at the first language that succeeds (saves queries).
-        scenario:       "intentional" (default, AIM-wrapped, what the reference recipe
-                        runs) or "unintentional" (bare translation).
-
-    Returns:
-        MultilingualResult.
-    """
-    languages = languages or DEFAULT_LANGUAGES
-    translate = _make_translator(translator, translator_llm)
-    check_str = target_str or goal
-
-    best = MultilingualResult(
-        success=False, score=0, injection="", target_response="",
-        n_queries=0, goal=goal,
-    )
-
-    for code, name in languages.items():
-        try:
-            translated = translate(goal, code, name)
-        except Exception as exc:
-            log.warning("[Multilingual] translation to %s failed, skipping: %s", code, exc)
-            continue
-        if not translated:
-            continue
-
-        injection = build_multilingual_injection(translated, scenario)
-
-        try:
-            response = target_fn(injection)
-        except Exception as exc:
-            log.warning("[Multilingual] target_fn raised for %s: %s", code, exc)
-            response = ""
-        best.n_queries += 1
-
-        success = check_ipi_success(response, check_str, eval_mode)
-        score = 0
-        if judge is not None:
-            try:
-                score = judge.score(injection, response, attacker_goal=goal)
-            except Exception as exc:
-                log.debug("[Multilingual] judge.score failed for %s: %s", code, exc)
-
-        best.per_language[code] = {"success": success, "score": score}
-        best.trace.append({
-            "language": code, "translated": translated, "injection": injection,
-            "response": response, "success": success, "score": score,
-        })
-
-        improved = (success and not best.success) or (score > best.score) or not best.injection
-        if improved:
-            best.success = best.success or success
-            best.score = max(best.score, score)
-            best.injection = injection
-            best.target_response = response
-            best.best_language = code
-
-        if success and stop_on_success:
-            best.success = True
-            break
-
-    return best
-
-
 class MultilingualAttacker(StaticAttacker):
     """
     Multilingual attacker — translates the goal into several languages and injects each.
@@ -285,7 +194,8 @@ class MultilingualAttacker(StaticAttacker):
     translation is often a near-free bypass.
 
     Args:
-        judge:          Optional guidance Evaluator (ipi.metrics) for scoring.
+        judge:          Optional guidance Evaluator (ipi.metrics). Annotates the reported
+                        candidate with a 1-10 score; it no longer ranks the languages.
         languages:      {code: name} map. Default: the nine from the paper.
         translator:     Optional Callable(text, dest_code) -> str.
         translator_llm: Optional LLM (or model string) translator, used if ``translator``
@@ -325,40 +235,100 @@ class MultilingualAttacker(StaticAttacker):
     def requires_local_target(cls) -> bool:
         return False
 
-    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
-        from ..harness import make_target_fn
-        from ..metrics import ScenarioResult, resolve_attack_target
-        target_fn = make_target_fn(instance, target)
+    # ------------------------------------------------------------------
+    # The attack
+    # ------------------------------------------------------------------
+
+    def single_attack(self, target: Victim, instance: Instance,
+                      verbose: bool = False) -> AttackDataset:
+        """
+        Translate the goal into each language, inject each, keep the best.
+
+        A language whose translation backend fails is skipped without spending a
+        victim query — ``n_queries`` is the number of languages actually *sent*, not
+        the number attempted. An empty dataset comes back if every translation failed,
+        which ``build_result`` reports as "the attack produced no candidate" rather
+        than as a scored row with an empty injection.
+        """
+        goal = instance.query or ""
         target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
+        translate = _make_translator(self.translator, self.translator_llm)
+        evaluator = EvaluatorIPISuccess(mode=eval_mode)
+        query = VictimQuery(instance, target)
 
-        r = run_multilingual(
-            goal=instance.query,
-            target_fn=target_fn,
-            judge=self.judge,
-            languages=self.languages,
-            translator=self.translator,
-            translator_llm=self.translator_llm,
-            eval_mode=eval_mode,
-            target_str=target_str,
-            stop_on_success=self.stop_on_success,
-            scenario=self.scenario,
+        best: Optional[Instance] = None
+        per_language: dict[str, dict] = {}
+
+        for code, name in self.languages.items():
+            try:
+                translated = translate(goal, code, name)
+            except Exception as exc:
+                log.warning("[Multilingual] translation to %s failed, skipping: %s",
+                            code, exc)
+                continue
+            if not translated:
+                continue
+
+            candidate = Instance(
+                id=f"{instance.id}-{code}",
+                query=goal,
+                jailbreak_prompt=build_multilingual_injection(translated, self.scenario),
+                reference_responses=[target_str] if target_str else [],
+                attack_attrs={
+                    "target_str": target_str, "attack_eval_mode": eval_mode,
+                    "language": code, "translated": translated,
+                },
+            )
+
+            batch = query(AttackDataset([candidate]))
+            if not len(batch):
+                break
+            evaluator(batch)
+            best = self.keep_best(best, batch)
+
+            success = bool(candidate.eval_results and candidate.eval_results[-1])
+            per_language[code] = {"success": success}
+            if verbose:
+                log.info("[multilingual] scenario=%s lang=%s success=%s",
+                         instance.id, code, success)
+
+            if success and self.stop_on_success:
+                break
+
+        if best is None:
+            log.warning("[Multilingual] instance=%s: no language could be queried.",
+                        instance.id)
+            return AttackDataset([])
+
+        return self.report(
+            best, query,
+            success=bool(best.eval_results and best.eval_results[-1]),
+            score=self._grade(best, goal),
+            best_language=best.attack_attrs.get("language", ""),
+            per_language=per_language,
         )
 
-        if verbose:
-            log.info("[multilingual] scenario=%s success=%s best_lang=%s n_queries=%d",
-                     instance.id, r.success, r.best_language, r.n_queries)
+    def _grade(self, candidate: Instance, goal: str) -> Optional[int]:
+        """
+        The reported 1-10 score: the judge's if there is one, else the binary verdict.
 
-        return ScenarioResult(
-            scenario_id=instance.id,
-            goal=instance.query,
-            success=r.success,
-            score=r.score,
-            injection=r.injection,
-            target_response=r.target_response,
-            n_queries=r.n_queries,
-            attack=self._ATTACK_NAME,
-            extra={"best_language": r.best_language, "per_language": r.per_language},
-        )
+        ``None`` lets ``build_result`` fall back to ``eval_results[-1]`` mapped through
+        ``Evaluator.as_score`` (10 or 1). One judge call per scenario, on the language
+        actually reported — the deleted ``run_multilingual`` called it once per language
+        and used the scores to rank them.
+        """
+        if self.judge is None:
+            return None
+        try:
+            return self.judge.score(
+                candidate.attack_attrs.get("injection", "")
+                or candidate.jailbreak_prompt or "",
+                candidate.target_responses[-1] if candidate.target_responses else "",
+                attacker_goal=goal,
+            )
+        except Exception as exc:
+            log.debug("[Multilingual] judge.score failed: %s", exc)
+            return None
 
     def __repr__(self) -> str:
         return (

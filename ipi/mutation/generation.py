@@ -12,6 +12,8 @@ Upstream's ``mutation/generation/``. Three groups:
                 keyword filter without changing intent
     PAIR/TAP    HistoricalInsight — build the attacker's next turn from the last
                 response + score
+                IntrospectBranching — the same turn, but conversational: it carries the
+                attacker's transcript and fans a parent out into branches
 
 Fidelity
 --------
@@ -20,19 +22,22 @@ Every instruction prompt below is **verbatim** from
 only" trailers included. The structural change is the one described in ``base.py``: the
 model is bound at construction and the transform is a plain ``mutate(text) -> str``.
 
-Not ported: ``ApplyGPTMutation`` (raw ``openai`` calls against a candidate list — our
-AutoDAN already takes an ``llm_mutator`` callable that covers it) and
-``IntrospectGeneration`` (TAP's attacker turn, which needs ``fastchat`` and upstream's
-model wrappers; our ``attacks/tap.py`` implements the same loop).
+Not ported: ``ApplyGPTMutation`` — raw ``openai`` calls against a candidate list, which
+our AutoDAN's ``llm_mutator`` callable already covers. ``IntrospectGeneration`` is here as
+``IntrospectBranching`` rather than ported: upstream's needs ``fastchat`` conversation
+templates and its own model wrappers, so the loop is upstream's and the plumbing is ours.
 """
 from __future__ import annotations
 
+import logging
 import random
 from typing import Optional, Union
 
 from ..datasets import Instance
 from ..seed import PLACEHOLDER
 from .base import LLMCallable, LLMMutation, MutationBase
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     # GPTFuzzer — template operators
@@ -44,7 +49,7 @@ __all__ = [
     # Jailbroken — filter laundering
     "AutoPayloadSplitting", "AutoObfuscation",
     # PAIR / TAP
-    "HistoricalInsight",
+    "HistoricalInsight", "IntrospectBranching",
 ]
 
 
@@ -346,3 +351,171 @@ class HistoricalInsight(LLMMutation):
 
     def _mutate(self, text: str, **kwargs) -> str:
         return self.model(self._prompt(text, **kwargs))
+
+
+# ---------------------------------------------------------------------------
+# TAP / PAIR — the attacker's next turn, in a conversation
+# ---------------------------------------------------------------------------
+
+class IntrospectBranching(MutationBase):
+    """
+    Ask the attacker LLM for the next injection, given the transcript of what it
+    already tried and how that scored.
+
+    TAP's branching and PAIR's stream refinement are **the same operator** at different
+    branching factors — a tree that fans out ``branching_factor`` ways versus a set of
+    independent chains that fan out one. Upstream splits them across
+    ``IntrospectGeneration`` and ``HistoricalInsight`` and duplicates the ask / retry /
+    JSON-parse loop in both recipes; here it exists once, which is what lets both
+    recipes' main loops read as a component pipeline.
+
+    The transcript is a plain ``list[dict]`` of chat messages in
+    ``attack_attrs["conv"]``, seeded by the recipe with the attacker system prompt and
+    the opening user message. ``Instance.copy()`` deep-copies ``attack_attrs``, so each
+    child branches with its own transcript rather than sharing the parent's.
+
+    Why not the upstream class
+    --------------------------
+    ``IntrospectGeneration`` drives ``fastchat``'s conversation templates and branches on
+    ``isinstance(model, HuggingfaceModel | OpenaiModel)``; neither exists here. Ours is
+    message dicts against a ``UnifiedLLM``, and the framings come from ``ipi.seed``, so
+    ``original`` / ``ipi`` / ``ipi_universal`` are one registry lookup instead of three
+    code paths. The *loop* is upstream's, including ``max_attempts`` and dropping a
+    branch whose attacker never produced valid JSON.
+
+    Args:
+        model:            The attacker LLM. Anything callable on a message list — a
+                          ``UnifiedLLM`` is.
+        branching_factor: Children per parent. TAP's tree uses > 1; PAIR's streams use 1.
+        keep_last_n:      Attacker turns (assistant + user pairs) kept per transcript,
+                          **on top of** the system prompt and the opening user message.
+                          That opening message is retained deliberately: in the IPI
+                          framings the system prompt is generic and the goal, user task
+                          and tool schema live in the first user turn, so upstream's
+                          "keep the system message and the tail" erases the objective
+                          mid-search. 0 disables truncation.
+        required_keys:    JSON keys the attacker's reply must carry to count as valid.
+        extract:          ``Callable[[dict, Instance], str]`` building the injection
+                          from the parsed reply and the candidate it belongs to.
+                          Defaults to the first required key. TAP's universal mode uses
+                          it to assemble prefix + the candidate's goal + suffix.
+        max_attempts:     Re-asks before the branch is abandoned.
+        attr_name:        Instance field the injection is written to.
+    """
+
+    #: ``attack_attrs`` slot holding the attacker's own message history.
+    CONV_KEY = "conv"
+
+    attr_name = "jailbreak_prompt"
+
+    def __init__(
+        self,
+        model,
+        *,
+        branching_factor: int = 1,
+        keep_last_n: int = 3,
+        required_keys: tuple = ("injection_string",),
+        extract=None,
+        max_attempts: int = 5,
+        attr_name: Optional[str] = None,
+    ):
+        super().__init__(attr_name)
+        if not callable(model):
+            raise TypeError(
+                f"IntrospectBranching needs a callable attacker model (a UnifiedLLM is "
+                f"one), got {type(model).__name__}")
+        self.model = model
+        self.branching_factor = branching_factor
+        self.keep_last_n = keep_last_n
+        self.required_keys = tuple(required_keys)
+        self.extract = extract or (
+            lambda parsed, instance: parsed.get(self.required_keys[0], ""))
+        self.max_attempts = max_attempts
+
+    # ------------------------------------------------------------------
+    # Component seam
+    # ------------------------------------------------------------------
+
+    def _get_mutated_instance(self, instance: Instance, **kwargs) -> list[Instance]:
+        """One parent -> up to ``branching_factor`` children. Failed branches vanish."""
+        if not instance.attack_attrs.get(self.CONV_KEY):
+            raise ValueError(
+                "IntrospectBranching expects the attacker transcript in "
+                f"attack_attrs[{self.CONV_KEY!r}]; the recipe seeds it with the system "
+                "prompt and the opening user message.")
+
+        children: list[Instance] = []
+        for _ in range(self.branching_factor):
+            child = self.new_child(instance)
+            # A branch has not been tried yet. copy() carried the parent's response and
+            # score across, and leaving them would let the evaluator re-read them.
+            child.target_responses = []
+            child.eval_results = []
+
+            conv = self.truncate(child.attack_attrs[self.CONV_KEY], self.keep_last_n)
+            raw, injection = self.ask(conv, child)
+            if not injection:
+                # Un-wire the edge new_child() made, so a dead branch leaves no node in
+                # the tree an MCTS selector would later descend into.
+                instance.children.remove(child)
+                continue
+
+            setattr(child, self.attr_name, injection)
+            conv.append({"role": "assistant", "content": raw})
+            child.attack_attrs[self.CONV_KEY] = conv
+            children.append(child)
+        return children
+
+    # ------------------------------------------------------------------
+    # The ask
+    # ------------------------------------------------------------------
+
+    def ask(self, conv: list[dict], instance: Optional[Instance] = None) -> tuple:
+        """
+        One branch: ask until the reply parses as JSON with the required keys.
+
+        Returns ``(raw_reply, injection)``, or ``("", "")`` when every attempt failed —
+        upstream's behaviour, which is to drop the branch rather than fall back to
+        attacking with the bare goal.
+        """
+        from ..llm_unified import parse_json_response
+
+        for attempt in range(self.max_attempts):
+            try:
+                raw = self.model(conv)
+                parsed = parse_json_response(raw, required_keys=list(self.required_keys))
+                if parsed:
+                    injection = self.extract(parsed, instance)
+                    if injection:
+                        return raw, injection
+            except Exception as exc:
+                _log.debug("[IntrospectBranching] attempt %d failed: %s", attempt + 1, exc)
+        return "", ""
+
+    @staticmethod
+    def truncate(conv: list[dict], keep_last_n: int) -> list[dict]:
+        """
+        System prompt + opening user message + the last ``keep_last_n`` turns.
+
+        A turn is one assistant reply plus one user feedback message, so the tail is
+        ``2 * keep_last_n`` messages — the original TAP mutator's cap. See the class
+        docstring for why the opening user message is part of the head and not the tail.
+        """
+        if keep_last_n <= 0:
+            return list(conv)
+        head, tail = list(conv[:2]), list(conv[2:])
+        max_tail = 2 * keep_last_n
+        if len(tail) <= max_tail:
+            return head + tail
+        return head + tail[-max_tail:]
+
+    def _mutate(self, text: str, **kwargs) -> str:
+        raise NotImplementedError(
+            "IntrospectBranching is conversational: it needs the Instance's transcript, "
+            "so there is no scalar mutate(text) path. Use the dataset path.")
+
+    def __repr__(self) -> str:
+        model = getattr(self.model, "model_name", None) or type(self.model).__name__
+        return (f"IntrospectBranching(model={model}, "
+                f"branching_factor={self.branching_factor}, "
+                f"keep_last_n={self.keep_last_n})")

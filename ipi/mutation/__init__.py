@@ -32,6 +32,7 @@ from .generation import (
     AlterSentenceStructure, ChangeStyle, InsertMeaninglessCharacters,
     MisspellSensitiveWords, Translation, RENELLM_MUTATORS,
     AutoPayloadSplitting, AutoObfuscation, HistoricalInsight,
+    IntrospectBranching,
 )
 from .rule import (
     Base64, Base64InputOnly, Base64Raw, Rot13, Leetspeak, Disemvowel,
@@ -50,6 +51,7 @@ __all__ = [
     "MisspellSensitiveWords", "Translation", "RENELLM_MUTATORS",
     # Generation — Jailbroken / PAIR
     "AutoPayloadSplitting", "AutoObfuscation", "HistoricalInsight",
+    "IntrospectBranching",
     # Rule — encoding
     "Base64", "Base64InputOnly", "Base64Raw", "Rot13", "Leetspeak", "Disemvowel",
     "Combination1", "Combination2", "Combination3", "ENCODING_MUTATORS",

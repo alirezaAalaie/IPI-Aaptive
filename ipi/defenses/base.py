@@ -99,6 +99,10 @@ class DefendedVictim(Victim):
         n_top: int = 20,
     ) -> dict[str, float]:
         processed = self.preprocess_messages(messages)
+        # Recorded for the same reason generate() records it: RS and Beam-RS drive
+        # entire scenarios through this path, and without it their audit trail is
+        # whatever unrelated generate() call happened last, or nothing at all.
+        self.last_input_messages = processed
         return self.target.get_first_token_logprobs(processed, n_top=n_top)
 
     # HF model internals delegation for white-box attacks (BEAST, GCG, AutoDAN)

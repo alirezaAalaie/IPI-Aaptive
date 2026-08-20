@@ -20,24 +20,37 @@ knobs are applied exactly as the reference ``DeepInception`` recipe does — by
 ``str.replace`` on the seed ('science fiction' → scene, '4' → character_number,
 '5' → layer_number) rather than by named format fields.
 
+Composition
+-----------
+One template, one query, no search — the whole algorithm is three lines inside
+``single_attack``::
+
+    query   = VictimQuery(instance, target)         # owns the call and the count
+    dataset = query(AttackDataset([candidate]))
+    EvaluatorIPISuccess(mode=eval_mode)(dataset)    # ground truth, not the judge
+
 IPI adaptation vs original
 --------------------------
   {query}:   the attacker's embedded instruction / injection goal (not a harmful request).
   delivery:  the filled template is injected through the data channel via
-             ``harness.make_target_fn`` (untrusted document), not sent as a user turn.
+             ``harness.VictimQuery`` (untrusted document), not sent as a user turn.
   success:   resolved from the scenario (``resolve_attack_target``) to match the dataset's
              own ``attack_eval_mode``.
+  score:     with no ``judge=``, the reported 1-10 score is the binary verdict mapped
+             through ``Evaluator.as_score`` (10 / 1) rather than the hard 0 the deleted
+             ``run_deepinception`` returned. ``AttackEvaluator`` recomputes success
+             regardless — the judge only annotates.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Optional
 
 from ..attacker import StaticAttacker
-from ..datasets import Instance
-from ..metrics import Evaluator, check_ipi_success
+from ..datasets import AttackDataset, Instance
+from ..harness import VictimQuery
+from ..metrics import Evaluator, EvaluatorIPISuccess, resolve_attack_target
 from ..victim import Victim
 from ..seed import SeedTemplate, render
 
@@ -78,75 +91,6 @@ def build_deepinception_injection(
     return render(tmpl, goal)   # substitute {query} last
 
 
-@dataclass
-class DeepInceptionResult:
-    success: bool
-    score: int
-    injection: str
-    target_response: str
-    n_queries: int          # always 1
-    goal: str
-    trace: list[dict] = field(default_factory=list)
-
-    def __repr__(self) -> str:
-        return f"DeepInceptionResult(success={self.success}, score={self.score})"
-
-
-def run_deepinception(
-    goal: str,
-    target_fn: Callable[[str], str],
-    judge: Optional[Evaluator] = None,
-    scene: str = "science fiction",
-    character_number: int = 5,
-    layer_number: int = 5,
-    eval_mode: str = "contains",
-    target_str: str = "",
-) -> DeepInceptionResult:
-    """
-    Run the single-query DeepInception attack.
-
-    Args:
-        goal:             Attacker injection goal.
-        target_fn:        Callable(injection: str) -> response: str.
-        judge:            Optional guidance Evaluator (ipi.metrics) for scoring.
-        scene:            Fictional setting. Default "science fiction".
-        character_number: Characters per layer. Default 5.
-        layer_number:     Nesting depth. Default 5.
-        eval_mode:        check_ipi_success mode (usually resolved from the scenario).
-        target_str:       Expected success string (falls back to goal).
-
-    Returns:
-        DeepInceptionResult (n_queries=1).
-    """
-    injection = build_deepinception_injection(goal, scene, character_number, layer_number)
-
-    try:
-        response = target_fn(injection)
-    except Exception as exc:
-        log.warning("[DeepInception] target_fn raised: %s", exc)
-        response = ""
-
-    check_str = target_str or goal
-    success = check_ipi_success(response, check_str, eval_mode)
-
-    score = 0
-    if judge is not None:
-        try:
-            score = judge.score(injection, response, attacker_goal=goal)
-        except Exception as exc:
-            log.debug("[DeepInception] judge.score failed: %s", exc)
-
-    return DeepInceptionResult(
-        success=success,
-        score=score,
-        injection=injection,
-        target_response=response,
-        n_queries=1,
-        goal=goal,
-        trace=[{"injection": injection, "response": response, "success": success}],
-    )
-
-
 class DeepInceptionAttacker(StaticAttacker):
     """
     DeepInception attacker (single-query, template-based, API-compatible).
@@ -155,7 +99,9 @@ class DeepInceptionAttacker(StaticAttacker):
     Jailbreaker".
 
     Args:
-        judge:            Optional guidance Evaluator (ipi.metrics) for scoring.
+        judge:            Optional guidance Evaluator (ipi.metrics). Annotates the
+                          reported candidate with a 1-10 score; it never decides
+                          success.
         scene:            Fictional setting. Default "science fiction".
         character_number: Characters per layer. Default 5.
         layer_number:     Nesting depth. Default 5.
@@ -183,38 +129,60 @@ class DeepInceptionAttacker(StaticAttacker):
     def requires_local_target(cls) -> bool:
         return False
 
-    def run_scenario(self, target: Victim, instance: Instance, verbose: bool = False):
-        from ..harness import make_target_fn
-        from ..metrics import ScenarioResult, resolve_attack_target
-        target_fn = make_target_fn(instance, target)
+    # ------------------------------------------------------------------
+    # The attack
+    # ------------------------------------------------------------------
+
+    def single_attack(self, target: Victim, instance: Instance,
+                      verbose: bool = False) -> AttackDataset:
+        """Fill the nested-fiction template with the goal, send it once, report it."""
+        goal = instance.query or ""
         target_str, eval_mode = resolve_attack_target(instance, self.eval_mode)
 
-        r = run_deepinception(
-            goal=instance.query,
-            target_fn=target_fn,
-            judge=self.judge,
-            scene=self.scene,
-            character_number=self.character_number,
-            layer_number=self.layer_number,
-            eval_mode=eval_mode,
-            target_str=target_str,
+        query = VictimQuery(instance, target)
+        candidate = Instance(
+            id=f"deepinception-{instance.id}",
+            query=goal,
+            jailbreak_prompt=build_deepinception_injection(
+                goal, self.scene, self.character_number, self.layer_number),
+            reference_responses=[target_str] if target_str else [],
+            attack_attrs={"target_str": target_str, "attack_eval_mode": eval_mode},
         )
 
+        dataset = query(AttackDataset([candidate]))
+        EvaluatorIPISuccess(mode=eval_mode)(dataset)
+
+        success = bool(candidate.eval_results and candidate.eval_results[-1])
         if verbose:
-            log.info("[deepinception] scenario=%s success=%s score=%d",
-                     instance.id, r.success, r.score)
+            log.info("[deepinception] scenario=%s success=%s", instance.id, success)
 
-        return ScenarioResult(
-            scenario_id=instance.id,
-            goal=instance.query,
-            success=r.success,
-            score=r.score,
-            injection=r.injection,
-            target_response=r.target_response,
-            n_queries=r.n_queries,
-            attack=self._ATTACK_NAME,
-            extra={"scene": self.scene, "layers": self.layer_number},
+        return self.report(
+            candidate, query,
+            success=success,
+            score=self._grade(candidate, goal),
+            scene=self.scene,
+            layers=self.layer_number,
         )
+
+    def _grade(self, candidate: Instance, goal: str) -> Optional[int]:
+        """
+        The reported 1-10 score: the judge's if there is one, else the binary verdict.
+
+        ``None`` lets ``build_result`` fall back to ``eval_results[-1]`` mapped through
+        ``Evaluator.as_score`` (10 or 1).
+        """
+        if self.judge is None:
+            return None
+        try:
+            return self.judge.score(
+                candidate.attack_attrs.get("injection", "")
+                or candidate.jailbreak_prompt or "",
+                candidate.target_responses[-1] if candidate.target_responses else "",
+                attacker_goal=goal,
+            )
+        except Exception as exc:
+            log.debug("[DeepInception] judge.score failed: %s", exc)
+            return None
 
     def __repr__(self) -> str:
         return (

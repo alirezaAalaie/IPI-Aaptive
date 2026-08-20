@@ -467,8 +467,8 @@ without a visible symptom. That is the pattern to watch for, not these four inst
    only gates early stopping.
 7. **`eval_mode` is owned by the data.** Every Attacker class defaults to `eval_mode=None` and
    resolves it from the instance's `attack_eval_mode`. Seven attackers previously hard-coded
-   `"function_name"`, which **no scenario in the benchmark uses** — the suite is 180 `startswith`
-   + 180 `contains`. Cosmetic for the four OPI one-shots; for RS, Beam-RS, AutoDAN and GCG it
+   `"function_name"`, which **no scenario in the benchmark uses** — the suite is 240 `startswith`
+   + 120 `contains`. Cosmetic for the four OPI one-shots; for RS, Beam-RS, AutoDAN and GCG it
    gated early stopping and best-candidate selection against a criterion that could never fire,
    so their **query counts drop**.
 8. **GCG / RS / Beam-RS judge success against the evaluation target**, not the optimisation
@@ -606,8 +606,8 @@ with `prompt_num=5` is the paper-reproduction row.
     keeps the candidate. `run_tap(on_topic_model=...)` now accepts a `UnifiedLLM` as well as a
     model string so a real judge can be passed.
 19. **~~Seven attackers default to `eval_mode="function_name"`~~ — fixed; the shape of the
-    bug is the lesson.** No scenario in the benchmark uses `function_name` (180
-    `startswith` + 180 `contains`), yet seven attackers optimised toward it. It survived
+    bug is the lesson.** No scenario in the benchmark uses `function_name` (240
+    `startswith` + 120 `contains`), yet seven attackers optimised toward it. It survived
     because `AttackEvaluator` overwrites the final verdict, so the *reported* ASR stayed
     plausible while each search was aimed at a string the data never asks for. **Any
     parameter that both steers a search and is overwritten before reporting can be wrong
