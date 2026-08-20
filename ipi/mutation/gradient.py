@@ -161,12 +161,18 @@ def compute_loss_and_grads(
         p.requires_grad_(False)
     try:
         with torch.enable_grad():
-            full_embed = embed_weights[input_ids[0]]   # (L, d_model)
-
-            # Replace suffix embedding positions with differentiable one_hot @ W
-            suffix_embed = one_hot @ embed_weights     # (S, d_model)
-            full_embed = full_embed.clone()
-            full_embed[suffix_slice] = suffix_embed
+            # Stitch the sequence together with cat rather than an in-place slice
+            # assignment. Upstream (llm-attacks, and StruQ/SecAlign's gcg/model.py)
+            # does the same, and once the embedding matrix is frozen the surrounding
+            # embeddings no longer require grad — writing a grad-requiring value into
+            # a slice of a tensor that does not is exactly the case worth not relying
+            # on. cat is unambiguous: one branch requires grad, so the result does.
+            embeds = embed_weights[input_ids[0]].detach()   # (L, d_model)
+            suffix_embed = one_hot @ embed_weights          # (S, d_model)
+            full_embed = torch.cat(
+                [embeds[: suffix_slice.start], suffix_embed, embeds[suffix_slice.stop:]],
+                dim=0,
+            )
 
             # Forward
             output = model(inputs_embeds=full_embed.unsqueeze(0),
