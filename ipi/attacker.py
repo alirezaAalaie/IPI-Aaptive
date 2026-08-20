@@ -69,20 +69,20 @@ __all__ = [
 
 def as_attacker_llm(model):
     """
-    A model *string* becomes an ``APILLM`` at the house attacker settings; anything else
-    passes through untouched.
+    A model *string* becomes an LLM at the house attacker settings — ``APILLM``, or
+    ``KaggleLLM`` for a ``kaggle/`` prefix; anything else passes through untouched.
 
     Every recipe that drives an attacker LLM did this inline with the same three
     ``config`` constants. The test is on ``str`` and not on ``UnifiedLLM`` deliberately:
     the mutation operators only need ``callable(str) -> str``, so a bare function or a
-    stub is a legitimate attacker model and must not be fed to ``APILLM``'s model-name
-    parsing. ``litellm`` is imported lazily, so ``import ipi.attacker`` stays cheap.
+    stub is a legitimate attacker model and must not be fed to the model-name parsing.
+    ``litellm`` is imported lazily, so ``import ipi.attacker`` stays cheap.
     """
     if not isinstance(model, str):
         return model
-    from .llm_unified import APILLM
-    return APILLM(model=model, temperature=ATTACK_TEMP, top_p=ATTACK_TOP_P,
-                  max_tokens=ATTACK_MAX_TOKENS)
+    from .llm_unified import make_llm
+    return make_llm(model, temperature=ATTACK_TEMP, top_p=ATTACK_TOP_P,
+                    max_tokens=ATTACK_MAX_TOKENS)
 
 
 #: ``attack_attrs`` slot holding a candidate's report bookkeeping (see ``report``).

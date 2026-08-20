@@ -16,6 +16,17 @@ LocalLLM   — Local HuggingFace model. Full logits/logprob access.
              Required for: BEAST, logprob-based RS on any model.
              Use: LocalLLM("lmsys/vicuna-7b-v1.5")
 
+KaggleLLM  — Model served by the Kaggle Benchmarks runtime (``kbench.llms[...]``).
+             Only importable inside a Kaggle Benchmarks notebook, and only usable
+             from inside a running ``@kbench.task``. No logprobs, no white-box access.
+             Use: KaggleLLM("kaggle/google/gemini-2.5-flash")
+
+make_llm   — The dispatcher. A ``kaggle/`` prefix picks KaggleLLM, backend="local"
+             picks LocalLLM, everything else APILLM; a non-str passes through. Every
+             seam that takes a model *string* (attacker LLM, *GetScore judge, TAP's
+             on-topic model, Multilingual's translator, make_target) goes through it,
+             so "kaggle/<id>" works in all of them.
+
 Usage
 -----
     from ipi.llm_unified import APILLM, LocalLLM
@@ -32,16 +43,23 @@ Usage
     local = LocalLLM("lmsys/vicuna-7b-v1.5")
     logits, tokens = local.generate_n_tokens_batch([prompt_ids], max_gen_len=10)
 
+    # Kaggle Benchmarks target / judge (inside a @kbench.task)
+    from ipi.llm_unified import make_llm
+    llm = make_llm("kaggle/google/gemini-2.5-flash", system_prompt="You are an email agent.")
+
 Model registry
 --------------
-    APILLM.supported_models()  → dict[str, ModelSpec] of all known API model IDs
-    LocalLLM.supported_models() → str describing accepted format
+    APILLM.supported_models()   → dict[str, ModelSpec] of all known API model IDs
+    LocalLLM.supported_models()  → str describing accepted format
+    KaggleLLM.supported_models() → live kbench.llms keys (KAGGLE_MODELS off-Kaggle)
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import copy
+import inspect
+import itertools
 import json
 import logging
 import os
@@ -964,6 +982,439 @@ class LocalLLM(UnifiedLLM):
             self._tokenizer_obj.decode([idx.item()]): val.item()
             for idx, val in zip(top_indices, top_values)
         }
+
+
+# ---------------------------------------------------------------------------
+# KaggleLLM — a model served by the Kaggle Benchmarks runtime
+# ---------------------------------------------------------------------------
+
+#: Prefix that routes a model string to ``KaggleLLM`` in ``make_llm`` / ``make_target``.
+#: ``"kaggle/google/gemini-2.5-flash"`` → ``kbench.llms["google/gemini-2.5-flash"]``.
+KAGGLE_PREFIX = "kaggle/"
+
+#: The ids ``kbench.llms`` exposed when this adapter was written. It is a convenience
+#: list only — nothing validates against it. ``KaggleLLM`` resolves against the *live*
+#: ``kbench.llms`` keys, so a model added (or retired) by Kaggle needs no edit here.
+KAGGLE_MODELS: tuple[str, ...] = (
+    "anthropic/claude-haiku-4-5@20251001",
+    "anthropic/claude-opus-4-1@20250805",
+    "anthropic/claude-opus-4-5@20251101",
+    "anthropic/claude-opus-4-6@default",
+    "anthropic/claude-opus-4-7@default",
+    "anthropic/claude-opus-4-8@default",
+    "anthropic/claude-opus-5@default",
+    "anthropic/claude-sonnet-4-5@20250929",
+    "anthropic/claude-sonnet-4-6@default",
+    "anthropic/claude-sonnet-4@20250514",
+    "deepseek-ai/deepseek-r1-0528",
+    "deepseek-ai/deepseek-v3.1",
+    "google/gemini-2.5-flash",
+    "google/gemini-2.5-pro",
+    "google/gemini-3-flash-preview",
+    "google/gemini-3.1-flash-lite-preview",
+    "google/gemini-3.1-pro-preview",
+    "google/gemini-3.5-flash",
+    "google/gemini-3.5-flash-lite",
+    "google/gemini-3.6-flash",
+    "google/gemini-3.7-flash",
+    "google/gemma-4-26b-a4b",
+    "google/gemma-4-31b",
+    "openai/gpt-5.4-2026-03-05",
+    "openai/gpt-5.4-mini-2026-03-17",
+    "openai/gpt-5.4-nano-2026-03-17",
+    "openai/gpt-5.5-2026-04-23",
+    "openai/gpt-5.6-luna",
+    "openai/gpt-5.6-sol",
+    "openai/gpt-5.6-terra",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-235b-a22b-instruct-2507",
+    "qwen/qwen3-coder-480b-a35b-instruct",
+    "qwen/qwen3-next-80b-a3b-instruct",
+    "qwen/qwen3-next-80b-a3b-thinking",
+    "xai/grok-4.20-0309-non-reasoning",
+    "xai/grok-4.20-0309-reasoning",
+    "zai/glm-5",
+)
+
+_KAGGLE_IMPORT_HINT = (
+    "kaggle_benchmarks is only available inside a Kaggle Benchmarks notebook "
+    "(open one at https://www.kaggle.com/benchmarks/tasks/new — the package and its "
+    "credentials are pre-installed there and cannot be pip-installed elsewhere)."
+)
+
+_KAGGLE_CONTEXT_HINT = (
+    "kbench.llms[...].prompt() needs an active Chat, which exists only while a "
+    "@kbench.task is running. Drive the whole evaluation from inside one task, e.g.\n"
+    "    @kbench.task(name='ipi_asr')\n"
+    "    def run_ipi(llm):\n"
+    "        target = make_target('kaggle/google/gemini-2.5-flash')\n"
+    "        ...\n"
+    "    run_ipi.run(llm=kbench.llm)"
+)
+
+
+def _kbench_module():
+    """Import ``kaggle_benchmarks`` lazily, with a message that says where it lives."""
+    try:
+        import kaggle_benchmarks as kbench
+    except ImportError as exc:                            # pragma: no cover - Kaggle-only
+        raise ImportError(_KAGGLE_IMPORT_HINT) from exc
+    return kbench
+
+
+#: A trailing ``-YYYY-MM-DD`` release date on a Kaggle model id.
+_KAGGLE_DATE_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
+
+
+def _strip_kaggle_version(key: str) -> str:
+    """``openai/gpt-5.4-mini-2026-03-17`` / ``anthropic/claude-opus-5@default`` → base id."""
+    return _KAGGLE_DATE_SUFFIX.sub("", key.split("@", 1)[0])
+
+
+def resolve_kaggle_model_id(name: str, available) -> str:
+    """
+    Map a model string onto a live ``kbench.llms`` key.
+
+    Kaggle versions its ids three ways: an ``@`` suffix
+    (``anthropic/claude-opus-5@default``), a trailing date
+    (``openai/gpt-5.4-mini-2026-03-17``), or nothing at all
+    (``google/gemini-2.5-flash``). Accepting the un-versioned form means a notebook does
+    not have to re-pin every model string when Kaggle rolls a version. An exact key
+    always wins; otherwise both version forms are stripped before matching, and if
+    several versions share a base, ``@default`` wins, else the highest-sorting one (the
+    latest date). Only the version suffix is ever stripped — nothing is prefix-matched,
+    so ``openai/gpt-5.4`` can never silently resolve to ``openai/gpt-5.4-mini-…``.
+    """
+    want = name.removeprefix(KAGGLE_PREFIX)
+    keys = list(available)
+    if want in keys:
+        return want
+    by_base: dict[str, list[str]] = {}
+    for key in keys:
+        by_base.setdefault(_strip_kaggle_version(key), []).append(key)
+    hits = by_base.get(_strip_kaggle_version(want), [])
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        for hit in hits:
+            if hit.endswith("@default"):
+                return hit
+        return sorted(hits)[-1]
+    raise ValueError(
+        f"Kaggle model {want!r} is not in kbench.llms. Available: {sorted(keys)}"
+    )
+
+
+class KaggleLLM(UnifiedLLM):
+    """
+    A model served by ``kaggle_benchmarks`` (``kbench.llms[...]``), as a ``UnifiedLLM``.
+
+    Use it anywhere ``APILLM`` goes — target, attacker, judge, translator — by prefixing
+    the model id with ``kaggle/``::
+
+        target   = make_target("kaggle/google/gemini-2.5-flash", system_prompt=AGENT_PROMPT)
+        judge    = EvaluatorIPIGetScore(model="kaggle/google/gemini-2.5-flash")
+        attacker = TAPAttacker(judge=judge, attacker_llm="kaggle/openai/gpt-5.4-mini")
+
+    Or hand it a live object, which is what ``kbench.llm`` (the notebook's own model
+    under test) is::
+
+        KaggleLLM(llm=kbench.llm, system_prompt=AGENT_PROMPT)
+
+    Three things it does NOT give you, all of them structural rather than fixable here:
+
+    * **No logprobs.** ``get_first_token_logprobs`` raises ``LogprobNotSupportedError``,
+      so RS / Beam-RS cannot run against a Kaggle victim. Attacks that only call
+      ``generate`` (TAP, PAIR, the static one-shots, ReNeLLM, GPTFuzzer, …) are fine.
+    * **No white-box access.** ``backend`` is ``"api"``; GCG / BEAST / AutoDAN gate it out.
+    * **No native system channel** unless ``kbench``'s ``prompt()`` grows one. See
+      ``system_mode`` — the default folds the system prompt into the first user turn and
+      warns once, because silently dropping it would make a defended victim look
+      undefended.
+
+    Every call runs in its own ``kbench.chats.new(...)`` context. That isolation is
+    load-bearing: a ``Chat`` accumulates turns, so sharing one across an attack's
+    iterations would feed candidate *n* every earlier candidate's transcript.
+
+    Args:
+        model:       ``"kaggle/<id>"`` or a bare ``kbench.llms`` id. Optional if ``llm``
+                     is given.
+        llm:         A live ``kbench.llms[...]`` / ``kbench.llm`` object to wrap directly.
+        system_mode: ``"auto"`` (default) uses a native system argument if ``prompt()``
+                     accepts one and folds it into the user turn otherwise;
+                     ``"native"`` requires the native argument and raises if absent;
+                     ``"fold"`` always folds.
+        chat_prefix: Name prefix for the per-call chat, so runs are legible in the
+                     recorded ``Run``.
+        (all other args inherited from ``UnifiedLLM``)
+    """
+
+    backend: ClassVar[str] = "api"
+
+    #: ``prompt()`` kwarg names we know how to fill, most-preferred first. Only names the
+    #: live signature actually declares are passed — an unknown kwarg is dropped, never
+    #: guessed, because ``prompt()`` is Kaggle's API and may change under us.
+    _PROMPT_ARG_ALIASES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "system":      ("system", "system_prompt", "system_instruction"),
+        "temperature": ("temperature",),
+        "max_tokens":  ("max_tokens", "max_output_tokens", "max_new_tokens"),
+        "top_p":       ("top_p",),
+    }
+
+    _chat_counter: ClassVar[itertools.count] = itertools.count()
+
+    def __init__(
+        self,
+        model: str = "",
+        system_prompt: str = "",
+        temperature: float = 0.0,
+        max_tokens: int = 500,
+        top_p: float = 1.0,
+        top_k: Optional[int] = None,
+        extra_messages: Optional[list[dict]] = None,
+        max_bs: int = 50,
+        llm=None,
+        system_mode: str = "auto",
+        chat_prefix: str = "ipi",
+    ):
+        if not model and llm is None:
+            raise ValueError("KaggleLLM needs either a model id or a live llm= object.")
+        if system_mode not in ("auto", "native", "fold"):
+            raise ValueError(
+                f"system_mode must be 'auto', 'native' or 'fold', got {system_mode!r}")
+
+        name = model or getattr(llm, "name", None) or getattr(llm, "model", None) or str(llm)
+        super().__init__(
+            model=name,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            top_k=top_k,
+            extra_messages=extra_messages,
+            max_bs=max_bs,
+        )
+        # Resolution against the live registry is deferred to first use so that
+        # constructing a KaggleLLM off-Kaggle (docs, smoke checks) does not import.
+        self._spec        = ModelSpec("kaggle", name.removeprefix(KAGGLE_PREFIX))
+        self._llm_obj     = llm
+        self.system_mode  = system_mode
+        self.chat_prefix  = chat_prefix
+        self._prompt_args: Optional[set[str]] = None
+        self._warned: set[str] = set()
+
+    @classmethod
+    def supported_models(cls):
+        """Live ``kbench.llms`` keys when the runtime is importable, else ``KAGGLE_MODELS``."""
+        try:
+            return tuple(sorted(_kbench_module().llms.keys()))
+        except ImportError:
+            return KAGGLE_MODELS
+
+    # --- The wrapped kbench object ---
+
+    @property
+    def kaggle_llm(self):
+        """The ``kbench.llms`` object, resolved and cached on first use."""
+        if self._llm_obj is None:
+            kbench = _kbench_module()
+            model_id = resolve_kaggle_model_id(self._spec.model_id, kbench.llms.keys())
+            self._spec = ModelSpec("kaggle", model_id)
+            self._llm_obj = kbench.llms[model_id]
+        return self._llm_obj
+
+    # --- Abstract method implementations ---
+
+    def generate(
+        self,
+        messages: list[dict],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> str:
+        mt  = max_tokens  if max_tokens  is not None else self.max_tokens
+        tmp = temperature if temperature is not None else self.temperature
+        tp  = top_p       if top_p       is not None else self.top_p
+        return self._kaggle_generate(messages, mt, tmp, tp)
+
+    def get_first_token_logprobs(
+        self,
+        messages: list[dict],
+        n_top: int = 20,
+    ) -> dict[str, float]:
+        raise LogprobNotSupportedError(
+            "kaggle_benchmarks exposes generated text only, not token logprobs, so "
+            "RS / Beam-RS cannot search against a Kaggle model. Use a logprob provider "
+            f"({sorted(_LOGPROB_API_PROVIDERS)}) or LocalLLM for those attacks."
+        )
+
+    # --- Private ---
+
+    def _warn_once(self, key: str, msg: str) -> None:
+        if key not in self._warned:
+            self._warned.add(key)
+            log.warning("[KaggleLLM] %s", msg)
+
+    def _supported_prompt_args(self) -> set[str]:
+        """Names ``prompt()`` explicitly declares. ``**kwargs`` is deliberately ignored —
+        a name absorbed by ``**kwargs`` is silently discarded, which is worse than folding."""
+        if self._prompt_args is None:
+            prompt = self.kaggle_llm.prompt   # resolution errors must propagate, not
+            try:                              # be swallowed into "takes no arguments"
+                params = inspect.signature(prompt).parameters
+                self._prompt_args = {
+                    n for n, p in params.items()
+                    if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+                }
+            except (TypeError, ValueError):               # pragma: no cover - exotic callables
+                self._prompt_args = set()
+        return self._prompt_args
+
+    def _arg_for(self, role: str) -> Optional[str]:
+        supported = self._supported_prompt_args()
+        for name in self._PROMPT_ARG_ALIASES[role]:
+            if name in supported:
+                return name
+        return None
+
+    def _prompt_kwargs(self, system_text: str, max_tokens: int,
+                       temperature: float, top_p: float) -> tuple[dict, bool]:
+        """Build ``prompt()`` kwargs. Returns ``(kwargs, system_is_native)``."""
+        kwargs: dict = {}
+        for role, value in (("temperature", temperature),
+                            ("max_tokens", max_tokens),
+                            ("top_p", top_p)):
+            name = self._arg_for(role)
+            if name is not None:
+                kwargs[name] = value
+            else:
+                self._warn_once(
+                    role,
+                    f"kbench prompt() takes no {role} argument — {role}={value!r} is "
+                    f"ignored and the platform default applies.")
+
+        native = False
+        if system_text:
+            name = self._arg_for("system") if self.system_mode != "fold" else None
+            if name is not None:
+                kwargs[name] = system_text
+                native = True
+            elif self.system_mode == "native":
+                raise RuntimeError(
+                    "system_mode='native' but kbench prompt() declares no system argument "
+                    f"(it takes {sorted(self._supported_prompt_args())}). Pass "
+                    "system_mode='fold' to accept the system prompt being folded into the "
+                    "user turn.")
+            else:
+                self._warn_once(
+                    "system",
+                    "kbench prompt() takes no system argument — the system prompt is "
+                    "folded into the user turn. For a VICTIM that changes the "
+                    "trusted/untrusted structure the defense sees; say so when reporting.")
+        return kwargs, native
+
+    def _send_turn(self, kbench, role: str, content: str) -> None:
+        """Replay one historical turn into the active chat."""
+        if role == "assistant":
+            send = getattr(self.kaggle_llm, "send", None)
+            if callable(send):
+                send(content)
+                return
+            self._warn_once(
+                "assistant",
+                "kbench LLM object exposes no send() — prior assistant turns are "
+                "replayed as labelled user text, so a multi-turn attacker transcript "
+                "is not byte-identical to the same transcript on an API provider.")
+            kbench.user.send(f"[ASSISTANT]: {content}")
+            return
+        kbench.user.send(content)
+
+    def _kaggle_generate(self, messages, max_tokens: int,
+                         temperature: float, top_p: float) -> str:
+        kbench = _kbench_module()
+        system_text, history, final_text = _split_chat_turns(messages)
+        kwargs, native_system = self._prompt_kwargs(
+            system_text, max_tokens, temperature, top_p)
+        prompt_text = final_text
+        if system_text and not native_system:
+            prompt_text = f"{system_text}\n\n{final_text}" if final_text else system_text
+
+        chat_name = f"{self.chat_prefix}-{next(KaggleLLM._chat_counter)}"
+        try:
+            with kbench.chats.new(chat_name):
+                for role, content in history:
+                    self._send_turn(kbench, role, content)
+                raw = self.kaggle_llm.prompt(prompt_text, **kwargs)
+        except (AttributeError, LookupError, RuntimeError) as exc:
+            raise RuntimeError(f"{exc}\n\n{_KAGGLE_CONTEXT_HINT}") from exc
+
+        text = raw if isinstance(raw, str) else str(raw)
+        self.n_input_chars  += len(prompt_text)
+        self.n_output_chars += len(text)
+        self.n_input_tokens  += len(prompt_text) // 4
+        self.n_output_tokens += len(text) // 4
+        return text.strip()
+
+
+def _split_chat_turns(messages) -> tuple[str, list[tuple[str, str]], str]:
+    """
+    Split a messages list into ``(system_text, history, final_text)``.
+
+    ``history`` is every non-system turn but the last, as ``(role, content)``; the last
+    one becomes the prompt regardless of its role, so an assistant *prefill* (PAIR's
+    ``{"improvement": "", "prompt": "``) is carried rather than dropped.
+    """
+    if isinstance(messages, str):
+        return "", [], messages
+    system_parts = [m.get("content", "") for m in messages if m.get("role") == "system"]
+    turns = [(m.get("role", "user"), m.get("content", ""))
+             for m in messages if m.get("role") != "system"]
+    system_text = "\n\n".join(p for p in system_parts if p)
+    if not turns:
+        return system_text, [], ""
+    return system_text, turns[:-1], turns[-1][1]
+
+
+# ---------------------------------------------------------------------------
+# Factory — one model string, the right subclass
+# ---------------------------------------------------------------------------
+
+def make_llm(model, backend: str = "api", **kwargs) -> UnifiedLLM:
+    """
+    Turn a model string into the right ``UnifiedLLM``, or pass an instance through.
+
+    The one place the ``kaggle/`` prefix is interpreted. Every seam that used to build an
+    ``APILLM`` from a bare string — the attacker LLM, the ``*GetScore`` judge, TAP's
+    on-topic model, Multilingual's translator, ``make_target`` — goes through here, so a
+    Kaggle model is usable in each of those roles by prefix alone.
+
+    Args:
+        model:    ``"kaggle/<id>"`` → ``KaggleLLM``; anything else → ``APILLM`` (or
+                  ``LocalLLM`` when ``backend="local"``). A non-``str`` is returned
+                  unchanged, so a pre-built LLM (or a bare callable) survives the trip.
+        backend:  ``"api"`` (default) · ``"local"`` · ``"kaggle"``. The prefix wins over
+                  the default, so ``backend`` only has to be set for local models.
+        **kwargs: Forwarded to the chosen constructor; keys the constructor does not take
+                  (``api_key`` / ``metis_location`` for Kaggle and local models,
+                  ``device_map`` for API ones) are dropped rather than raising.
+    """
+    if not isinstance(model, str):
+        return model
+    if backend == "kaggle" or model.startswith(KAGGLE_PREFIX):
+        return KaggleLLM(model=model, **_only_kwargs_for(KaggleLLM, kwargs))
+    if backend == "local":
+        return LocalLLM(model=model, **kwargs)
+    return APILLM(model=model, **_only_kwargs_for(APILLM, kwargs))
+
+
+def _only_kwargs_for(cls, kwargs: dict) -> dict:
+    """Drop kwargs ``cls.__init__`` does not declare (see ``make_llm``)."""
+    accepted = set(inspect.signature(cls.__init__).parameters)
+    dropped = [k for k in kwargs if k not in accepted]
+    if dropped:
+        log.debug("make_llm: %s ignores %s", cls.__name__, dropped)
+    return {k: v for k, v in kwargs.items() if k in accepted}
 
 
 # ---------------------------------------------------------------------------

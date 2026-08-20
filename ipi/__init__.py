@@ -7,7 +7,8 @@ Indirect Prompt Injection (IPI) research.
 
 File layout
 -----------
-  llm_unified.py  — UnifiedLLM (abstract), APILLM (API), LocalLLM (local HF)
+  llm_unified.py  — UnifiedLLM (abstract), APILLM (API), LocalLLM (local HF),
+                    KaggleLLM (kaggle_benchmarks) · make_llm dispatches on the model string
   victim.py       — Victim ABC  (interface any defense must implement)
   attacker.py     — BaseAttacker ABC
   seed/           — SeedTemplate: the registry of every fixed string an attack uses
@@ -91,8 +92,12 @@ from .channels import (
 from .llm_unified import (
     APILLM,
     LocalLLM,
+    KaggleLLM,
     UnifiedLLM,
+    make_llm,
     KNOWN_MODELS,
+    KAGGLE_MODELS,
+    KAGGLE_PREFIX,
     ModelSpec,
     parse_json_response,
     LogprobNotSupportedError,
@@ -199,8 +204,8 @@ __all__ = [
     # Victim interface
     "Victim",
     # LLM hierarchy
-    "UnifiedLLM", "APILLM", "LocalLLM",
-    "KNOWN_MODELS", "ModelSpec", "parse_json_response",
+    "UnifiedLLM", "APILLM", "LocalLLM", "KaggleLLM", "make_llm",
+    "KNOWN_MODELS", "KAGGLE_MODELS", "KAGGLE_PREFIX", "ModelSpec", "parse_json_response",
     "LogprobNotSupportedError", "LocalOnlyError",
     "METIS_BASE_IR", "METIS_BASE_GLOBAL",
     # Target (Victim wrapping UnifiedLLM)

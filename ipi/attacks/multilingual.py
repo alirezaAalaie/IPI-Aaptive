@@ -66,7 +66,8 @@ IPI adaptation vs original
 Translation backends (in priority order)
 -----------------------------------------
   1. ``translator``          — user-supplied Callable(text, dest_lang) -> str.
-  2. ``translator_llm``      — a UnifiedLLM/APILLM used to translate via prompting.
+  2. ``translator_llm``      — a UnifiedLLM (or model string, ``kaggle/`` included)
+                               used to translate via prompting.
   3. Google translate endpoint (no key, no dependency) — used if neither is given.
   If all fail for a language, that language is skipped (logged), not silently counted.
 """
@@ -83,7 +84,7 @@ from ..attacker import StaticAttacker
 from ..datasets import AttackDataset, Instance
 from ..harness import VictimQuery
 from ..metrics import Evaluator, EvaluatorIPISuccess, resolve_attack_target
-from ..llm_unified import APILLM, UnifiedLLM
+from ..llm_unified import UnifiedLLM, make_llm
 from ..victim import Victim
 
 log = logging.getLogger(__name__)
@@ -170,7 +171,7 @@ def _make_translator(
     llm_obj: Optional[UnifiedLLM] = None
     if translator_llm is not None:
         llm_obj = (
-            APILLM(model=translator_llm, temperature=0.0, max_tokens=512)
+            make_llm(translator_llm, temperature=0.0, max_tokens=512)
             if isinstance(translator_llm, str) else translator_llm
         )
 

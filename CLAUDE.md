@@ -9,7 +9,8 @@ stress-test it.
 
 ```
 ipi/                    ← the package (this is the product; pip-installed on Kaggle)
-  llm_unified.py        UnifiedLLM ABC · APILLM (litellm) · LocalLLM (HF)
+  llm_unified.py        UnifiedLLM ABC · APILLM (litellm) · LocalLLM (HF) ·
+                        KaggleLLM (kaggle_benchmarks) · make_llm dispatches on the string
   victim.py             Victim ABC — the interface EVERY defense implements
   attacker.py           BaseAttacker ABC → StaticAttacker / AdaptiveAttacker / JudgeGuidedAttacker
   metrics/              Evaluator family — *GetScore guidance (1-10) beside *Judge/*Match
@@ -396,6 +397,25 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   `pip install ipi-adaptive[pisanitizer]`. `scripts/check_pisanitizer_fidelity.py` differentially
   tests the port against vendored upstream; notebook:
   `experiments/pisanitizer_defense_notebook.ipynb`.
+
+- **A `kaggle/` model string picks the Kaggle Benchmarks backend, and `make_llm` is the only
+  place that is decided.** `KaggleLLM` wraps `kbench.llms[...]`, so
+  `make_target("kaggle/google/gemini-2.5-flash")`, `EvaluatorIPIGetScore(model="kaggle/...")`,
+  `attacker_llm="kaggle/..."`, TAP's `on_topic_model` and Multilingual's `translator_llm` all
+  take one. Four constraints are structural, not bugs to fix: it imports only inside a Kaggle
+  Benchmarks notebook; `prompt()` only works while a `@kbench.task` is *running*, so drive the
+  whole eval from inside one task; there are **no logprobs** (RS / Beam-RS raise) and no
+  `hf_model` (GCG / BEAST / AutoDAN gate out); and `prompt()` has no documented system-prompt
+  argument, so unless the live signature grows one the system turn is **folded into the user
+  turn** and a one-time warning says so — for a victim that changes the trusted/untrusted
+  structure the defense is handed, so pass `system_mode="native"` to make it a hard error
+  instead. Sampling kwargs are passed only if the live `prompt()` signature declares them
+  (checked with `inspect.signature`; a name absorbed by `**kwargs` would be silently dropped).
+  Every call opens its own `kbench.chats.new(...)` — a shared `Chat` accumulates turns and
+  would feed candidate N the whole earlier search. Un-versioned ids resolve to the versioned
+  key (`openai/gpt-5.4-mini` → `openai/gpt-5.4-mini-2026-03-17`, `anthropic/claude-opus-5` →
+  `…@default`) by stripping the suffix only — nothing is prefix-matched, so `openai/gpt-5.4`
+  raises rather than silently picking the mini.
 
 ## Current work
 
