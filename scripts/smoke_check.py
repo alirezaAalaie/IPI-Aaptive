@@ -1238,12 +1238,15 @@ def _harness_target_fn():
     make_target_fn(bare, _Recorder())("INJECTION")
     assert seen["messages"][1]["content"] == "INJECTION"
 
-    # attack_context keeps the attacker-side key names TAP/PAIR document.
+    # attack_context keeps the attacker-side key names TAP/PAIR document, and carries the
+    # target string under BOTH — `target_tool_calls` is the documented attacker-side name,
+    # `target_str` is what TAP/PAIR actually read (see the attack_context check below).
     ctx = attack_context(inst)
     assert ctx == {
         "user_task": "Summarize the email.",
         "tool_schema": "send_email(to, body)",
         "target_tool_calls": "HACKED",
+        "target_str": "HACKED",
         "conversation_history": "Subject: lunch",
     }, ctx
 
@@ -2234,6 +2237,41 @@ def _e2e_evaluator():
     # a user_target, so a rate has to be reported (here 0.0 — the victim only emits the
     # injection's target string and never does the user's task).
     assert res.utility_rate is not None, "utility rate went missing"
+
+
+@check("harness: attack_context publishes the target string TAP/PAIR read")
+def _attack_context_target():
+    """
+    ``attack_context`` must carry ``target_str`` under that name.
+
+    TAP and PAIR both read ``context["target_str"]`` — for the ``{target_str}`` slot in
+    the ``original`` attacker prompt, and for each candidate's ``reference_responses``.
+    The dict published it only as ``target_tool_calls``, so both silently got "": the
+    original framing asked the attacker to aim for a reply beginning with '', and
+    EditDistance / PrefixExactMatch / ExactMatch scored against nothing.
+    """
+    from ipi.harness import attack_context
+    from ipi.attacks.tap import TAPAttacker, _system_prompt
+    from ipi.attacks.pair import PAIRAttacker
+    from ipi.metrics import EvaluatorKeywordJudge
+
+    inst = _mock_instance()
+    target = inst.attack_attrs["target_str"]
+    ctx = attack_context(inst)
+    assert ctx["target_str"] == target, "attack_context dropped target_str"
+
+    system_prompt = _system_prompt("original", inst.query, ctx)
+    assert target in system_prompt, \
+        "the original framing names the target string — it must not render empty"
+    assert "{target_str}" not in system_prompt and "[TARGET]" not in system_prompt
+
+    judge = EvaluatorKeywordJudge()
+    noop = lambda messages: ""
+    roots = TAPAttacker(judge=judge, attacker_llm=noop, width=1)._roots(inst.query, ctx)
+    streams = PAIRAttacker(judge=judge, attacker_llm=noop, n_streams=1)._streams(inst.query, ctx)
+    for name, ds in (("TAP", roots), ("PAIR", streams)):
+        assert ds[0].reference_responses == [target], \
+            f"{name} candidates must carry the target as their reference response"
 
 
 @check("KaggleLLM: dispatch, versions, chat isolation, no logprobs, task wrapper")

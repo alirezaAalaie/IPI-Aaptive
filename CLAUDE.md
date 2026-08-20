@@ -139,6 +139,15 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
 
 ## Known gotchas
 
+- **`attack_context` carries the target string twice, and one of the names is load-bearing.**
+  TAP and PAIR read `context["target_str"]` — for the `{target_str}` slot in the `original`
+  attacker prompt, and for every candidate's `reference_responses`. The dict published it
+  only as `target_tool_calls`, so both silently got `""`: the `original` framing told the
+  attacker to aim for a reply beginning with `''`, and `EvaluatorEditDistanceGetScore` /
+  `PrefixExactMatch` / `ExactMatch` scored against nothing. Reported ASR was never affected
+  (`AttackEvaluator` recomputes from the scenario), but **any `prompt_mode="original"` TAP or
+  PAIR number predates the fix and needs re-running.**
+
 - **TAP report-config still needs setting** (`attacks/tap.py`). The unbounded-conversation bug is
   fixed (`keep_last_n`, default 3), but the default `on_topic_prune=False`, `width=5`,
   `branching=2` is *not* paper-TAP. For a row labelled "TAP" set `on_topic_prune=True`,

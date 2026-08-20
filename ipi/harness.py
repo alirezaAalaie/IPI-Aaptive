@@ -115,6 +115,13 @@ def attack_context(instance: Instance) -> dict:
         "user_task":            attrs.get("user_task", ""),
         "tool_schema":          attrs.get("tool_schema", ""),
         "target_tool_calls":    attrs.get("target_str", ""),
+        # Same string under its own name. TAP and PAIR both read ``context["target_str"]``
+        # — for the ``{target_str}`` slot in the ``original`` attacker prompt, and for the
+        # candidates' ``reference_responses``. Publishing it only as ``target_tool_calls``
+        # meant both silently got "": the original framing told the attacker to aim for a
+        # reply beginning with '', and every reference-reading evaluator (EditDistance,
+        # PrefixExactMatch, ExactMatch) scored against nothing.
+        "target_str":           attrs.get("target_str", ""),
         "conversation_history": attrs.get("pipeline_context", ""),
     }
 
