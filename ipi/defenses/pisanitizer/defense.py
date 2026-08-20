@@ -23,7 +23,7 @@ IPI adaptations vs original
   Short IPI contexts are still handled, but note the peak-finding floor
   (``height=0.005``, ``threshold=0.01``) was tuned against long contexts where
   attention per token is small; on a 40-token context, ordinary tokens clear
-  those thresholds easily. See ``min_context_tokens``.
+  those thresholds easily. See ``min_context_chars``.
 * The sanitizer only ever sees the *data* channel, never the trusted
   instruction, so it cannot delete the user's real task. Upstream passes the
   context alone for the same reason.
@@ -50,8 +50,9 @@ class PISanitizerDefense(DefendedVictim):
         target:             The victim being defended. May be an API model.
         sanitizer:          A :class:`PISanitizer`. Built with defaults if
                             omitted, which loads Llama-3.1-8B-Instruct.
-        min_context_tokens: Skip sanitization for data channels shorter than
-                            this many characters. The method's thresholds were
+        min_context_chars:  Skip sanitization for data channels shorter than
+                            this many *characters* (not tokens — the guard runs
+                            before tokenization). The method's thresholds were
                             tuned on long contexts; on very short ones the peak
                             finder has no baseline to stand out from. ``0``
                             disables the guard.
@@ -72,12 +73,12 @@ class PISanitizerDefense(DefendedVictim):
         self,
         target: Victim,
         sanitizer: Optional[PISanitizer] = None,
-        min_context_tokens: int = 0,
+        min_context_chars: int = 0,
         pass_user_task: bool = False,
     ):
         super().__init__(target)
         self.sanitizer = sanitizer if sanitizer is not None else PISanitizer()
-        self.min_context_tokens = min_context_tokens
+        self.min_context_chars = min_context_chars
         self.pass_user_task = pass_user_task
         self.last_trace: Optional[SanitizationTrace] = None
 
@@ -98,10 +99,10 @@ class PISanitizerDefense(DefendedVictim):
             self.last_trace = None
             return messages
 
-        if self.min_context_tokens and len(data) < self.min_context_tokens:
+        if self.min_context_chars and len(data) < self.min_context_chars:
             log.info(
-                "[PISanitizer] Data channel is %d chars (< min_context_tokens=%d); "
-                "skipping sanitization.", len(data), self.min_context_tokens,
+                "[PISanitizer] Data channel is %d chars (< min_context_chars=%d); "
+                "skipping sanitization.", len(data), self.min_context_chars,
             )
             self.last_trace = None
             return messages
