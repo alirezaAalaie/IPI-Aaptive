@@ -2236,7 +2236,7 @@ def _e2e_evaluator():
     assert res.utility_rate is not None, "utility rate went missing"
 
 
-@check("KaggleLLM: dispatch, version resolution, chat isolation, no logprobs")
+@check("KaggleLLM: dispatch, versions, chat isolation, no logprobs, task wrapper")
 def _kaggle_llm():
     """
     The Kaggle Benchmarks backend, against a stub ``kaggle_benchmarks``.
@@ -2278,9 +2278,13 @@ def _kaggle_llm():
         def send(self, text):
             calls.append(("assistant", text))
 
+    in_task = {"active": True}
+
     class _Chats:
         @contextlib.contextmanager
         def new(self, name):
+            if not in_task["active"]:
+                raise RuntimeError("no active Run: chats.new() needs a running task")
             calls.append(("chat", name))
             yield
 
@@ -2322,7 +2326,62 @@ def _kaggle_llm():
             pass
         else:
             raise AssertionError("Kaggle exposes no logprobs — RS/Beam-RS must be gated out")
+
+        # run_in_kaggle_task: one task per evaluation, result through the closure.
+        from ipi.llm_unified import run_in_kaggle_task
+        made: list = []
+
+        class _Task:
+            def __init__(self, fn, kw):
+                self.fn, self.kw = fn, kw
+
+            def run(self, llm=None):
+                made.append((self.kw, llm))
+                in_task["active"] = True
+                try:
+                    self.fn(llm)
+                finally:
+                    in_task["active"] = False
+                return "a Run object, not the result"
+
+        def _task(**kw):
+            if "store_task" not in kw:      # exercise the decorator-kwarg fallback
+                raise TypeError("older kbench.task takes no store_task")
+            return lambda fn: _Task(fn, kw)
+
+        stub.task = _task
+        stub.llm = "default-llm"
+        out = run_in_kaggle_task(lambda a, b=0: {"asr": a + b}, 1, b=2, name="ipi-tap")
+        assert out == {"asr": 3}, \
+            "the result must come back through the closure, not the task's return slot"
+        assert len(made) == 1 and made[0][1] == "default-llm"
+        assert made[0][0]["store_task"] is False and made[0][0]["name"].startswith("ipi-tap")
+
+        # Inside a running task — the normal shape — KaggleLLM must create NO task of its
+        # own. One per victim query is the fallback for a bare cell, never the path.
+        in_task["active"] = True
+        made.clear()
+        calls.clear()
+        llm.generate([{"role": "user", "content": "inside"}])
+        assert not made, "a task was already active; KaggleLLM must not open another"
+
+        # Outside one, auto_task retries the call in a one-off task rather than dying...
+        in_task["active"] = False
+        made.clear()
+        assert llm.generate([{"role": "user", "content": "bare"}]) == "reply"
+        assert len(made) == 1, "auto_task should have wrapped exactly one retry"
+
+        # ...and auto_task=False says so instead of silently paying for a task per query.
+        strict = make_llm("kaggle/google/gemini-2.5-flash")
+        strict.auto_task = False
+        try:
+            strict.generate([{"role": "user", "content": "bare"}])
+        except RuntimeError as exc:
+            assert "@kbench.task" in str(exc), "the error must name what is missing"
+        else:
+            raise AssertionError("auto_task=False must not fall back to a per-call task")
     finally:
+        in_task["active"] = True
         if saved is None:
             del sys.modules["kaggle_benchmarks"]
         else:

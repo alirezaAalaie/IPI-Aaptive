@@ -415,7 +415,15 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   would feed candidate N the whole earlier search. Un-versioned ids resolve to the versioned
   key (`openai/gpt-5.4-mini` → `openai/gpt-5.4-mini-2026-03-17`, `anthropic/claude-opus-5` →
   `…@default`) by stripping the suffix only — nothing is prefix-matched, so `openai/gpt-5.4`
-  raises rather than silently picking the mini.
+  raises rather than silently picking the mini. **Where the task comes from:** driven from
+  inside a running `@kbench.task` — the normal shape — `KaggleLLM` opens no task of its
+  own, it just asks. Only a failed direct call is retried inside a one-off task
+  (`auto_task`, on by default, warns), so a bare cell still works; that path is one task
+  per *victim query*, which is why it is a fallback and not the route. To work outside a
+  task deliberately, `run_in_kaggle_task(fn, *args)` wraps one *evaluation* in one task
+  and returns the result through a closure — a `ScenarioResults` is not JSON and the
+  task's own return slot is serialized. `ipi_attack_benchmark.ipynb` exposes that as
+  `run_eval(evaluator, subset)` behind `WRAP_EACH_ATTACK_IN_TASK`, default off.
 
 ## Current work
 

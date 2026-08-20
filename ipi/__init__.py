@@ -95,6 +95,7 @@ from .llm_unified import (
     KaggleLLM,
     UnifiedLLM,
     make_llm,
+    run_in_kaggle_task,
     KNOWN_MODELS,
     KAGGLE_MODELS,
     KAGGLE_PREFIX,
@@ -204,7 +205,7 @@ __all__ = [
     # Victim interface
     "Victim",
     # LLM hierarchy
-    "UnifiedLLM", "APILLM", "LocalLLM", "KaggleLLM", "make_llm",
+    "UnifiedLLM", "APILLM", "LocalLLM", "KaggleLLM", "make_llm", "run_in_kaggle_task",
     "KNOWN_MODELS", "KAGGLE_MODELS", "KAGGLE_PREFIX", "ModelSpec", "parse_json_response",
     "LogprobNotSupportedError", "LocalOnlyError",
     "METIS_BASE_IR", "METIS_BASE_GLOBAL",

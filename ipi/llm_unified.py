@@ -1137,6 +1137,13 @@ class KaggleLLM(UnifiedLLM):
     load-bearing: a ``Chat`` accumulates turns, so sharing one across an attack's
     iterations would feed candidate *n* every earlier candidate's transcript.
 
+    **Where the task comes from.** ``prompt()`` needs a running ``@kbench.task``. If the
+    evaluation is already being driven from inside one — the normal case — this class
+    creates no task of its own and simply asks. Only if that direct call fails does it
+    retry inside a one-off task (``auto_task``), so a bare notebook cell still works, with
+    a warning: that path is one task per victim query. To run outside a task deliberately,
+    wrap the evaluation once with ``run_in_kaggle_task(evaluator.run, subset)``.
+
     Args:
         model:       ``"kaggle/<id>"`` or a bare ``kbench.llms`` id. Optional if ``llm``
                      is given.
@@ -1147,6 +1154,10 @@ class KaggleLLM(UnifiedLLM):
                      ``"fold"`` always folds.
         chat_prefix: Name prefix for the per-call chat, so runs are legible in the
                      recorded ``Run``.
+        auto_task:   When the direct call fails — which is what happens outside a running
+                     task — retry it inside a one-off ``@kbench.task`` and warn. It keeps
+                     a bare notebook cell working; it is not the way to run an evaluation,
+                     because it is one task per victim query. Default ``True``.
         (all other args inherited from ``UnifiedLLM``)
     """
 
@@ -1177,6 +1188,7 @@ class KaggleLLM(UnifiedLLM):
         llm=None,
         system_mode: str = "auto",
         chat_prefix: str = "ipi",
+        auto_task: bool = True,
     ):
         if not model and llm is None:
             raise ValueError("KaggleLLM needs either a model id or a live llm= object.")
@@ -1201,6 +1213,7 @@ class KaggleLLM(UnifiedLLM):
         self._llm_obj     = llm
         self.system_mode  = system_mode
         self.chat_prefix  = chat_prefix
+        self.auto_task    = auto_task
         self._prompt_args: Optional[set[str]] = None
         self._warned: set[str] = set()
 
@@ -1330,6 +1343,14 @@ class KaggleLLM(UnifiedLLM):
             return
         kbench.user.send(content)
 
+    def _prompt_once(self, kbench, history, prompt_text: str, kwargs: dict) -> str:
+        """One chat: replay the history, ask, return the raw reply."""
+        chat_name = f"{self.chat_prefix}-{next(KaggleLLM._chat_counter)}"
+        with kbench.chats.new(chat_name):
+            for role, content in history:
+                self._send_turn(kbench, role, content)
+            return self.kaggle_llm.prompt(prompt_text, **kwargs)
+
     def _kaggle_generate(self, messages, max_tokens: int,
                          temperature: float, top_p: float) -> str:
         kbench = _kbench_module()
@@ -1340,14 +1361,27 @@ class KaggleLLM(UnifiedLLM):
         if system_text and not native_system:
             prompt_text = f"{system_text}\n\n{final_text}" if final_text else system_text
 
-        chat_name = f"{self.chat_prefix}-{next(KaggleLLM._chat_counter)}"
+        # Ask directly first. Inside a running @kbench.task — which is where an evaluation
+        # normally lives — that is all this needs, and no task is created. The fallback
+        # exists only for a call from a bare notebook cell, where there is no active Chat.
         try:
-            with kbench.chats.new(chat_name):
-                for role, content in history:
-                    self._send_turn(kbench, role, content)
-                raw = self.kaggle_llm.prompt(prompt_text, **kwargs)
-        except (AttributeError, LookupError, RuntimeError) as exc:
-            raise RuntimeError(f"{exc}\n\n{_KAGGLE_CONTEXT_HINT}") from exc
+            raw = self._prompt_once(kbench, history, prompt_text, kwargs)
+        except Exception as exc:
+            if not self.auto_task:
+                raise RuntimeError(f"{exc}\n\n{_KAGGLE_CONTEXT_HINT}") from exc
+            self._warn_once(
+                "auto_task",
+                f"first call failed ({type(exc).__name__}: {exc}) — retrying inside a "
+                "one-off @kbench.task. If that works you were outside a task: this costs "
+                "a task per VICTIM QUERY, so wrap the evaluation instead, with "
+                "run_in_kaggle_task(evaluator.run, subset).")
+            try:
+                raw = run_in_kaggle_task(
+                    self._prompt_once, kbench, history, prompt_text, kwargs,
+                    name=f"{self.chat_prefix}-call")
+            except Exception:
+                # The retry tells us nothing new — re-raise what actually went wrong.
+                raise RuntimeError(f"{exc}\n\n{_KAGGLE_CONTEXT_HINT}") from exc
 
         text = raw if isinstance(raw, str) else str(raw)
         self.n_input_chars  += len(prompt_text)
@@ -1374,6 +1408,65 @@ def _split_chat_turns(messages) -> tuple[str, list[tuple[str, str]], str]:
     if not turns:
         return system_text, [], ""
     return system_text, turns[:-1], turns[-1][1]
+
+
+def run_in_kaggle_task(fn, *args, name: str = "ipi", llm=None, **kwargs):
+    """
+    Call ``fn(*args, **kwargs)`` inside a ``@kbench.task`` and return its result.
+
+    A ``KaggleLLM`` can only talk while a task is running, so a notebook cell that would
+    normally read::
+
+        result = AttackEvaluator(target=target, attacker=tap).run(subset)
+
+    becomes::
+
+        result = run_in_kaggle_task(AttackEvaluator(target=target, attacker=tap).run, subset)
+
+    and the whole attack — every judge call, every attacker-LLM call — runs inside one
+    recorded ``Run``. One task per evaluation, not per victim query: a task is the unit
+    Kaggle records, and one per query would write a run file per query.
+
+    The return value comes back through a closure rather than the task's own return
+    slot, deliberately. Kaggle serializes what a task returns into the run file, and a
+    ``ScenarioResults`` is not JSON — routing it through the task would either fail or
+    silently flatten it.
+
+    Args:
+        fn:   The callable to run. Usually a bound ``AttackEvaluator.run``.
+        name: Task name. Kaggle enforces a length limit and rejects an over-long one at
+              decoration time, so this is truncated and suffixed with a counter.
+        llm:  The model recorded as "under test" for this run. Defaults to ``kbench.llm``
+              — the notebook's own model — which is *not* necessarily the victim; nothing
+              in the eval reads it, it is bookkeeping for the leaderboard.
+    """
+    kbench = _kbench_module()
+    box: dict = {}
+    task_name = f"{name[:40]}-{next(KaggleLLM._chat_counter)}"
+
+    def _body(llm):                      # first parameter must be the model under test
+        box["value"] = fn(*args, **kwargs)
+
+    _body.__name__ = task_name.replace("-", "_")
+    # store_task=False keeps /kaggle/working free of a task file per attack; older
+    # builds of kbench.task may not take it, hence the fallbacks.
+    for decorator_kwargs in ({"name": task_name, "store_task": False},
+                             {"name": task_name},
+                             {}):
+        try:
+            task = kbench.task(**decorator_kwargs)(_body)
+            break
+        except TypeError:
+            continue
+    else:                                                # pragma: no cover - defensive
+        raise RuntimeError("kbench.task rejected every decorator form tried")
+
+    task.run(llm=kbench.llm if llm is None else llm)
+    if "value" not in box:                               # pragma: no cover - defensive
+        raise RuntimeError(
+            f"kbench task {task_name!r} finished without running {fn!r} — check the Run "
+            "output in the notebook for the assertion or error it recorded.")
+    return box["value"]
 
 
 # ---------------------------------------------------------------------------
