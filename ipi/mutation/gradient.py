@@ -149,29 +149,42 @@ def compute_loss_and_grads(
     one_hot.scatter_(1, suffix_ids.unsqueeze(1), 1.0)
     one_hot.requires_grad_(True)
 
-    # Embed the full input: prefix uses normal embed lookup, suffix uses one_hot @ W
-    with torch.enable_grad():
-        full_embed = embed_weights[input_ids[0]]   # (L, d_model)
+    # GCG wants the gradient w.r.t. ``one_hot`` and nothing else — it never updates a
+    # weight. A loaded HF model has requires_grad=True on every parameter, so a plain
+    # ``loss.backward()`` also allocates a ``.grad`` for each of them: a second full
+    # copy of the model, 14 GiB for a 7B in bf16. That OOMs before the candidate batch
+    # size matters at all, which is why shrinking batch_size did not help. Freeze the
+    # parameters for the duration and ask autograd for the one gradient we want, so
+    # nothing is accumulated into leaves.
+    frozen = [p for p in model.parameters() if p.requires_grad]
+    for p in frozen:
+        p.requires_grad_(False)
+    try:
+        with torch.enable_grad():
+            full_embed = embed_weights[input_ids[0]]   # (L, d_model)
 
-        # Replace suffix embedding positions with differentiable one_hot @ W
-        suffix_embed = one_hot @ embed_weights     # (S, d_model)
-        full_embed = full_embed.clone()
-        full_embed[suffix_slice] = suffix_embed
+            # Replace suffix embedding positions with differentiable one_hot @ W
+            suffix_embed = one_hot @ embed_weights     # (S, d_model)
+            full_embed = full_embed.clone()
+            full_embed[suffix_slice] = suffix_embed
 
-        # Forward
-        output = model(inputs_embeds=full_embed.unsqueeze(0),
-                       use_cache=False, return_dict=True)
-        logits = output.logits[0]                  # (L, vocab)
+            # Forward
+            output = model(inputs_embeds=full_embed.unsqueeze(0),
+                           use_cache=False, return_dict=True)
+            logits = output.logits[0]                  # (L, vocab)
 
-        # Loss over target positions
-        tgt_ids = input_ids[0, target_slice]       # (T,)
-        shift   = target_slice.start - 1           # predict from position before target start
-        log_probs = F.log_softmax(logits[shift: shift + len(tgt_ids)], dim=-1)
-        loss = -log_probs[torch.arange(len(tgt_ids)), tgt_ids].mean()
+            # Loss over target positions
+            tgt_ids = input_ids[0, target_slice]       # (T,)
+            shift   = target_slice.start - 1           # predict from position before target start
+            log_probs = F.log_softmax(logits[shift: shift + len(tgt_ids)], dim=-1)
+            loss = -log_probs[torch.arange(len(tgt_ids)), tgt_ids].mean()
 
-        loss.backward()
+            (grads,) = torch.autograd.grad(loss, one_hot)
+    finally:
+        for p in frozen:
+            p.requires_grad_(True)
 
-    grads = one_hot.grad.detach().clone()          # (S, vocab)
+    grads = grads.detach().clone()                 # (S, vocab)
     loss_val = loss.item()
     return loss_val, grads
 
