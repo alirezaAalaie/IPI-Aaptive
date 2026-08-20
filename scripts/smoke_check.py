@@ -2239,6 +2239,72 @@ def _e2e_evaluator():
     assert res.utility_rate is not None, "utility rate went missing"
 
 
+@check("recipes tap/pair: the ipi_document framing, and no silent prompt_mode typo")
+def _prompt_modes():
+    """
+    ``ipi_document`` — the framing for a victim with no tools.
+
+    ``DualVerifiableDataset`` has ``tool_schema`` empty on all 360 scenarios, so
+    ``ipi_single`` describes tools the victim cannot call and ``original`` claims the
+    victim sees "only your prompt P". The document framing must instead name the exact
+    required string, show the content the injection sits in, and say nothing about tools.
+    A ``prompt_mode`` typo used to fall through to ``ipi_single`` silently.
+    """
+    from ipi.attacks import pair as pair_mod
+    from ipi.attacks import tap as tap_mod
+    from ipi.attacks.pair import PAIRAttacker
+    from ipi.attacks.tap import TAPAttacker, _system_prompt
+    from ipi.harness import attack_context
+    from ipi.metrics import EvaluatorKeywordJudge
+
+    inst = _mock_instance()
+    ctx = attack_context(inst)
+    target = inst.attack_attrs["target_str"]
+    # The benchmark's own tool_schema is "" on all 360 scenarios, which would make the
+    # "no tools in the prompt" assertion vacuous. Put one in: the framing must drop it
+    # even when the scenario has one, not merely inherit an empty field.
+    ctx["tool_schema"] = "send_email(to, body)"
+
+    system_prompt = _system_prompt("ipi_document", inst.query, ctx)
+    assert "no tools" in system_prompt, "the document framing must state the victim has none"
+    assert "tool-using AI agents" not in system_prompt, "that is the ipi_single framing"
+
+    judge = EvaluatorKeywordJudge()
+    noop = lambda messages: ""
+    opening = {
+        "TAP": "".join(
+            TAPAttacker(judge=judge, attacker_llm=noop, width=1,
+                        prompt_mode="ipi_document")
+            ._roots(inst.query, ctx)[0].attack_attrs["conv"][1]["content"]),
+        "PAIR": "".join(
+            PAIRAttacker(judge=judge, attacker_llm=noop, n_streams=1,
+                         prompt_mode="ipi_document")
+            ._streams(inst.query, ctx)[0].attack_attrs["conv"][1]["content"]),
+    }
+    for name, text in opening.items():
+        assert target in text, f"{name}: the exact required string must be given"
+        assert ctx["conversation_history"] in text, \
+            f"{name}: the document the injection lands in must be shown"
+        assert ctx["tool_schema"] not in text, \
+            f"{name}: no tool schema belongs in the tool-free framing"
+
+    # The registry actually carries the variant for both recipes.
+    for module, method in ((tap_mod, "TAP"), (pair_mod, "PAIR")):
+        assert module.PROMPT_MODES["ipi_document"] == "ipi_document"
+        assert "ipi_universal" not in pair_mod.PROMPT_MODES, \
+            "a universal template is searched over a tree — that is TAP's shape, not PAIR's"
+
+    for cls, kw in ((TAPAttacker, {"width": 1}), (PAIRAttacker, {"n_streams": 1})):
+        try:
+            cls(judge=judge, attacker_llm=noop, prompt_mode="ipi_docment", **kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"{cls.__name__} accepted a prompt_mode typo — it would run ipi_single "
+                "under a different label")
+
+
 @check("harness: attack_context publishes the target string TAP/PAIR read")
 def _attack_context_target():
     """

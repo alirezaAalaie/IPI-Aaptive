@@ -125,9 +125,15 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
 
 ## Conventions
 
-- `prompt_mode` on TAP/PAIR: `"ipi_single"` (default) · `"ipi_universal"` · `"original"`.
-  `"original"` exists for paper-reproduction; the IPI modes swap the JSON key from
-  `"prompt"` to `"injection_string"` and reframe the system prompt around tool-calling.
+- `prompt_mode` on TAP/PAIR: `"ipi_single"` (default) · `"ipi_document"` ·
+  `"ipi_universal"` (TAP only) · `"original"`. `"original"` exists for paper-reproduction;
+  the IPI modes swap the JSON key from `"prompt"` to `"injection_string"`. `ipi_single`
+  reframes the system prompt around tool-calling; **`ipi_document` is the one that matches
+  `DualVerifiableDataset`** — `tool_schema` is empty on all 360 scenarios and success is the
+  reply's literal text, so it states the victim has no tools, names the exact required
+  string, shows the content the injection is placed inside, and trades tool-targeting for
+  context termination and formatting camouflage. Unknown modes now raise: a typo used to
+  fall through to `ipi_single` and the row was labelled with a mode it never ran.
 - Every attack module docstring carries an **"IPI adaptations vs original"** section. Keep this
   up to date — it is the audit trail for what deviates from each paper, and reviewers will ask.
 - Success checking is centralised in `metrics.check_ipi_success(response, target_str, mode)`

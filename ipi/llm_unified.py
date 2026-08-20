@@ -1410,7 +1410,8 @@ def _split_chat_turns(messages) -> tuple[str, list[tuple[str, str]], str]:
     return system_text, turns[:-1], turns[-1][1]
 
 
-def run_in_kaggle_task(fn, *args, name: str = "ipi", llm=None, **kwargs):
+def run_in_kaggle_task(fn, *args, name: str = "ipi", llm=None,
+                       store_task: bool = False, **kwargs):
     """
     Call ``fn(*args, **kwargs)`` inside a ``@kbench.task`` and return its result.
 
@@ -1439,6 +1440,11 @@ def run_in_kaggle_task(fn, *args, name: str = "ipi", llm=None, **kwargs):
         llm:  The model recorded as "under test" for this run. Defaults to ``kbench.llm``
               — the notebook's own model — which is *not* necessarily the victim; nothing
               in the eval reads it, it is bookkeeping for the leaderboard.
+        store_task: Write the task file. Default ``False`` — these are wrapper tasks, and
+              storing one per attack fills ``/kaggle/working``. Note that Kaggle's
+              Benchmark panel says "No tasks detected" until a *stored* task exists, so a
+              notebook that wants to publish needs one top-level ``@kbench.task`` of its
+              own; do not try to get that from this helper.
     """
     kbench = _kbench_module()
     box: dict = {}
@@ -1450,7 +1456,7 @@ def run_in_kaggle_task(fn, *args, name: str = "ipi", llm=None, **kwargs):
     _body.__name__ = task_name.replace("-", "_")
     # store_task=False keeps /kaggle/working free of a task file per attack; older
     # builds of kbench.task may not take it, hence the fallbacks.
-    for decorator_kwargs in ({"name": task_name, "store_task": False},
+    for decorator_kwargs in ({"name": task_name, "store_task": store_task},
                              {"name": task_name},
                              {}):
         try:
