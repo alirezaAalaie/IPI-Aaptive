@@ -2278,9 +2278,13 @@ def _kaggle_llm():
         def send(self, text):
             calls.append(("assistant", text))
 
+    in_task = {"active": True}
+
     class _Chats:
         @contextlib.contextmanager
         def new(self, name):
+            if not in_task["active"]:
+                raise RuntimeError("no active Run: chats.new() needs a running task")
             calls.append(("chat", name))
             yield
 
@@ -2333,7 +2337,11 @@ def _kaggle_llm():
 
             def run(self, llm=None):
                 made.append((self.kw, llm))
-                self.fn(llm)
+                in_task["active"] = True
+                try:
+                    self.fn(llm)
+                finally:
+                    in_task["active"] = False
                 return "a Run object, not the result"
 
         def _task(**kw):
@@ -2348,7 +2356,32 @@ def _kaggle_llm():
             "the result must come back through the closure, not the task's return slot"
         assert len(made) == 1 and made[0][1] == "default-llm"
         assert made[0][0]["store_task"] is False and made[0][0]["name"].startswith("ipi-tap")
+
+        # Inside a running task — the normal shape — KaggleLLM must create NO task of its
+        # own. One per victim query is the fallback for a bare cell, never the path.
+        in_task["active"] = True
+        made.clear()
+        calls.clear()
+        llm.generate([{"role": "user", "content": "inside"}])
+        assert not made, "a task was already active; KaggleLLM must not open another"
+
+        # Outside one, auto_task retries the call in a one-off task rather than dying...
+        in_task["active"] = False
+        made.clear()
+        assert llm.generate([{"role": "user", "content": "bare"}]) == "reply"
+        assert len(made) == 1, "auto_task should have wrapped exactly one retry"
+
+        # ...and auto_task=False says so instead of silently paying for a task per query.
+        strict = make_llm("kaggle/google/gemini-2.5-flash")
+        strict.auto_task = False
+        try:
+            strict.generate([{"role": "user", "content": "bare"}])
+        except RuntimeError as exc:
+            assert "@kbench.task" in str(exc), "the error must name what is missing"
+        else:
+            raise AssertionError("auto_task=False must not fall back to a per-call task")
     finally:
+        in_task["active"] = True
         if saved is None:
             del sys.modules["kaggle_benchmarks"]
         else:
