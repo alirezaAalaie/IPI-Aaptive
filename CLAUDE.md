@@ -415,7 +415,12 @@ by hand — `attack_attrs.get` returns `None` on a typo where an attribute would
   would feed candidate N the whole earlier search. Un-versioned ids resolve to the versioned
   key (`openai/gpt-5.4-mini` → `openai/gpt-5.4-mini-2026-03-17`, `anthropic/claude-opus-5` →
   `…@default`) by stripping the suffix only — nothing is prefix-matched, so `openai/gpt-5.4`
-  raises rather than silently picking the mini.
+  raises rather than silently picking the mini. `run_in_kaggle_task(fn, *args)` is the
+  other half: it runs one `@kbench.task` per *evaluation* (not per query — a task writes a
+  run file) and returns the result through a closure, since a `ScenarioResults` is not
+  JSON and the task's own return slot is serialized. `ipi_attack_benchmark.ipynb` wraps it
+  as `run_eval(evaluator, subset)`, which is a plain `.run` unless a `kaggle/` model is in
+  the loop; every attack cell in that notebook launches through it.
 
 ## Current work
 

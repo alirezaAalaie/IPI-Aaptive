@@ -2236,7 +2236,7 @@ def _e2e_evaluator():
     assert res.utility_rate is not None, "utility rate went missing"
 
 
-@check("KaggleLLM: dispatch, version resolution, chat isolation, no logprobs")
+@check("KaggleLLM: dispatch, versions, chat isolation, no logprobs, task wrapper")
 def _kaggle_llm():
     """
     The Kaggle Benchmarks backend, against a stub ``kaggle_benchmarks``.
@@ -2322,6 +2322,32 @@ def _kaggle_llm():
             pass
         else:
             raise AssertionError("Kaggle exposes no logprobs — RS/Beam-RS must be gated out")
+
+        # run_in_kaggle_task: one task per evaluation, result through the closure.
+        from ipi.llm_unified import run_in_kaggle_task
+        made: list = []
+
+        class _Task:
+            def __init__(self, fn, kw):
+                self.fn, self.kw = fn, kw
+
+            def run(self, llm=None):
+                made.append((self.kw, llm))
+                self.fn(llm)
+                return "a Run object, not the result"
+
+        def _task(**kw):
+            if "store_task" not in kw:      # exercise the decorator-kwarg fallback
+                raise TypeError("older kbench.task takes no store_task")
+            return lambda fn: _Task(fn, kw)
+
+        stub.task = _task
+        stub.llm = "default-llm"
+        out = run_in_kaggle_task(lambda a, b=0: {"asr": a + b}, 1, b=2, name="ipi-tap")
+        assert out == {"asr": 3}, \
+            "the result must come back through the closure, not the task's return slot"
+        assert len(made) == 1 and made[0][1] == "default-llm"
+        assert made[0][0]["store_task"] is False and made[0][0]["name"].startswith("ipi-tap")
     finally:
         if saved is None:
             del sys.modules["kaggle_benchmarks"]

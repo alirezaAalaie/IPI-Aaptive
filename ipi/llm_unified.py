@@ -1376,6 +1376,65 @@ def _split_chat_turns(messages) -> tuple[str, list[tuple[str, str]], str]:
     return system_text, turns[:-1], turns[-1][1]
 
 
+def run_in_kaggle_task(fn, *args, name: str = "ipi", llm=None, **kwargs):
+    """
+    Call ``fn(*args, **kwargs)`` inside a ``@kbench.task`` and return its result.
+
+    A ``KaggleLLM`` can only talk while a task is running, so a notebook cell that would
+    normally read::
+
+        result = AttackEvaluator(target=target, attacker=tap).run(subset)
+
+    becomes::
+
+        result = run_in_kaggle_task(AttackEvaluator(target=target, attacker=tap).run, subset)
+
+    and the whole attack — every judge call, every attacker-LLM call — runs inside one
+    recorded ``Run``. One task per evaluation, not per victim query: a task is the unit
+    Kaggle records, and one per query would write a run file per query.
+
+    The return value comes back through a closure rather than the task's own return
+    slot, deliberately. Kaggle serializes what a task returns into the run file, and a
+    ``ScenarioResults`` is not JSON — routing it through the task would either fail or
+    silently flatten it.
+
+    Args:
+        fn:   The callable to run. Usually a bound ``AttackEvaluator.run``.
+        name: Task name. Kaggle enforces a length limit and rejects an over-long one at
+              decoration time, so this is truncated and suffixed with a counter.
+        llm:  The model recorded as "under test" for this run. Defaults to ``kbench.llm``
+              — the notebook's own model — which is *not* necessarily the victim; nothing
+              in the eval reads it, it is bookkeeping for the leaderboard.
+    """
+    kbench = _kbench_module()
+    box: dict = {}
+    task_name = f"{name[:40]}-{next(KaggleLLM._chat_counter)}"
+
+    def _body(llm):                      # first parameter must be the model under test
+        box["value"] = fn(*args, **kwargs)
+
+    _body.__name__ = task_name.replace("-", "_")
+    # store_task=False keeps /kaggle/working free of a task file per attack; older
+    # builds of kbench.task may not take it, hence the fallbacks.
+    for decorator_kwargs in ({"name": task_name, "store_task": False},
+                             {"name": task_name},
+                             {}):
+        try:
+            task = kbench.task(**decorator_kwargs)(_body)
+            break
+        except TypeError:
+            continue
+    else:                                                # pragma: no cover - defensive
+        raise RuntimeError("kbench.task rejected every decorator form tried")
+
+    task.run(llm=kbench.llm if llm is None else llm)
+    if "value" not in box:                               # pragma: no cover - defensive
+        raise RuntimeError(
+            f"kbench task {task_name!r} finished without running {fn!r} — check the Run "
+            "output in the notebook for the assertion or error it recorded.")
+    return box["value"]
+
+
 # ---------------------------------------------------------------------------
 # Factory — one model string, the right subclass
 # ---------------------------------------------------------------------------
