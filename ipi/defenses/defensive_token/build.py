@@ -26,6 +26,15 @@ IPI adaptations vs original
 * ``torch_dtype`` is exposed and defaults to the model's existing dtype rather
   than upstream's implicit float32, so patching a bf16 model in place does not
   silently upcast one matrix.
+* **The resize is conditional.** Upstream calls ``resize_token_embeddings``
+  unconditionally, which on a *padded* vocabulary shrinks the matrix rather than
+  growing it — Qwen2.5 has 152064 embedding rows for 151665 tokens, so the five
+  new ids (151665-151669) already have rows and upstream's call would drop the
+  matrix to 151670 and reallocate the untied lm_head alongside it. The rows the
+  tokens land in are identical either way (they are resolved by id, not by
+  position), so the only difference is ~2 GiB of transient allocation and 394
+  unused output logits that stock Qwen carries anyway. On a 15 GB card holding a
+  7B model in bf16 that allocation is the difference between running and OOM.
 """
 from __future__ import annotations
 
@@ -101,12 +110,22 @@ def apply_defensive_tokens(
         {"additional_special_tokens": list(DEFENSIVE_TOKEN_NAMES)}
     )
     rows_before = emb.weight.shape[0]
-    model.resize_token_embeddings(len(tokenizer))
-    emb = _embedding_matrix(model)
-    log.info(
-        "[DefensiveToken] %s: added %d tokens, embedding rows %d -> %d",
-        key, n_added, rows_before, emb.weight.shape[0],
-    )
+    if len(tokenizer) > rows_before:
+        model.resize_token_embeddings(len(tokenizer))
+        emb = _embedding_matrix(model)
+        log.info(
+            "[DefensiveToken] %s: added %d tokens, embedding rows %d -> %d",
+            key, n_added, rows_before, emb.weight.shape[0],
+        )
+    else:
+        # Padded vocabulary — the five new ids already have rows. Resizing here
+        # would only *shrink* the matrix to len(tokenizer), which reallocates the
+        # embedding table and the lm_head for no benefit; see the module docstring.
+        log.info(
+            "[DefensiveToken] %s: added %d tokens; embedding matrix already holds "
+            "%d rows for %d tokens, no resize needed",
+            key, n_added, rows_before, len(tokenizer),
+        )
 
     token_ids = [tokenizer.convert_tokens_to_ids(t) for t in DEFENSIVE_TOKEN_NAMES]
     unknown = tokenizer.convert_tokens_to_ids(tokenizer.unk_token) if tokenizer.unk_token else None

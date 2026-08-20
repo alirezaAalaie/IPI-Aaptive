@@ -147,6 +147,12 @@ class DefensiveTokenDefense(StructuredChannelDefense):
         """
         Read live off the tokenizer, so the five DefensiveTokens are included
         once the target is patched (demo.py: ``recursive_filter(..., all_special_tokens)``).
+
+        The ``if t`` is load-bearing, not tidiness: ``channels.recursive_filter``
+        (StruQ's) tests ``f in s`` to decide whether to loop again, and ``'' in s``
+        is always True, so a single empty token hangs the run forever. Upstream's
+        own ``recursive_filter`` compares before/after and terminates instead, so
+        this only bites here.
         """
         return tuple(t for t in self.tokenizer.all_special_tokens if t)
 

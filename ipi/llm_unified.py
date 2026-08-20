@@ -877,8 +877,17 @@ class LocalLLM(UnifiedLLM):
             trust_remote_code=True,
         )
 
-        # Resize token embeddings if tokenizer vocabulary was expanded
-        if len(self._tokenizer_obj) != model_obj.config.vocab_size:
+        # Resize token embeddings if the tokenizer vocabulary was *expanded*.
+        #
+        # The condition is `>` and not `!=` on purpose. A padded vocabulary — the
+        # embedding matrix deliberately wider than the tokenizer, for kernel
+        # alignment — is normal and must be left alone: Qwen2.5 ships
+        # config.vocab_size=152064 against len(tokenizer)=151665. Under `!=` every
+        # Qwen load shrank the matrix by 399 rows, which buys nothing and costs a
+        # full reallocation of BOTH the embedding table and the (untied) lm_head
+        # while the originals are still resident. On a 15 GB card holding a 7B model
+        # in bf16 that is ~2 GiB the run does not have, and it OOM'd at load.
+        if len(self._tokenizer_obj) > model_obj.config.vocab_size:
             try:
                 model_obj.resize_token_embeddings(len(self._tokenizer_obj), mean_resizing=False)
             except TypeError:
