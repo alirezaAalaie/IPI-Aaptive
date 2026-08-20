@@ -58,7 +58,7 @@ from ..config import (
 from ..constraint import DeleteOffTopic
 from ..datasets import AttackDataset, Instance
 from ..harness import VictimQuery, attack_context
-from ..llm_unified import APILLM, UnifiedLLM
+from ..llm_unified import UnifiedLLM, make_llm
 from ..metrics import Evaluator
 from ..mutation import IntrospectBranching
 from ..seed import SeedTemplate, render
@@ -171,7 +171,8 @@ class TAPAttacker(JudgeGuidedAttacker):
     Args:
         judge:            Guidance Evaluator (``ipi.metrics``), owned by this attacker.
                           Its ``success_threshold`` is TAP's early stop.
-        attacker_llm:     ``APILLM`` (or model string) generating the injections.
+        attacker_llm:     ``UnifiedLLM`` (or model string, ``kaggle/`` included)
+                          generating the injections.
         depth:            Maximum tree depth. Default 10.
         width:            Candidates kept after pruning each level. Default 5.
         branching_factor: New candidates per surviving candidate per level. Default 2.
@@ -197,7 +198,7 @@ class TAPAttacker(JudgeGuidedAttacker):
     def __init__(
         self,
         judge: Evaluator,
-        attacker_llm: Union[str, APILLM],
+        attacker_llm: Union[str, UnifiedLLM],
         depth: int = TAP_DEPTH,
         width: int = TAP_WIDTH,
         branching_factor: int = TAP_BRANCHING,
@@ -367,5 +368,5 @@ def _as_on_topic(model: Optional[Union[str, UnifiedLLM]],
         return model
     if model and model != fallback.model_name:
         # 16 tokens is all "Response: [[YES]]" needs.
-        return APILLM(model=model, temperature=0.0, top_p=1.0, max_tokens=16)
+        return make_llm(model, temperature=0.0, top_p=1.0, max_tokens=16)
     return fallback

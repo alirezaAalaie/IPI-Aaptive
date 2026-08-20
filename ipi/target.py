@@ -38,12 +38,15 @@ Usage
     # Convenience factory
     target = make_target("gpt-4o-mini", system_prompt=AGENT_PROMPT)
     target = make_target("lmsys/vicuna-7b-v1.5", system_prompt=AGENT_PROMPT, backend="local")
+
+    # Kaggle Benchmarks target (inside a @kbench.task; see KaggleLLM)
+    target = make_target("kaggle/google/gemini-2.5-flash", system_prompt=AGENT_PROMPT)
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from .llm_unified import APILLM, LocalLLM, UnifiedLLM
+from .llm_unified import APILLM, KAGGLE_PREFIX, KaggleLLM, LocalLLM, UnifiedLLM, make_llm
 from .victim import Victim
 
 
@@ -188,7 +191,8 @@ def make_target(
         max_tokens:      Default 500.
         api_key:         Override API key env-var lookup. APILLM only.
         metis_location:  "ir" | "global". APILLM only.
-        backend:         "api" (default) | "local".
+        backend:         "api" (default) | "local" | "kaggle". A ``kaggle/`` model
+                         prefix selects the Kaggle backend on its own.
         extra_messages:  Extra messages inserted before user turn. APILLM only.
         **local_kwargs:  Extra kwargs forwarded to LocalLLM (device_map, torch_dtype, etc.).
 
@@ -198,23 +202,17 @@ def make_target(
     Example:
         target = make_target("gpt-4o-mini", system_prompt="You are an email agent.")
         target = make_target("lmsys/vicuna-7b-v1.5", backend="local", device_map="cuda:0")
+        target = make_target("kaggle/google/gemini-2.5-flash", system_prompt=AGENT_PROMPT)
     """
-    if backend == "local":
-        llm: UnifiedLLM = LocalLLM(
-            model=model,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **local_kwargs,
-        )
-    else:
-        llm = APILLM(
-            model=model,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            api_key=api_key,
-            metis_location=metis_location,
-            extra_messages=extra_messages,
-        )
+    llm = make_llm(
+        model,
+        backend=backend,
+        system_prompt=system_prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        api_key=api_key,
+        metis_location=metis_location,
+        extra_messages=extra_messages,
+        **local_kwargs,
+    )
     return TargetLLM(llm, system_prompt_template=system_prompt_template)

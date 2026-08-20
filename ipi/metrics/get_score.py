@@ -24,7 +24,7 @@ from typing import Optional, Union
 
 from ..config import JUDGE_TEMP, JUDGE_MAX_TOKENS
 from ..datasets import Instance
-from ..llm_unified import APILLM, UnifiedLLM
+from ..llm_unified import UnifiedLLM, make_llm
 from ..seed import SeedTemplate, render
 from .base import Evaluator, get_attr
 
@@ -57,7 +57,8 @@ class EvaluatorGenerativeGetScore(Evaluator):
 
     Args:
         model:          A ``UnifiedLLM``, or a litellm model string to wrap in an
-                        ``APILLM``. Pass a ``LocalLLM`` to judge without API calls.
+                        ``APILLM`` — or a ``KaggleLLM`` for a ``kaggle/`` prefix.
+                        Pass a ``LocalLLM`` to judge without API calls.
         system_prompt:  ``None`` = ``judge.PAIR.original`` from the seed registry. Any
                         ``{query}`` in it is filled with the instance's goal.
         prompt_pattern: ``None`` = upstream's ``[PROMPT]:… [ASSISTANT'S RESPONSE]:…``.
@@ -90,7 +91,7 @@ class EvaluatorGenerativeGetScore(Evaluator):
     ):
         super().__init__(eval_model=(
             model if isinstance(model, UnifiedLLM)
-            else APILLM(model=model, temperature=JUDGE_TEMP, max_tokens=JUDGE_MAX_TOKENS)
+            else make_llm(model, temperature=JUDGE_TEMP, max_tokens=JUDGE_MAX_TOKENS)
         ))
         self.system_prompt = (
             _judge_prompt("PAIR", "original") if system_prompt is None else system_prompt)

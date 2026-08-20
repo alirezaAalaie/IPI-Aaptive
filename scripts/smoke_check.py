@@ -2236,6 +2236,99 @@ def _e2e_evaluator():
     assert res.utility_rate is not None, "utility rate went missing"
 
 
+@check("KaggleLLM: dispatch, version resolution, chat isolation, no logprobs")
+def _kaggle_llm():
+    """
+    The Kaggle Benchmarks backend, against a stub ``kaggle_benchmarks``.
+
+    ``kbench`` only exists inside a Kaggle Benchmarks notebook, so the adapter can never
+    be exercised for real here. What is checkable — and what actually breaks — is the
+    plumbing: that ``kaggle/`` routes to ``KaggleLLM`` everywhere a model string is
+    accepted, that an un-versioned id finds the versioned key, that every call gets its
+    own ``Chat`` (a shared one would feed candidate N the whole earlier search), and that
+    ``prompt()`` is only handed kwargs its live signature declares.
+    """
+    import contextlib
+    import types
+
+    from ipi.llm_unified import (
+        APILLM, KaggleLLM, LogprobNotSupportedError, make_llm, resolve_kaggle_model_id)
+
+    keys = ["google/gemini-2.5-flash", "openai/gpt-5.4-mini-2026-03-17",
+            "anthropic/claude-opus-5@default"]
+    assert resolve_kaggle_model_id("google/gemini-2.5-flash", keys) == keys[0]
+    assert resolve_kaggle_model_id("kaggle/openai/gpt-5.4-mini", keys) == keys[1], \
+        "a trailing release date must not stop an un-versioned id from resolving"
+    assert resolve_kaggle_model_id("anthropic/claude-opus-5", keys) == keys[2]
+    for bad in ("openai/gpt-5.4", "nope/nope"):
+        try:
+            resolve_kaggle_model_id(bad, keys)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} must not resolve — prefix matching would guess")
+
+    calls: list = []
+
+    class _Llm:
+        def prompt(self, text, temperature=None, max_tokens=None):
+            calls.append(("prompt", text, temperature, max_tokens))
+            return " reply "
+
+        def send(self, text):
+            calls.append(("assistant", text))
+
+    class _Chats:
+        @contextlib.contextmanager
+        def new(self, name):
+            calls.append(("chat", name))
+            yield
+
+    stub = types.ModuleType("kaggle_benchmarks")
+    stub.llms = {k: _Llm() for k in keys}
+    stub.user = types.SimpleNamespace(send=lambda t: calls.append(("user", t)))
+    stub.chats = _Chats()
+    saved = sys.modules.get("kaggle_benchmarks")
+    sys.modules["kaggle_benchmarks"] = stub
+    try:
+        assert isinstance(make_llm("kaggle/google/gemini-2.5-flash"), KaggleLLM)
+        assert isinstance(make_llm("gpt-4o-mini"), APILLM), "only the prefix routes to Kaggle"
+        # api_key is meaningless on Kaggle and must be dropped, not raise.
+        llm = make_llm("kaggle/openai/gpt-5.4-mini", temperature=0.3, api_key="unused")
+
+        out = llm.generate([
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"},
+        ], max_tokens=64)
+        assert out == "reply", f"response not stripped: {out!r}"
+        assert calls[0][0] == "chat"
+        assert calls[1] == ("user", "one") and calls[2] == ("assistant", "two")
+        kind, text, temp, mt = calls[3]
+        assert kind == "prompt" and temp == 0.3 and mt == 64
+        assert text == "SYS\n\nthree", \
+            "no system argument on prompt() means the system turn folds into the user turn"
+
+        first_chat = calls[0][1]
+        calls.clear()
+        llm.generate([{"role": "user", "content": "again"}])
+        assert calls[0][0] == "chat" and calls[0][1] != first_chat, \
+            "each call needs its own Chat or the transcript leaks across candidates"
+
+        try:
+            llm.get_first_token_logprobs([{"role": "user", "content": "x"}])
+        except LogprobNotSupportedError:
+            pass
+        else:
+            raise AssertionError("Kaggle exposes no logprobs — RS/Beam-RS must be gated out")
+    finally:
+        if saved is None:
+            del sys.modules["kaggle_benchmarks"]
+        else:
+            sys.modules["kaggle_benchmarks"] = saved
+
+
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
