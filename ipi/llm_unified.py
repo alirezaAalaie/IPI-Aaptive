@@ -5,10 +5,11 @@ UnifiedLLM — abstract base class. Holds shared config and concrete helpers
              (__call__, get_logprob, get_response, chat, __repr__).
              Subclass with APILLM or LocalLLM.
 
-APILLM     — API-backed model (litellm / OpenAI-compat / Metis proxy / OpenRouter).
-             Supports: openai, anthropic, google/gemini, deepseek, openrouter,
-                       metis_openai, metis_deepseek, metis_gemini,
-                       and any raw litellm model string.
+APILLM     — API-backed model (litellm / OpenAI-compat / Metis proxy / OpenRouter /
+             native google-genai for Google AI Studio).
+             Supports: openai, anthropic, google/gemini (direct, via google-genai —
+                       not litellm), deepseek, openrouter, metis_openai,
+                       metis_deepseek, metis_gemini, and any raw litellm model string.
              Logprob support: openai, metis_openai, deepseek, metis_deepseek, openrouter.
              Use: APILLM("gpt-4o-mini", system_prompt="...")
 
@@ -83,9 +84,9 @@ _METIS_OPENAI_PATH   = "/openai/v1"
 _METIS_DEEPSEEK_PATH = "/deepseek/v1"
 
 _LITELLM_PREFIXES: dict[str, str] = {
-    "google":   "gemini/",
     "deepseek": "deepseek/",
-    # openai, anthropic, litellm → no prefix
+    # openai, anthropic, litellm → no prefix. google is handled natively
+    # (_google_generate), not through litellm — see APILLM._api_generate.
 }
 
 
@@ -380,7 +381,8 @@ class UnifiedLLM(ABC):
 
 class APILLM(UnifiedLLM):
     """
-    API-backed LLM using litellm or direct OpenAI-compatible SDK.
+    API-backed LLM using litellm, direct OpenAI-compatible SDK, or (for google)
+    the native google-genai SDK against Google AI Studio.
 
     Supports all providers in KNOWN_MODELS plus any raw litellm model string.
     Logprob access: openai, metis_openai, deepseek, metis_deepseek.
@@ -437,6 +439,8 @@ class APILLM(UnifiedLLM):
             return self._openai_compat_generate(messages, max_tokens, temperature, top_p)
         if provider == "metis_gemini":
             return self._metis_gemini_generate(messages, max_tokens, temperature)
+        if provider == "google":
+            return self._google_generate(messages, max_tokens, temperature, top_p)
 
         import litellm
         kwargs: dict = dict(
@@ -480,6 +484,54 @@ class APILLM(UnifiedLLM):
 
         resp = client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content.strip()
+
+    def _google_generate(
+        self,
+        messages: list[dict],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> str:
+        """Direct Google AI Studio call via the ``google-genai`` SDK — no litellm.
+
+        Reads GOOGLE_API_KEY the same way the rest of APILLM resolves keys
+        (self._api_key, from ``_ENV_VARS``); ``genai.Client(api_key=...)`` talks
+        to the Gemini Developer API directly, not Vertex.
+        """
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise ImportError(
+                "google-genai is required for the 'google' provider. "
+                "Install: pip install google-genai"
+            ) from exc
+
+        client = genai.Client(api_key=self._api_key) if self._api_key else genai.Client()
+
+        system_text = ""
+        contents: list = []
+        for m in messages:
+            if m["role"] == "system":
+                system_text = f"{system_text}\n{m['content']}" if system_text else m["content"]
+            else:
+                role = "user" if m["role"] == "user" else "model"
+                contents.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
+
+        config_kwargs: dict = dict(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+            top_p=top_p,
+        )
+        if system_text:
+            config_kwargs["system_instruction"] = system_text
+
+        resp = client.models.generate_content(
+            model=self._spec.model_id,
+            contents=contents,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+        return resp.text.strip()
 
     def _metis_gemini_generate(
         self,

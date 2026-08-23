@@ -22,6 +22,10 @@ local = [
 agentdojo = [
     "agentdojo>=0.1",
 ]
+# Native Google AI Studio access for APILLM's "google" provider (no litellm).
+google = [
+    "google-genai>=1.0",
+]
 # PISanitizer reconstructs attention from model internals (torch/transformers)
 # and finds peaks in the resulting signal (scipy).
 pisanitizer = [
