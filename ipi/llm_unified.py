@@ -98,8 +98,9 @@ class ModelSpec:
 
 
 KNOWN_MODELS: dict[str, ModelSpec] = {
-    # ---- Google (Gemini API) ----
+    # ---- Google (Gemini API, Google AI Studio) ----
     "gemini-2.5-flash-lite":  ModelSpec("google",   "gemini-2.5-flash-lite"),
+    "gemini-2.5-flash":       ModelSpec("google",   "gemini-2.5-flash"),
     "gemma-3-27b-it":         ModelSpec("google",   "gemma-3-27b-it"),
     "gemini-2.0-flash":       ModelSpec("google",   "gemini-2.0-flash"),
     "gemini-2.5-pro":         ModelSpec("google",   "gemini-2.5-pro"),
