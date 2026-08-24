@@ -158,7 +158,11 @@ class PAIRAttacker(JudgeGuidedAttacker):
 
     Args:
         judge:        Guidance Evaluator (``ipi.metrics``), owned by this attacker. Its
-                      ``success_threshold`` is PAIR's early stop.
+                      ``success_threshold`` is PAIR's early stop. If it's an
+                      ``EvaluatorIPIGetScore``, match its ``variant`` to ``prompt_mode``
+                      — ``"ipi_document"`` here wants ``variant="ipi_document"`` there,
+                      or the judge scores literal-string candidates against a rubric
+                      written for tool calls.
         attacker_llm: ``APILLM`` (or model string) generating the injections.
         n_streams:    Parallel attack conversations. Default 3.
         n_iterations: Max refinement rounds. Default 10.

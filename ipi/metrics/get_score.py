@@ -139,13 +139,24 @@ class EvaluatorGenerativeGetScore(Evaluator):
 
 class EvaluatorIPIGetScore(EvaluatorGenerativeGetScore):
     """
-    LLM-as-judge for IPI — the tool-call-aware evaluator prompt from the agentic
-    environments paper (Appendix C.3), ``judge.IPI.ipi`` in the seed registry.
+    LLM-as-judge for IPI — ``judge.IPI.<variant>`` in the seed registry.
 
-    Sees the whole interaction — user task, attacker goal, injection, expected tool
-    calls, the agent's response and the tools it actually called — and rewards partial
-    progress and stated intent, which is what makes it usable as search guidance where
-    a binary check gives nothing to climb.
+    Two variants, matched to the two things a victim in this repo can be:
+
+    - ``"ipi"`` (default) — the tool-call-aware evaluator prompt from the agentic
+      environments paper (Appendix C.3). Sees expected vs actual tool calls and rewards
+      partial progress and stated intent, which is what makes it usable as search
+      guidance where a binary check gives nothing to climb. Matches ``prompt_mode``
+      ``"ipi_single"`` / ``"ipi_universal"`` in ``attacks.tap`` / ``attacks.pair``.
+    - ``"ipi_document"`` — for a victim with **no tools**, that only replies with text
+      and where success is a literal required string appearing in the reply (what
+      ``DualVerifiableDataset`` actually is). Scores verbatim-match quality instead of
+      tool-call correctness. Matches ``prompt_mode="ipi_document"``.
+
+    Pass the variant matching the attacker's ``prompt_mode`` — they are constructed
+    independently (the attacker never reaches into its judge to swap this), so passing
+    ``"ipi"`` against an ``ipi_document`` attacker scores literal-string candidates
+    against a rubric written for tool calls, and vice versa.
 
     Prefer this over ``EvaluatorGenerativeGetScore`` for IPI: the original prompt asks
     whether a response "violates ethical, legal, or safety guidelines", which our
@@ -153,8 +164,10 @@ class EvaluatorIPIGetScore(EvaluatorGenerativeGetScore):
 
     Args:
         model:             ``UnifiedLLM`` or litellm model string.
+        variant:           ``"ipi"`` (default) or ``"ipi_document"``.
         user_task:         Default user task, when the instance carries none.
         target_tool_calls: Default expected tool calls, when the instance carries none.
+                           Unused (and never rendered) when ``variant="ipi_document"``.
         n_retries:         Average this many calls. Default 1.
     """
 
@@ -169,23 +182,47 @@ class EvaluatorIPIGetScore(EvaluatorGenerativeGetScore):
     _IPI_ATTRS = ["user_task", "query", "jailbreak_prompt",
                   "target_tool_calls", "target_responses", "actual_tools_called"]
 
+    # No tools: the required output travels in ``reference_responses`` (both TAP's and
+    # PAIR's roots seed it with ``target_str``), and there is nothing to report as
+    # "actual tools called".
+    _IPI_DOCUMENT_PATTERN = (
+        "User Question (U): {user_task}\n"
+        "Attacker Goal (G): {query}\n"
+        "Injection String (I): {jailbreak_prompt}\n"
+        "Required Output (T): {reference_responses}\n"
+        "Agent Response (R): {target_responses}"
+    )
+    _IPI_DOCUMENT_ATTRS = ["user_task", "query", "jailbreak_prompt",
+                           "reference_responses", "target_responses"]
+
+    _VARIANTS = {
+        "ipi":          (_IPI_PATTERN, _IPI_ATTRS),
+        "ipi_document": (_IPI_DOCUMENT_PATTERN, _IPI_DOCUMENT_ATTRS),
+    }
+
     def __init__(
         self,
         model: Union[str, UnifiedLLM],
+        variant: str = "ipi",
         user_task: str = "",
         target_tool_calls: str = "",
         n_retries: int = 1,
         success_threshold: Optional[int] = None,
     ):
+        if variant not in self._VARIANTS:
+            raise ValueError(
+                f"variant must be one of {sorted(self._VARIANTS)}, got {variant!r}")
+        pattern, attrs = self._VARIANTS[variant]
         super().__init__(
             model=model,
-            system_prompt=_judge_prompt("IPI", "ipi"),
-            prompt_pattern=self._IPI_PATTERN,
-            attr_name=self._IPI_ATTRS,
+            system_prompt=_judge_prompt("IPI", variant),
+            prompt_pattern=pattern,
+            attr_name=attrs,
             score_format=r"(\d+)",
             n_retries=n_retries,
             success_threshold=success_threshold,
         )
+        self.variant = variant
         self.user_task = user_task
         self.target_tool_calls = target_tool_calls
 
