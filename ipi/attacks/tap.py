@@ -197,7 +197,12 @@ class TAPAttacker(JudgeGuidedAttacker):
 
     Args:
         judge:            Guidance Evaluator (``ipi.metrics``), owned by this attacker.
-                          Its ``success_threshold`` is TAP's early stop.
+                          Its ``success_threshold`` is TAP's early stop. If it's an
+                          ``EvaluatorIPIGetScore``, match its ``variant`` to
+                          ``prompt_mode`` — ``"ipi_document"`` here wants
+                          ``variant="ipi_document"`` there, or the judge scores
+                          literal-string candidates against a rubric written for tool
+                          calls.
         attacker_llm:     ``UnifiedLLM`` (or model string, ``kaggle/`` included)
                           generating the injections.
         depth:            Maximum tree depth. Default 10.
