@@ -22,9 +22,12 @@ into the next one's ``num_jailbreak``.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 from ..datasets import Instance
 from ..victim import Victim
@@ -32,7 +35,7 @@ from .judge import EvaluatorIPISuccess, EvaluatorUserUtility
 
 log = logging.getLogger(__name__)
 
-__all__ = ["ScenarioResult", "EvalResult", "AttackEvaluator"]
+__all__ = ["ScenarioResult", "EvalResult", "AttackEvaluator", "evaluate_saved_results"]
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +50,7 @@ class ScenarioResult:
     Attributes:
         scenario_id:     The scenario's id string.
         goal:            The attacker's injection goal.
-        success:         Whether the attack was considered successful (ASR).
+        success:         Whether the attack was considered successful (ASR), or None if deferred.
         score:           Best guidance score achieved (1-10).
         injection:       The best injection string found.
         target_response: Agent response to the best injection.
@@ -60,7 +63,7 @@ class ScenarioResult:
     """
     scenario_id:     str
     goal:            str
-    success:         bool
+    success:         Optional[bool]
     score:           int
     injection:       str
     target_response: str
@@ -79,10 +82,10 @@ class EvalResult:
 
     Attributes:
         attack:          Attack name.
-        asr:             Attack success rate (n_success / n_total).
+        asr:             Attack success rate (n_success / n_total), or None if deferred.
         avg_score:       Average best score.
         avg_queries:     Average target queries per scenario.
-        n_success:       Number of successful attacks.
+        n_success:       Number of successful attacks, or None if deferred.
         n_total:         Total scenarios evaluated.
         utility_rate:    Optional User Utility success rate, over the scenarios that
                          actually carry a ``user_target`` — NOT over n_total. A
@@ -94,21 +97,25 @@ class EvalResult:
                          packaged benchmark (all 360 carry a user_target).
         results:         Per-scenario ScenarioResult list.
     """
-    attack:       str
-    asr:          float
-    avg_score:    float
-    avg_queries:  float
-    n_success:    int
-    n_total:      int
+    attack:          str
+    asr:             Optional[float]
+    avg_score:       float
+    avg_queries:     float
+    n_success:       Optional[int]
+    n_total:         int
     utility_rate:    Optional[float] = None
     n_utility:       Optional[int] = None
     n_utility_total: Optional[int] = None
     results:         list[ScenarioResult] = field(default_factory=list)
 
     def summary(self) -> str:
+        if self.asr is None:
+            asr_line = "ASR:          Pending evaluation (deferred judging)"
+        else:
+            asr_line = f"ASR:          {self.asr:.1%}  ({self.n_success}/{self.n_total})"
         s = (
             f"Attack:       {self.attack}\n"
-            f"ASR:          {self.asr:.1%}  ({self.n_success}/{self.n_total})\n"
+            f"{asr_line}\n"
         )
         if self.utility_rate is not None and self.n_utility is not None:
             # The denominator is the labelled subset, not n_total — printing n_total
@@ -125,10 +132,10 @@ class EvalResult:
         return s
 
     def failed_scenarios(self) -> list[ScenarioResult]:
-        return [r for r in self.results if not r.success]
+        return [r for r in self.results if r.success is False]
 
     def successful_scenarios(self) -> list[ScenarioResult]:
-        return [r for r in self.results if r.success]
+        return [r for r in self.results if r.success is True]
 
     def to_dict(self) -> dict:
         """Convert EvalResult to a structured JSON-serializable dictionary."""
@@ -154,6 +161,8 @@ class EvalResult:
                 "user_target": r.extra.get("user_target", ""),
                 "injection_goal": r.goal,
                 "target_str": r.extra.get("target_str", ""),
+                "judge_question": r.extra.get("judge_question", ""),
+                "attack_eval_mode": r.extra.get("attack_eval_mode", "contains"),
                 "optimization_target": r.extra.get("optimization_target", ""),
                 "attack_str": r.injection,
                 "final_prompt": r.final_prompt if r.final_prompt is not None else r.extra.get("final_prompt"),
@@ -305,11 +314,13 @@ class AttackEvaluator:
         attacker,
         verbose: bool = False,
         success_fn: Optional[Callable[[str, str], bool]] = None,
+        deferred_judging: bool = False,
     ):
         self.target     = target
         self.attacker   = attacker
         self.verbose    = verbose
         self.success_fn = success_fn   # None → the default EvaluatorIPISuccess
+        self.deferred_judging = deferred_judging
         self.success_evaluator = EvaluatorIPISuccess()
         self.utility_evaluator = EvaluatorUserUtility()
 
@@ -368,9 +379,13 @@ class AttackEvaluator:
             attrs = instance.attack_attrs
             try:
                 r = self.attacker.run_scenario(self.target, instance, verbose=self.verbose)
-                # Override success: the evaluator owns this, not the attack's judge
-                r.success = self._check_success(r.target_response, instance)
-                r.utility_success = self._check_utility(r.target_response, instance)
+                if self.deferred_judging:
+                    r.success = None
+                    r.utility_success = None
+                else:
+                    # Override success: the evaluator owns this, not the attack's judge
+                    r.success = self._check_success(r.target_response, instance)
+                    r.utility_success = self._check_utility(r.target_response, instance)
 
                 # The messages the model saw for the injection this row reports —
                 # rebuilt from that injection, not read back off the last call.
@@ -386,6 +401,10 @@ class AttackEvaluator:
                 r.extra["user_target"] = attrs.get("user_target", "")
                 r.extra["target_str"] = attrs.get("target_str", "")
                 r.extra["optimization_target"] = attrs.get("optimization_target", "")
+                r.extra["judge_question"] = attrs.get("judge_question", "")
+                r.extra["attack_eval_mode"] = attrs.get("attack_eval_mode", "")
+                r.extra["user_eval_mode"] = attrs.get("user_eval_mode", "contains")
+                r.extra["model_response"] = r.target_response
                 r.extra["final_prompt"] = final_prompt
                 r.extra["final_prompt_source"] = prompt_source
                 r.extra["defense_name"] = def_label
@@ -394,20 +413,28 @@ class AttackEvaluator:
             except Exception as e:
                 log.error("[AttackEvaluator] %s instance=%s error: %s",
                           attack_name, instance.id, e)
+                def_label = defense_name or type(self.target).__name__
+                success_val = None if self.deferred_judging else False
                 results.append(ScenarioResult(
                     scenario_id=instance.id, goal=instance.query or "",
-                    success=False, score=0, injection="", target_response="",
+                    success=success_val, score=0, injection="", target_response="",
                     # utility_success stays None: an attack that crashed produced no
                     # response to judge, and False here would enter the utility
                     # denominator as a failure — on a dataset with no utility labels
                     # that turns "no utility line" into "Utility Rate: 0.0%".
                     n_queries=0, attack=attack_name, utility_success=None,
+                    defense_name=def_label,
                     extra={
                         "error": str(e),
                         "user_task": attrs.get("user_task", ""),
                         "user_target": attrs.get("user_target", ""),
                         "target_str": attrs.get("target_str", ""),
                         "optimization_target": attrs.get("optimization_target", ""),
+                        "judge_question": attrs.get("judge_question", ""),
+                        "attack_eval_mode": attrs.get("attack_eval_mode", ""),
+                        "user_eval_mode": attrs.get("user_eval_mode", "contains"),
+                        "model_response": "",
+                        "defense_name": def_label,
                     },
                 ))
 
@@ -421,9 +448,15 @@ class AttackEvaluator:
 
     @staticmethod
     def _aggregate(attack: str, results: list[ScenarioResult]) -> EvalResult:
-        n_total   = len(results)
-        n_success = sum(1 for r in results if r.success)
-        asr         = n_success / n_total if n_total else 0.0
+        n_total = len(results)
+        evaluated_success = [r.success for r in results if r.success is not None]
+        if not evaluated_success and n_total > 0:
+            n_success = None
+            asr = None
+        else:
+            n_success = sum(1 for s in evaluated_success if s)
+            asr = n_success / n_total if n_total else 0.0
+
         avg_score   = sum(r.score     for r in results) / n_total if n_total else 0.0
         avg_queries = sum(r.n_queries for r in results) / n_total if n_total else 0.0
 
@@ -443,3 +476,189 @@ class AttackEvaluator:
             utility_rate=utility_rate, n_utility=n_utility,
             n_utility_total=n_utility_total, results=results,
         )
+
+
+def evaluate_saved_results(
+    data_or_path: Union[str, os.PathLike, dict, EvalResult, list],
+    judge: Optional[Any] = None,
+    output_path: Optional[str] = None,
+) -> EvalResult:
+    """
+    Evaluate previously generated model responses and calculate ASR and utility.
+
+    Enables decoupled/deferred judging so that model generation can run without
+    an active judge model or network connection, and evaluation can be performed
+    later deterministically or via an LLM judge.
+
+    Args:
+        data_or_path: File path (str or Path), dictionary, list of records, or EvalResult.
+        judge:        Judge evaluator (defaults to EvaluatorCyberSecEvalJudge()).
+        output_path:  Optional path to save updated evaluation results JSON.
+
+    Returns:
+        Updated EvalResult with computed ASR, utility rate, and per-scenario results.
+    """
+    from .checks import check_ipi_success, check_user_utility
+    from .judge import EvaluatorCyberSecEvalJudge
+
+    if judge is None:
+        judge = EvaluatorCyberSecEvalJudge()
+
+    raw_data: dict
+    if isinstance(data_or_path, (str, os.PathLike)):
+        with open(data_or_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, list):
+            raw_data = {"results": loaded}
+        elif isinstance(loaded, dict):
+            raw_data = loaded
+        else:
+            raise ValueError(f"Invalid JSON content in {data_or_path}")
+    elif isinstance(data_or_path, EvalResult):
+        raw_data = data_or_path.to_dict()
+    elif isinstance(data_or_path, dict):
+        raw_data = dict(data_or_path)
+    elif isinstance(data_or_path, list):
+        raw_data = {"results": data_or_path}
+    else:
+        raise TypeError(f"Unsupported type for data_or_path: {type(data_or_path)}")
+
+    if "results" in raw_data and isinstance(raw_data["results"], list):
+        records = raw_data["results"]
+    elif "rows" in raw_data and isinstance(raw_data["rows"], list):
+        records = raw_data["rows"]
+    else:
+        records = [raw_data]
+
+    attack_name = raw_data.get("attack") or "evaluation"
+
+    scenario_results: list[ScenarioResult] = []
+    for record in records:
+        if isinstance(record, ScenarioResult):
+            model_response = record.target_response
+            extra = record.extra
+            judge_question = extra.get("judge_question", "")
+            target_str = extra.get("target_str", "")
+            eval_mode = extra.get("attack_eval_mode", "contains")
+            user_target = extra.get("user_target", "")
+            user_eval_mode = extra.get("user_eval_mode", "contains")
+            rec_attack = record.attack
+            rec_id = record.scenario_id
+            rec_goal = record.goal
+            rec_score = record.score
+            rec_injection = record.injection
+            rec_queries = record.n_queries
+            rec_def = record.defense_name
+            rec_final_prompt = record.final_prompt
+        elif isinstance(record, dict):
+            extra = record.get("extra", {}) if isinstance(record.get("extra"), dict) else {}
+            model_response = record.get("model_response")
+            if model_response is None:
+                model_response = record.get("target_response", "")
+            judge_question = record.get("judge_question") or extra.get("judge_question", "")
+            target_str = record.get("target_str") or extra.get("target_str", "")
+            eval_mode = record.get("attack_eval_mode") or extra.get("attack_eval_mode", "contains")
+            user_target = record.get("user_target") or extra.get("user_target", "")
+            user_eval_mode = record.get("user_eval_mode") or extra.get("user_eval_mode", "contains")
+            rec_attack = record.get("attack") or attack_name
+            rec_id = str(record.get("scenario_id", ""))
+            rec_goal = str(record.get("injection_goal") or record.get("goal", ""))
+            rec_score = int(record.get("score", 0))
+            rec_injection = str(record.get("attack_str") or record.get("injection", ""))
+            rec_queries = int(record.get("n_queries", 0))
+            rec_def = record.get("defense_name")
+            rec_final_prompt = record.get("final_prompt")
+        else:
+            continue
+
+        # Evaluate attack success
+        if judge_question:
+            if hasattr(judge, "judge"):
+                atk_success = judge.judge(
+                    model_response,
+                    judge_question=judge_question,
+                    target_str=target_str,
+                )
+            elif hasattr(judge, "check"):
+                atk_success = judge.check(
+                    model_response,
+                    target_str=target_str,
+                    judge_question=judge_question,
+                )
+            elif callable(judge):
+                try:
+                    atk_success = bool(judge(model_response, judge_question=judge_question, target_str=target_str))
+                except TypeError:
+                    atk_success = bool(judge(model_response, target_str))
+            else:
+                atk_success = False
+        else:
+            atk_success = check_ipi_success(model_response, target_str, eval_mode)
+
+        # Evaluate user utility
+        if user_target:
+            util_success = check_user_utility(model_response, user_target, user_eval_mode)
+        else:
+            util_success = None
+
+        if isinstance(record, dict):
+            record["attack_success"] = atk_success
+            record["utility_success"] = util_success
+            if "success" in record:
+                record["success"] = atk_success
+        elif isinstance(record, ScenarioResult):
+            record.success = atk_success
+            record.utility_success = util_success
+
+        sr = ScenarioResult(
+            scenario_id=rec_id,
+            goal=rec_goal,
+            success=atk_success,
+            score=rec_score,
+            injection=rec_injection,
+            target_response=str(model_response),
+            n_queries=rec_queries,
+            attack=str(rec_attack),
+            utility_success=util_success,
+            final_prompt=rec_final_prompt,
+            defense_name=rec_def,
+            extra=dict(extra),
+        )
+        sr.extra["user_task"] = record.get("user_task", extra.get("user_task", "")) if isinstance(record, dict) else extra.get("user_task", "")
+        sr.extra["user_target"] = user_target
+        sr.extra["target_str"] = target_str
+        sr.extra["judge_question"] = judge_question
+        sr.extra["attack_eval_mode"] = eval_mode
+        sr.extra["user_eval_mode"] = user_eval_mode
+        sr.extra["defense_name"] = rec_def or extra.get("defense_name", "")
+        sr.extra["model_response"] = model_response
+        scenario_results.append(sr)
+
+    eval_result = AttackEvaluator._aggregate(attack_name, scenario_results)
+
+    if output_path is not None:
+        raw_data["attack"] = eval_result.attack
+        raw_data["asr"] = eval_result.asr
+        raw_data["n_success"] = eval_result.n_success
+        raw_data["n_total"] = eval_result.n_total
+        raw_data["avg_score"] = eval_result.avg_score
+        raw_data["avg_queries"] = eval_result.avg_queries
+        if eval_result.utility_rate is not None:
+            raw_data["utility_rate"] = eval_result.utility_rate
+            raw_data["n_utility"] = eval_result.n_utility
+            raw_data["n_utility_total"] = eval_result.n_utility_total
+        if "results" in raw_data:
+            raw_data["results"] = eval_result.to_dict()["results"]
+        elif "rows" in raw_data:
+            raw_data["rows"] = records
+        else:
+            raw_data["results"] = eval_result.to_dict()["results"]
+
+        parent_dir = os.path.dirname(os.path.abspath(output_path))
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(raw_data, f, indent=2, default=str)
+        log.info("Saved updated evaluation results to %s", output_path)
+
+    return eval_result
