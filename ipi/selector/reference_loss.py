@@ -192,6 +192,7 @@ class ReferenceLossSelector(SelectPolicy):
         """
         import torch
         import torch.nn.functional as F
+        from .token_loss import forward_last_logits
 
         rows, input_rows, label_rows, mask_rows = self._build_batch(instances)
 
@@ -208,20 +209,33 @@ class ReferenceLossSelector(SelectPolicy):
         labels    = torch.tensor(label_rows, dtype=torch.long, device=device)
         attention = torch.tensor(mask_rows,  dtype=torch.long, device=device)
 
-        with torch.no_grad():
-            logits = model(input_ids=input_ids, attention_mask=attention,
-                           use_cache=False).logits
+        max_len = input_ids.shape[1]
+        target_positions = [
+            pos for label_row in label_rows for pos, val in enumerate(label_row) if val != -100
+        ]
+        min_target_pos = min(target_positions) if target_positions else 0
+        keep = min(max_len, max(2, max_len - min_target_pos + 1))
 
-        shift_logits = logits[:, :-1, :].transpose(1, 2)      # B x V x (L-1)
-        shift_labels = labels[:, 1:]                          # B x (L-1)
+        with torch.no_grad():
+            logits = forward_last_logits(model, input_ids, keep)
+
+        shift_logits = logits[:, :-1, :].transpose(1, 2)      # B x V x (keep-1)
+        shift_labels = labels[:, -(keep - 1):]                # B x (keep-1)
         per_token = F.cross_entropy(shift_logits, shift_labels, reduction="none")
         valid = (shift_labels != -100)
-        losses = (per_token * valid).sum(dim=1) / valid.sum(dim=1)
+        losses = (per_token * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
 
         for row, i in enumerate(rows):
             instances[i]._loss = float(losses[row].item())
 
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_oom(exc: BaseException) -> bool:
+        s = str(exc).lower()
+        return isinstance(exc, RuntimeError) and (
+            "out of memory" in s or "unspecified launch failure" in s or "device-side assert" in s
+        )
 
     def score(self, dataset: AttackDataset) -> AttackDataset:
         """
@@ -231,12 +245,34 @@ class ReferenceLossSelector(SelectPolicy):
         search needs the whole fitness vector — AutoDAN's roulette wheel is over all of
         it — so the scoring pass is public on its own. Same batching, same masked-label
         formulation; the only difference is that nothing is discarded.
+
+        On CUDA OOM or kernel launch failure, the batch size is halved and the batch retried.
         """
         instances = list(dataset)
         # `or 1` guards the empty dataset: range(0, 0, 0) raises rather than doing nothing.
         size = self.batch_size or len(instances) or 1
-        for start in range(0, len(instances), size):
-            self._score_batch(instances[start: start + size])
+        start = 0
+        while start < len(instances):
+            batch = instances[start: start + size]
+            try:
+                self._score_batch(batch)
+            except Exception as exc:
+                if not self._is_oom(exc) or size <= 1:
+                    raise
+                size = max(1, size // 2)
+                self.batch_size = size
+                log.warning(
+                    "[ReferenceLossSelector] CUDA memory/kernel error scoring %d candidates — "
+                    "retrying at batch_size=%d for the rest of the run",
+                    len(batch), size,
+                )
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                continue
+            start += len(batch)
         return dataset
 
     def select(self, dataset: AttackDataset) -> AttackDataset:
