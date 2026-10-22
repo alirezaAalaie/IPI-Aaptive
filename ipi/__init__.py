@@ -201,6 +201,13 @@ from .defenses import (
     StruQDefense,
 )
 
+# ---- Logging ----
+from .logger import (
+    DualLogger,
+    setup_logging,
+    close_logging,
+)
+
 # ---- Simple high-level API ----
 
 # ---- Subpackage namespaces ----
@@ -277,6 +284,8 @@ __all__ = [
     # Harness helpers
     "make_target_fn", "attack_context", "resolve_optimization_target",
     "build_channeled_prompt", "build_victim_messages",
+    # Logging
+    "DualLogger", "setup_logging", "close_logging",
     # Simple API
 ]
 
