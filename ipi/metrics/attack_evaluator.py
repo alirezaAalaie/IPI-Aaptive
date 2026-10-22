@@ -660,11 +660,14 @@ def evaluate_saved_results(
         sr.extra["user_task"] = record.get("user_task", extra.get("user_task", "")) if isinstance(record, dict) else extra.get("user_task", "")
         sr.extra["user_target"] = user_target
         sr.extra["target_str"] = target_str
+        sr.extra["optimization_target"] = record.get("optimization_target", extra.get("optimization_target", "")) if isinstance(record, dict) else extra.get("optimization_target", "")
         sr.extra["judge_question"] = judge_question
         sr.extra["attack_eval_mode"] = eval_mode
         sr.extra["user_eval_mode"] = user_eval_mode
         sr.extra["defense_name"] = rec_def or extra.get("defense_name", "")
         sr.extra["model_response"] = model_response
+        if isinstance(record, dict) and "error" in record:
+            sr.extra["error"] = record["error"]
         scenario_results.append(sr)
 
     eval_result = AttackEvaluator._aggregate(attack_name, scenario_results)
