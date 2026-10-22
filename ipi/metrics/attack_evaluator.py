@@ -315,12 +315,14 @@ class AttackEvaluator:
         verbose: bool = False,
         success_fn: Optional[Callable[[str, str], bool]] = None,
         deferred_judging: bool = False,
+        progress: Union[bool, int] = False,
     ):
         self.target     = target
         self.attacker   = attacker
         self.verbose    = verbose
         self.success_fn = success_fn   # None → the default EvaluatorIPISuccess
         self.deferred_judging = deferred_judging
+        self.progress   = progress
         self.success_evaluator = EvaluatorIPISuccess()
         self.utility_evaluator = EvaluatorUserUtility()
 
@@ -360,6 +362,7 @@ class AttackEvaluator:
         save_file: bool = False,
         output_dir: str = "results",
         defense_name: Optional[str] = None,
+        progress: Optional[Union[bool, int]] = None,
     ) -> EvalResult:
         """
         Run the attacker on every instance in dataset.
@@ -372,10 +375,26 @@ class AttackEvaluator:
             save_file:    If True, automatically saves detailed JSON log to disk.
             output_dir:   Directory to save the evaluation file (default: "results").
             defense_name: Optional defense label for filename (defaults to target class name).
+            progress:     If True or int step > 0, prints progress percentages during execution.
         """
         attack_name = type(self.attacker).__name__.replace("Attacker", "").lower()
+        def_label = defense_name or type(self.target).__name__
+
+        total = len(dataset) if hasattr(dataset, "__len__") else None
+        show_progress = self.progress if progress is None else progress
+        if isinstance(show_progress, int) and show_progress > 0:
+            step = show_progress
+        elif show_progress:
+            step = max(1, total // 10) if total else 1
+        else:
+            step = None
+
         results: list[ScenarioResult] = []
-        for instance in dataset:
+        for idx, instance in enumerate(dataset, start=1):
+            if step and total:
+                if idx == 1 or idx % step == 0 or idx == total:
+                    pct = (idx / total) * 100
+                    print(f"[{def_label}] [{idx:02d}/{total:02d} ({pct:5.1f}%)] Processing scenario: {instance.id}")
             attrs = instance.attack_attrs
             try:
                 r = self.attacker.run_scenario(self.target, instance, verbose=self.verbose)
@@ -482,6 +501,7 @@ def evaluate_saved_results(
     data_or_path: Union[str, os.PathLike, dict, EvalResult, list],
     judge: Optional[Any] = None,
     output_path: Optional[str] = None,
+    progress: Union[bool, int] = False,
 ) -> EvalResult:
     """
     Evaluate previously generated model responses and calculate ASR and utility.
@@ -494,6 +514,7 @@ def evaluate_saved_results(
         data_or_path: File path (str or Path), dictionary, list of records, or EvalResult.
         judge:        Judge evaluator (defaults to EvaluatorCyberSecEvalJudge()).
         output_path:  Optional path to save updated evaluation results JSON.
+        progress:     If True or int step > 0, prints evaluation progress percentages.
 
     Returns:
         Updated EvalResult with computed ASR, utility rate, and per-scenario results.
@@ -532,8 +553,20 @@ def evaluate_saved_results(
 
     attack_name = raw_data.get("attack") or "evaluation"
 
+    total = len(records)
+    if isinstance(progress, int) and progress > 0:
+        step = progress
+    elif progress:
+        step = max(1, total // 10) if total else 1
+    else:
+        step = None
+
     scenario_results: list[ScenarioResult] = []
-    for record in records:
+    for idx, record in enumerate(records, start=1):
+        if step and total:
+            if idx == 1 or idx % step == 0 or idx == total:
+                pct = (idx / total) * 100
+                print(f"[{attack_name}] Adjudicating: [{idx:02d}/{total:02d} ({pct:5.1f}%)]")
         if isinstance(record, ScenarioResult):
             model_response = record.target_response
             extra = record.extra
