@@ -149,8 +149,15 @@ from .attacks import (
 )
 
 # ---- Dataset (the carrier) ----
-from .datasets import Instance, AttackDataset
-from .datasets import DualVerifiableDataset, load_dual_verifiable
+from .datasets import (
+    Instance,
+    AttackDataset,
+    DualVerifiableDataset,
+    load_dual_verifiable,
+    CyberSecEval2Dataset,
+    load_cyberseceval2,
+    extract_target_from_judge_question,
+)
 
 # ---- Metrics (success + guidance) ----
 from .metrics import (
@@ -169,9 +176,11 @@ from .metrics import (
     EvaluatorPrefixExactMatch,
     EvaluatorPatternJudge,
     EvaluatorKeywordJudge,
+    EvaluatorCyberSecEvalJudge,
     ScenarioResult,
     EvalResult,
     AttackEvaluator,
+    evaluate_saved_results,
 )
 
 # ---- Harness helpers (Instance -> Victim plumbing) ----
@@ -249,6 +258,7 @@ __all__ = [
     "build_fake_completion_injection", "build_combined_injection",
     # Dataset — the carrier
     "Instance", "AttackDataset", "DualVerifiableDataset", "load_dual_verifiable",
+    "CyberSecEval2Dataset", "load_cyberseceval2", "extract_target_from_judge_question",
     # Metrics — primitives
     "Evaluator",
     "check_function_name", "check_exact_function_call", "check_ipi_success",
@@ -258,8 +268,9 @@ __all__ = [
     "EvaluatorEditDistanceGetScore",
     "EvaluatorIPISuccess", "EvaluatorUserUtility", "EvaluatorMatch",
     "EvaluatorPrefixExactMatch", "EvaluatorPatternJudge", "EvaluatorKeywordJudge",
+    "EvaluatorCyberSecEvalJudge",
     # Metrics — runner
-    "ScenarioResult", "EvalResult", "AttackEvaluator",
+    "ScenarioResult", "EvalResult", "AttackEvaluator", "evaluate_saved_results",
     # Channels
     "ChanneledPrompt", "ChanneledMessages", "channels_of",
     "PreRenderedMessages", "PreRenderedPromptError",

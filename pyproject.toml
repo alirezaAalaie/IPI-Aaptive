@@ -47,5 +47,6 @@ include = ["ipi*"]
 [tool.setuptools.package-data]
 # Ship data files needed at runtime (pip install git+... builds a wheel; without
 # this, non-.py files are dropped and the package breaks on Kaggle).
-"ipi.data" = ["*.json"]
+"ipi.data" = ["*.json", "cyberseceval2/*.json"]
+"ipi.data.cyberseceval2" = ["*.json"]
 "ipi.seed" = ["*.json"]

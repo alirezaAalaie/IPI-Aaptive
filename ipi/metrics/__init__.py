@@ -57,8 +57,9 @@ from .judge import (
     EvaluatorPrefixExactMatch,
     EvaluatorPatternJudge,
     EvaluatorKeywordJudge,
+    EvaluatorCyberSecEvalJudge,
 )
-from .attack_evaluator import ScenarioResult, EvalResult, AttackEvaluator
+from .attack_evaluator import ScenarioResult, EvalResult, AttackEvaluator, evaluate_saved_results
 
 __all__ = [
     # Base
@@ -72,6 +73,7 @@ __all__ = [
     # Success
     "EvaluatorIPISuccess", "EvaluatorUserUtility", "EvaluatorMatch",
     "EvaluatorPrefixExactMatch", "EvaluatorPatternJudge", "EvaluatorKeywordJudge",
+    "EvaluatorCyberSecEvalJudge",
     # Runner
-    "ScenarioResult", "EvalResult", "AttackEvaluator",
+    "ScenarioResult", "EvalResult", "AttackEvaluator", "evaluate_saved_results",
 ]

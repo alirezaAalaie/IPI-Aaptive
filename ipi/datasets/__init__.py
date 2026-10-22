@@ -18,10 +18,18 @@ Bipia, Hijack) were removed — DualVerifiable is the benchmark we run.
 from .instance import Instance
 from .attack_dataset import AttackDataset
 from .dual_verifiable import DualVerifiableDataset, load_dual_verifiable
+from .cyberseceval import (
+    CyberSecEval2Dataset,
+    load_cyberseceval2,
+    extract_target_from_judge_question,
+)
 
 __all__ = [
     "Instance",
     "AttackDataset",
     "DualVerifiableDataset",
     "load_dual_verifiable",
+    "CyberSecEval2Dataset",
+    "load_cyberseceval2",
+    "extract_target_from_judge_question",
 ]
