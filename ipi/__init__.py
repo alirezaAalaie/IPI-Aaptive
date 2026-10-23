@@ -157,6 +157,9 @@ from .datasets import (
     CyberSecEval2Dataset,
     load_cyberseceval2,
     extract_target_from_judge_question,
+    AlpacaFarmDataset,
+    load_alpacafarm,
+    render_alpacafarm_injection,
 )
 
 # ---- Metrics (success + guidance) ----
@@ -266,6 +269,7 @@ __all__ = [
     # Dataset — the carrier
     "Instance", "AttackDataset", "DualVerifiableDataset", "load_dual_verifiable",
     "CyberSecEval2Dataset", "load_cyberseceval2", "extract_target_from_judge_question",
+    "AlpacaFarmDataset", "load_alpacafarm", "render_alpacafarm_injection",
     # Metrics — primitives
     "Evaluator",
     "check_function_name", "check_exact_function_call", "check_ipi_success",

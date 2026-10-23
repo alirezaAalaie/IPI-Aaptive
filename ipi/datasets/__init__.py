@@ -23,6 +23,11 @@ from .cyberseceval import (
     load_cyberseceval2,
     extract_target_from_judge_question,
 )
+from .alpacafarm import (
+    AlpacaFarmDataset,
+    load_alpacafarm,
+    render_alpacafarm_injection,
+)
 
 __all__ = [
     "Instance",
@@ -32,4 +37,7 @@ __all__ = [
     "CyberSecEval2Dataset",
     "load_cyberseceval2",
     "extract_target_from_judge_question",
+    "AlpacaFarmDataset",
+    "load_alpacafarm",
+    "render_alpacafarm_injection",
 ]

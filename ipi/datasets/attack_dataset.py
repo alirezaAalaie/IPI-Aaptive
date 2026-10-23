@@ -101,8 +101,16 @@ class AttackDataset:
             out.extend(ds._dataset)
         return cls(out)
 
-    def subset(self, n: int, seed: int = 42) -> "AttackDataset":
-        """A reproducible random subset of at most ``n`` instances."""
+    def subset(self, n: Union[int, Iterable[int]], seed: int = 42) -> "AttackDataset":
+        """
+        A subset of instances.
+
+        If ``n`` is an integer, returns a reproducible random sample of at most ``n`` instances.
+        If ``n`` is an iterable of integer indices, returns the instances at those indices.
+        """
+        if isinstance(n, (list, tuple, range, set)):
+            indices = [i for i in n if 0 <= i < len(self._dataset)]
+            return AttackDataset([self._dataset[i] for i in indices])
         rng = random.Random(seed)
         return AttackDataset(rng.sample(self._dataset, min(n, len(self._dataset))))
 
